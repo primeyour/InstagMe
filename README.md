@@ -30,7 +30,7 @@ Before running the bot, make sure you have the following installed:
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/telegram-instagram-reels-uploader-bot.git
+https://github.com/ka3en/Telegram-to-Instagram.git
 cd telegram-instagram-reels-uploader-bot
 ```
 
