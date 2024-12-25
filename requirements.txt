@@ -1,0 +1,5 @@
+
+pyrogram==2.0.69
+instagrapi==1.19.0
+asyncio==3.4.3
+moviepy==1.0.3
