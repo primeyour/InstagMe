@@ -15,7 +15,7 @@ This bot allows users to upload Instagram Reels directly from Telegram, providin
 
 You can watch the test video for the bot below:
 
-[Test Video](https://cdn.discordapp.com/attachments/1308933497309888542/1321604635558940793/image.png)(https://cdn.discordapp.com/attachments/1308933497309888542/1321603575012393041/km_20241226-1_720p_25f_20241226_014618.mp4)
+[Test Video](https://cdn.discordapp.com/attachments/1308933497309888542/1321604635558940793/image.png)](https://cdn.discordapp.com/attachments/1308933497309888542/1321603575012393041/km_20241226-1_720p_25f_20241226_014618.mp4)
 
 
 ## Technologies Used
