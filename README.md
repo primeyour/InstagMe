@@ -22,7 +22,7 @@ This bot allows users to upload Instagram Reels directly from Telegram, providin
 
 Before running the bot, make sure you have the following installed:
 
-- Python 3.x
+- Python 3.10.x
 - `pip` for managing Python packages
 
 ## Installation
@@ -107,7 +107,7 @@ We welcome contributions! Please feel free to open issues or submit pull request
 
 ## Contact
 
-For any issues or suggestions, feel free to open an issue on the GitHub repository, or reach out via email at [your-email@example.com](mailto:your-email@example.com).
+For any issues or suggestions, feel free to open an issue on the GitHub repository, or reach out via email at [karen@i-karen.ir](mailto:karen@i-karen.ir).
 
 ---
 
