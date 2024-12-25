@@ -11,6 +11,13 @@ This bot allows users to upload Instagram Reels directly from Telegram, providin
 - **User Authorization**: Only authorized users can interact with the bot, ensuring security.
 - **Custom Captions**: Upload Reels with custom captions, stored in a text file.
 
+## Test Video
+
+You can watch the test video for the bot below:
+
+[Test Video](https://cdn.discordapp.com/attachments/1308933497309888542/1321603575012393041/km_20241226-1_720p_25f_20241226_014618.mp4?ex=676dd6be&is=676c853e&hm=27241c592182d553076cf8c5fd77f0aef28c030772d799f4644fbb52e5fe08ff&)
+
+
 ## Technologies Used
 
 - **Python 3.x**
