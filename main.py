@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # === ENV LOADING ===
 load_dotenv()
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "20836266"))
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "20836266")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "bbdd206f92e1ca4bc4935b43dfd4a2a1")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WNND9unHi8ZaUgkMmVz1vI")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
@@ -18,11 +18,9 @@ INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
 # === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
-CAPTION_FILE = "caption.txt"
 
 # === INIT CLIENTS ===
-insta_client = InstaClient()  # <-- do NOT login here
-
+insta_client = InstaClient()
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
 
 main_menu = ReplyKeyboardMarkup(
@@ -32,6 +30,9 @@ main_menu = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+# === GLOBAL STATE ===
+user_states = {}
 
 # === UTILITY ===
 def is_authorized(user_id):
@@ -46,7 +47,7 @@ def is_authorized(user_id):
 async def start(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id):
-        await message.reply(f"⛔ You are not authorized to use this bot.\n\n🆔 Your ID: {user_id}")
+        await message.reply(f"⛔ You are not authorized.\n\n🆔 Your ID: {user_id}")
         return
     await message.reply("👋 Welcome! Choose an option below:", reply_markup=main_menu)
 
@@ -59,63 +60,56 @@ async def login_instagram(client, message):
     except Exception as e:
         await message.reply(f"❌ Login failed: {e}")
 
-@app.on_message(filters.command("setcaption"))
-async def set_caption(client, message):
-    caption = message.text.replace("/setcaption", "").strip()
-    with open(CAPTION_FILE, "w", encoding="utf-8") as f:
-        f.write(caption)
-    await message.reply("✅ Caption saved.")
-
-# === BUTTONS ===
+# === BUTTON HANDLERS ===
 @app.on_message(filters.text & filters.regex("^📤 Upload a Reel$"))
 async def upload_one_prompt(client, message):
-    await message.reply("🎥 Send your video to upload with caption.")
+    user_states[message.chat.id] = {"step": "awaiting_video"}
+    await message.reply("🎥 Please send your reel video now.")
 
-@app.on_message(filters.text & filters.regex("^📤 Upload Multiple Reels$"))
-async def upload_multiple_prompt(client, message):
-    await message.reply("🎥 Send multiple videos. They’ll be uploaded every 30 seconds.")
-
-# === VIDEO UPLOAD ===
+# === VIDEO HANDLER ===
 @app.on_message(filters.video)
-async def video_upload(client, message):
-    user_id = message.from_user.id
+async def handle_video(client, message):
+    user_id = message.chat.id
     if not is_authorized(user_id):
         await message.reply("⛔ You are not authorized.")
         return
 
+    state = user_states.get(user_id)
+    if not state or state.get("step") != "awaiting_video":
+        await message.reply("❗ Please press '📤 Upload a Reel' first.")
+        return
+
+    file_path = await message.download()
+    user_states[user_id] = {"step": "awaiting_title", "file_path": file_path}
+    await message.reply("📝 Now send the title for your reel.")
+
+# === TITLE HANDLER ===
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_title"))
+async def handle_title(client, message):
+    user_id = message.chat.id
+    user_states[user_id]["title"] = message.text
+    user_states[user_id]["step"] = "awaiting_hashtags"
+    await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
+
+# === HASHTAG HANDLER ===
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_hashtags"))
+async def handle_hashtags(client, message):
+    user_id = message.chat.id
+    title = user_states[user_id].get("title", "")
+    hashtags = message.text.strip()
+    file_path = user_states[user_id]["file_path"]
+    caption = f"{title}\n\n{hashtags}"
+
     try:
-        path = await message.download()
-
-        await message.reply("📝 Please send the title for your video.")
-        title_msg = await app.listen(message.chat.id, timeout=60)
-
-        await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
-        tags_msg = await app.listen(message.chat.id, timeout=60)
-
-        caption = f"{title_msg.text.strip()}\n\n{tags_msg.text.strip()}"
-
-        await message.reply(f"🧾 Preview:\n\n{caption}\n\nSend ✅ to confirm or ❌ to cancel.")
-        confirm = await app.listen(message.chat.id, timeout=30)
-
-        if confirm.text.strip() != "✅":
-            await message.reply("❌ Cancelled.")
-            return
-
         insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        insta_client.clip_upload(path, caption)
-        await message.reply("✅ Uploaded to Instagram!")
-
-        await asyncio.sleep(30)
-
+        insta_client.clip_upload(file_path, caption)
+        await message.reply("✅ Successfully uploaded to Instagram!")
     except Exception as e:
-        await message.reply(f"⚠️ Error: {e}")
+        await message.reply(f"❌ Upload failed: {e}")
 
-# === HANDLE TEXT REPLIES (non-command) ===
-@app.on_message(filters.text & ~filters.command(["start", "login", "setcaption"]))
-async def unknown_message(client, message):
-    await message.reply("❓ Unknown command or message. Please use the menu or send a valid command.")
+    user_states.pop(user_id)
 
-# === FAKE WEB SERVER FOR KOYEB ===
+# === KOYEB FAKE SERVER ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -128,5 +122,5 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === START BOT ===
+# === RUN ===
 app.run()
