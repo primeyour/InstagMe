@@ -39,8 +39,8 @@ def is_authorized(user_id):
         return False
 
 # === COMMANDS ===
-@app.on_message(filters.command("start"))
-async def start_handler(client, message):
+@app.on_message(filters.text & ~filters.command(["start", "login"]))
+async def handle_text(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id):
         await message.reply(f"⛔ You are not authorized to use this bot.\n\n🆔 Your ID: {user_id}")
