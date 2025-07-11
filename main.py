@@ -21,8 +21,7 @@ AUTHORIZED_USERS_FILE = "authorized_users.txt"
 CAPTION_FILE = "caption.txt"
 
 # === INIT CLIENTS ===
-insta_client = InstaClient()
-insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+insta_client = InstaClient()  # <-- do NOT login here
 
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
 
@@ -57,8 +56,8 @@ async def login_instagram(client, message):
         _, username, password = message.text.split(maxsplit=2)
         insta_client.login(username, password)
         await message.reply("✅ Instagram login successful.")
-    except:
-        await message.reply("❌ Login failed. Use: /login username password")
+    except Exception as e:
+        await message.reply(f"❌ Login failed: {e}")
 
 @app.on_message(filters.command("setcaption"))
 async def set_caption(client, message):
@@ -110,10 +109,7 @@ async def video_upload(client, message):
     except Exception as e:
         await message.reply(f"⚠️ Error: {e}")
 
-# OPTIONAL: Fake web server just for Koyeb health check
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+# === FAKE WEB SERVER FOR KOYEB ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -126,5 +122,5 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === RUN ===
+# === START BOT ===
 app.run()
