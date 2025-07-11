@@ -1,12 +1,18 @@
-import os import asyncio from pyrogram import Client, filters from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton from instagrapi import Client as InstaClient
+import os
+import asyncio
+from pyrogram import Client, filters
+from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
+from instagrapi import Client as InstaClient
+from dotenv import load_dotenv
 
-=== ENV VARS ===
+# Load environment variables
+load_dotenv()
 
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "20836266") TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "bbdd206f92e1ca4bc4935b43dfd4a2a1") TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WNND9unHi8ZaUgkMmVz1vI")
-
-=== INSTAGRAM ===
-
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "") INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
 === FILES ===
 
