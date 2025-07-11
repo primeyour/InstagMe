@@ -3,3 +3,4 @@ instagrapi==1.19.1
 moviepy==1.0.3
 TgCrypto
 python-dotenv
+ntplib==0.4.0
