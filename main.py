@@ -110,18 +110,21 @@ async def video_upload(client, message):
     except Exception as e:
         await message.reply(f"⚠️ Error: {e}")
 
-# === FAKE WEB SERVER FOR KOYEB ===
-class SimpleHandler(BaseHTTPRequestHandler):
+# OPTIONAL: Fake web server just for Koyeb health check
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"OK")
 
-def run_fake_server():
-    server = HTTPServer(("", 8000), SimpleHandler)
-    server.serve_forever()
+def run_server():
+    httpd = HTTPServer(('0.0.0.0', 8080), Handler)
+    httpd.serve_forever()
 
-threading.Thread(target=run_fake_server, daemon=True).start()
+threading.Thread(target=run_server, daemon=True).start()
 
 # === RUN ===
 app.run()
