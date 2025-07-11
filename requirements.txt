@@ -2,4 +2,5 @@ pyrogram==2.0.69
 instagrapi==1.19.1
 asyncio==3.4.3
 moviepy==1.0.3
+TgCrypto
 python-dotenv
