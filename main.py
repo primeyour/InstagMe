@@ -122,16 +122,5 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === FIX TIME SYNC ISSUE ===
-import ntplib
-from time import time
-
-try:
-    ntp = ntplib.NTPClient()
-    ntp.request('pool.ntp.org')  # Just sync to avoid Pyrogram crash
-    print("[INFO] NTP time sync done.")
-except Exception as e:
-    print(f"[WARN] Time sync failed: {e}")
-
 # === START BOT ===
 app.run()
