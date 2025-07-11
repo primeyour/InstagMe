@@ -2,7 +2,7 @@ import os import asyncio from pyrogram import Client, filters from pyrogram.type
 
 === ENV VARS ===
 
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "") TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "") TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "20836266") TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "bbdd206f92e1ca4bc4935b43dfd4a2a1") TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WNND9unHi8ZaUgkMmVz1vI")
 
 === INSTAGRAM ===
 
