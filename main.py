@@ -1,5 +1,4 @@
 import os
-import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -16,7 +15,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WN
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://user:pass@157.46.4.46:8000")
-
 # === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
 SESSION_FILE = "insta_settings.json"
@@ -34,7 +32,7 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === GLOBAL STATE ===
+# === STATE ===
 user_states = {}
 
 # === UTILITY ===
@@ -48,7 +46,10 @@ def is_authorized(user_id):
 def safe_instagram_login():
     try:
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy(INSTAGRAM_PROXY)  # ✅ Proxy as string
+            insta_client.set_proxy({
+                "http": INSTAGRAM_PROXY,
+                "https": INSTAGRAM_PROXY
+            })
 
         if os.path.exists(SESSION_FILE):
             insta_client.load_settings(SESSION_FILE)
@@ -69,15 +70,29 @@ async def start(client, message):
 
 @app.on_message(filters.command("login"))
 async def login_instagram(client, message):
+    user_id = message.from_user.id
+    if not is_authorized(user_id):
+        await message.reply("⛔ You are not authorized.")
+        return
+
     try:
-        _, username, password = message.text.split(maxsplit=2)
+        args = message.text.split(maxsplit=2)
+        if len(args) != 3:
+            await message.reply("❗ Usage: /login username password")
+            return
+
+        username, password = args[1], args[2]
 
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy(INSTAGRAM_PROXY)  # ✅ Correct usage
+            insta_client.set_proxy({
+                "http": INSTAGRAM_PROXY,
+                "https": INSTAGRAM_PROXY
+            })
 
+        await message.reply("🔐 Logging into Instagram...")
         insta_client.login(username, password)
         insta_client.dump_settings(SESSION_FILE)
-        await message.reply("✅ Instagram login successful.")
+        await message.reply("✅ Instagram login successful and session saved.")
     except Exception as e:
         await message.reply(f"❌ Login failed: {e}")
 
@@ -112,7 +127,7 @@ async def handle_title(client, message):
     user_states[user_id]["step"] = "awaiting_hashtags"
     await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
 
-# === HASHTAG HANDLER ===
+# === HASHTAGS HANDLER ===
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_hashtags"))
 async def handle_hashtags(client, message):
     user_id = message.chat.id
@@ -143,5 +158,5 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === START BOT ===
+# === RUN ===
 app.run()
