@@ -10,12 +10,13 @@ from dotenv import load_dotenv
 
 # === LOAD ENV ===
 load_dotenv()
-TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "20836266")
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "20836266"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "bbdd206f92e1ca4bc4935b43dfd4a2a1")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WNND9unHi8ZaUgkMmVz1vI")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://user:pass@157.46.4.46:8000")
+
 # === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
 SESSION_FILE = "insta_settings.json"
@@ -33,7 +34,7 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === STATE ===
+# === GLOBAL STATE ===
 user_states = {}
 
 # === UTILITY ===
@@ -47,10 +48,7 @@ def is_authorized(user_id):
 def safe_instagram_login():
     try:
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy({
-                "http": INSTAGRAM_PROXY,
-                "https": INSTAGRAM_PROXY
-            })
+            insta_client.set_proxy(INSTAGRAM_PROXY)  # ✅ Proxy as string
 
         if os.path.exists(SESSION_FILE):
             insta_client.load_settings(SESSION_FILE)
@@ -73,11 +71,10 @@ async def start(client, message):
 async def login_instagram(client, message):
     try:
         _, username, password = message.text.split(maxsplit=2)
+
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy({
-                "http": INSTAGRAM_PROXY,
-                "https": INSTAGRAM_PROXY
-            })
+            insta_client.set_proxy(INSTAGRAM_PROXY)  # ✅ Correct usage
+
         insta_client.login(username, password)
         insta_client.dump_settings(SESSION_FILE)
         await message.reply("✅ Instagram login successful.")
@@ -115,7 +112,7 @@ async def handle_title(client, message):
     user_states[user_id]["step"] = "awaiting_hashtags"
     await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
 
-# === HASHTAGS HANDLER ===
+# === HASHTAG HANDLER ===
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_hashtags"))
 async def handle_hashtags(client, message):
     user_id = message.chat.id
@@ -133,7 +130,7 @@ async def handle_hashtags(client, message):
 
     user_states.pop(user_id)
 
-# === KEEP SERVER ALIVE FOR KOYEB ===
+# === FAKE SERVER FOR KOYEB ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -146,5 +143,5 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === RUN ===
+# === START BOT ===
 app.run()
