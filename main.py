@@ -18,6 +18,7 @@ INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
 # === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
+SESSION_FILE = "insta_settings.json"
 
 # === INIT CLIENTS ===
 insta_client = InstaClient()
@@ -42,6 +43,15 @@ def is_authorized(user_id):
     except FileNotFoundError:
         return False
 
+def safe_instagram_login():
+    try:
+        if os.path.exists(SESSION_FILE):
+            insta_client.load_settings(SESSION_FILE)
+        insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        insta_client.dump_settings(SESSION_FILE)
+    except Exception as e:
+        raise Exception("Instagram login failed: " + str(e))
+
 # === COMMANDS ===
 @app.on_message(filters.command("start"))
 async def start(client, message):
@@ -56,7 +66,8 @@ async def login_instagram(client, message):
     try:
         _, username, password = message.text.split(maxsplit=2)
         insta_client.login(username, password)
-        await message.reply("✅ Instagram login successful.")
+        insta_client.dump_settings(SESSION_FILE)
+        await message.reply("✅ Instagram login successful and session saved.")
     except Exception as e:
         await message.reply(f"❌ Login failed: {e}")
 
@@ -101,7 +112,7 @@ async def handle_hashtags(client, message):
     caption = f"{title}\n\n{hashtags}"
 
     try:
-        insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        safe_instagram_login()
         insta_client.clip_upload(file_path, caption)
         await message.reply("✅ Successfully uploaded to Instagram!")
     except Exception as e:
