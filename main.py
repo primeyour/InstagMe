@@ -15,6 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WN
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://user:pass@157.46.4.46:8000")
+
 # === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
 SESSION_FILE = "insta_settings.json"
@@ -46,10 +47,7 @@ def is_authorized(user_id):
 def safe_instagram_login():
     try:
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy({
-                "http": INSTAGRAM_PROXY,
-                "https": INSTAGRAM_PROXY
-            })
+            insta_client.set_proxy(INSTAGRAM_PROXY)
 
         if os.path.exists(SESSION_FILE):
             insta_client.load_settings(SESSION_FILE)
@@ -84,10 +82,7 @@ async def login_instagram(client, message):
         username, password = args[1], args[2]
 
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy({
-                "http": INSTAGRAM_PROXY,
-                "https": INSTAGRAM_PROXY
-            })
+            insta_client.set_proxy(INSTAGRAM_PROXY)
 
         await message.reply("🔐 Logging into Instagram...")
         insta_client.login(username, password)
