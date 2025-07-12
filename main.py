@@ -16,7 +16,6 @@ INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://user:pass@157.46.4.46:8000")
 
-# === FILES ===
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
 SESSION_FILE = "insta_settings.json"
 
@@ -24,7 +23,6 @@ SESSION_FILE = "insta_settings.json"
 insta_client = InstaClient()
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
 
-# === MAIN MENU ===
 main_menu = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📤 Upload a Reel")],
@@ -33,7 +31,6 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# === STATE ===
 user_states = {}
 
 # === UTILITY ===
@@ -47,7 +44,7 @@ def is_authorized(user_id):
 def safe_instagram_login():
     try:
         if INSTAGRAM_PROXY:
-            insta_client.set_proxy(INSTAGRAM_PROXY)
+            insta_client.set_proxy(INSTAGRAM_PROXY)  # <- fixed here
 
         if os.path.exists(SESSION_FILE):
             insta_client.load_settings(SESSION_FILE)
