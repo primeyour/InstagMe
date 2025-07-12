@@ -1,5 +1,6 @@
 import os
 import threading
+import concurrent.futures
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from pyrogram import Client, filters
@@ -14,12 +15,11 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "bbdd206f92e1ca4bc4935b43dfd4
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7983901811:AAGi4rscPTCS_WNND9unHi8ZaUgkMmVz1vI")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "http://user:pass@157.46.4.46:8000")
+INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "")  # Example: http://user:pass@ip:port
 
 AUTHORIZED_USERS_FILE = "authorized_users.txt"
 SESSION_FILE = "insta_settings.json"
 
-# === INIT CLIENTS ===
 insta_client = InstaClient()
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
 
@@ -33,7 +33,6 @@ main_menu = ReplyKeyboardMarkup(
 
 user_states = {}
 
-# === UTILITY ===
 def is_authorized(user_id):
     try:
         with open(AUTHORIZED_USERS_FILE, "r") as file:
@@ -42,19 +41,13 @@ def is_authorized(user_id):
         return False
 
 def safe_instagram_login():
-    try:
-        if INSTAGRAM_PROXY:
-            insta_client.set_proxy(INSTAGRAM_PROXY)  # <- fixed here
+    if INSTAGRAM_PROXY:
+        insta_client.set_proxy(INSTAGRAM_PROXY)
+    if os.path.exists(SESSION_FILE):
+        insta_client.load_settings(SESSION_FILE)
+    insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+    insta_client.dump_settings(SESSION_FILE)
 
-        if os.path.exists(SESSION_FILE):
-            insta_client.load_settings(SESSION_FILE)
-
-        insta_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        insta_client.dump_settings(SESSION_FILE)
-    except Exception as e:
-        raise Exception("Instagram login failed: " + str(e))
-
-# === COMMANDS ===
 @app.on_message(filters.command("start"))
 async def start(client, message):
     user_id = message.from_user.id
@@ -77,24 +70,31 @@ async def login_instagram(client, message):
             return
 
         username, password = args[1], args[2]
-
-        if INSTAGRAM_PROXY:
-            insta_client.set_proxy(INSTAGRAM_PROXY)
-
         await message.reply("🔐 Logging into Instagram...")
-        insta_client.login(username, password)
-        insta_client.dump_settings(SESSION_FILE)
+
+        def do_login():
+            temp_client = InstaClient()
+            if INSTAGRAM_PROXY:
+                temp_client.set_proxy(INSTAGRAM_PROXY)
+            temp_client.login(username, password)
+            temp_client.dump_settings(SESSION_FILE)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(do_login)
+            future.result(timeout=20)
+
         await message.reply("✅ Instagram login successful and session saved.")
+
+    except concurrent.futures.TimeoutError:
+        await message.reply("❌ Login timeout. Proxy/Instagram may be slow or blocked.")
     except Exception as e:
         await message.reply(f"❌ Login failed: {e}")
 
-# === BUTTONS ===
 @app.on_message(filters.text & filters.regex("^📤 Upload a Reel$"))
 async def upload_prompt(client, message):
     user_states[message.chat.id] = {"step": "awaiting_video"}
     await message.reply("🎥 Send your reel video now.")
 
-# === VIDEO HANDLER ===
 @app.on_message(filters.video)
 async def handle_video(client, message):
     user_id = message.chat.id
@@ -111,7 +111,6 @@ async def handle_video(client, message):
     user_states[user_id] = {"step": "awaiting_title", "file_path": file_path}
     await message.reply("📝 Now send the title for your reel.")
 
-# === TITLE HANDLER ===
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_title"))
 async def handle_title(client, message):
     user_id = message.chat.id
@@ -119,7 +118,6 @@ async def handle_title(client, message):
     user_states[user_id]["step"] = "awaiting_hashtags"
     await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
 
-# === HASHTAGS HANDLER ===
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_hashtags"))
 async def handle_hashtags(client, message):
     user_id = message.chat.id
@@ -137,7 +135,7 @@ async def handle_hashtags(client, message):
 
     user_states.pop(user_id)
 
-# === FAKE SERVER FOR KOYEB ===
+# === FAKE SERVER ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -150,5 +148,4 @@ def run_server():
 
 threading.Thread(target=run_server, daemon=True).start()
 
-# === RUN ===
 app.run()
