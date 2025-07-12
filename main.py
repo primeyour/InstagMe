@@ -25,8 +25,8 @@ app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, b
 
 main_menu = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📤 Upload a Reel")],
-        [KeyboardButton("📤 Upload Multiple Reels")]
+        [KeyboardButton("\ud83d\udce4 Upload a Reel")],
+        [KeyboardButton("\ud83d\udce4 Upload Multiple Reels")]
     ],
     resize_keyboard=True
 )
@@ -52,25 +52,25 @@ def safe_instagram_login():
 async def start(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id):
-        await message.reply(f"⛔ Not authorized.\n🆔 Your ID: {user_id}")
+        await message.reply(f"\u26d4 Not authorized.\n\ud83c\udd94 Your ID: {user_id}")
         return
-    await message.reply("👋 Welcome! Choose an option below:", reply_markup=main_menu)
+    await message.reply("\ud83d\udc4b Welcome! Choose an option below:", reply_markup=main_menu)
 
 @app.on_message(filters.command("login"))
 async def login_instagram(client, message):
     user_id = message.from_user.id
     if not is_authorized(user_id):
-        await message.reply("⛔ You are not authorized.")
+        await message.reply("\u26d4 You are not authorized.")
         return
 
     try:
         args = message.text.split(maxsplit=2)
         if len(args) != 3:
-            await message.reply("❗ Usage: /login username password")
+            await message.reply("\u2757 Usage: /login username password")
             return
 
         username, password = args[1], args[2]
-        await message.reply("🔐 Logging into Instagram...")
+        await message.reply("\ud83d\udd10 Logging into Instagram...")
 
         def do_login():
             temp_client = InstaClient()
@@ -81,42 +81,42 @@ async def login_instagram(client, message):
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(do_login)
-            future.result(timeout=20)
+            future.result(timeout=30)
 
-        await message.reply("✅ Instagram login successful and session saved.")
+        await message.reply("\u2705 Instagram login successful and session saved.")
 
     except concurrent.futures.TimeoutError:
-        await message.reply("❌ Login timeout. Proxy/Instagram may be slow or blocked.")
+        await message.reply("\u274c Login timeout. Proxy/Instagram may be slow or blocked.")
     except Exception as e:
-        await message.reply(f"❌ Login failed: {e}")
+        await message.reply(f"\u274c Login failed: {str(e)}")
 
-@app.on_message(filters.text & filters.regex("^📤 Upload a Reel$"))
+@app.on_message(filters.text & filters.regex("^\ud83d\udce4 Upload a Reel$"))
 async def upload_prompt(client, message):
     user_states[message.chat.id] = {"step": "awaiting_video"}
-    await message.reply("🎥 Send your reel video now.")
+    await message.reply("\ud83c\udfa5 Send your reel video now.")
 
 @app.on_message(filters.video)
 async def handle_video(client, message):
     user_id = message.chat.id
     if not is_authorized(user_id):
-        await message.reply("⛔ You are not authorized.")
+        await message.reply("\u26d4 You are not authorized.")
         return
 
     state = user_states.get(user_id)
     if not state or state.get("step") != "awaiting_video":
-        await message.reply("❗ Click 📤 Upload a Reel first.")
+        await message.reply("\u2757 Click \ud83d\udce4 Upload a Reel first.")
         return
 
     file_path = await message.download()
     user_states[user_id] = {"step": "awaiting_title", "file_path": file_path}
-    await message.reply("📝 Now send the title for your reel.")
+    await message.reply("\ud83d\udcdd Now send the title for your reel.")
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_title"))
 async def handle_title(client, message):
     user_id = message.chat.id
     user_states[user_id]["title"] = message.text
     user_states[user_id]["step"] = "awaiting_hashtags"
-    await message.reply("🏷️ Now send hashtags (e.g. #funny #reel).")
+    await message.reply("\ud83c\udff7\ufe0f Now send hashtags (e.g. #funny #reel).")
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_hashtags"))
 async def handle_hashtags(client, message):
@@ -129,13 +129,13 @@ async def handle_hashtags(client, message):
     try:
         safe_instagram_login()
         insta_client.clip_upload(file_path, caption)
-        await message.reply("✅ Uploaded to Instagram!")
+        await message.reply("\u2705 Uploaded to Instagram!")
     except Exception as e:
-        await message.reply(f"❌ Upload failed: {e}")
+        await message.reply(f"\u274c Upload failed: {e}")
 
     user_states.pop(user_id)
 
-# === FAKE SERVER ===
+# === KEEP ALIVE ===
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
