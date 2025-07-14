@@ -5,15 +5,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
 import json
 import time
-import subprocess # For direct ffmpeg calls
-import re # For regex if needed in parsing, though json parsing is primary
+import subprocess 
 
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from instagrapi import Client as InstaClient
 from dotenv import load_dotenv
 from pymongo import MongoClient
-import requests # For Facebook Graph API
+import requests 
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -24,17 +22,14 @@ load_dotenv()
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "")  # Leave empty if no proxy
 
 # === NEW: MongoDB Configuration ===
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-DB_NAME = "InstaFb" 
+DB_NAME = "bot_database" 
 
 # === NEW: Admin and Log Channel Configuration ===
-OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) # IMPORTANT: Replace with your actual Telegram User ID
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737")) # IMPORTANT: Replace with your actual log channel ID
+OWNER_ID = int(os.getenv("OWNER_ID", "YOUR_TELEGRAM_OWNER_ID")) 
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-100YOUR_LOG_CHANNEL_ID")) 
 
 # === NEW: Facebook API Configuration ===
 FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID", "")
@@ -44,7 +39,6 @@ FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")
 
 
 # === GLOBAL CLIENTS AND DB ===
-insta_client = InstaClient() 
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
 
 mongo_client = MongoClient(MONGO_URI)
@@ -55,9 +49,9 @@ users_collection = db["users"]
 users_collection.create_index("user_id", unique=True)
 
 # === KEYBOARDS ===
+# Main menu will now only have Facebook and later YouTube/TikTok
 main_menu_user = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📤 Upload a Reel (Instagram)")],
         [KeyboardButton("📤 Upload Video (Facebook)")],
         [KeyboardButton("⚙️ Settings")]
     ],
@@ -66,15 +60,16 @@ main_menu_user = ReplyKeyboardMarkup(
 
 main_menu_admin = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📤 Upload a Reel (Instagram)"), KeyboardButton("📤 Upload Video (Facebook)")],
+        [KeyboardButton("📤 Upload Video (Facebook)")],
         [KeyboardButton("⚙️ Settings"), KeyboardButton("👤 Admin Panel")]
     ],
     resize_keyboard=True
 )
 
+# Settings menu will be updated for Facebook, YouTube, TikTok logins
 settings_menu = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("🔑 Instagram Login"), KeyboardButton("🔑 Facebook Login")],
+        [KeyboardButton("🔑 Facebook Login")], # Instagram Login removed
         [KeyboardButton("🎵 Video Audio Settings"), KeyboardButton("🔙 Main Menu")]
     ],
     resize_keyboard=True
@@ -90,18 +85,17 @@ admin_panel_menu_kb = ReplyKeyboardMarkup(
 )
 
 # === USER STATES ===
-# New state for dynamic audio selection and storing audio streams info
 user_states = {}
 # Example user_states entry:
 # user_states = {
 #     chat_id: {
-#         "step": "awaiting_video_instagram", 
-#         "platform": "instagram", 
+#         "step": "awaiting_video_facebook", 
+#         "platform": "facebook", 
 #         "file_path": "/path/to/video.mp4",
-#         "title": "My awesome reel",
-#         "caption_or_description": "#reel #instagram",
-#         "audio_streams": [...], # NEW: List of detected audio streams
-#         "selected_audio_config": "all" # NEW: 'all', 'none', or stream_index (e.g., 0, 1)
+#         "title": "My awesome video",
+#         "caption_or_description": "My video description",
+#         "visibility": "public", # new: 'public', 'private', 'unlisted'
+#         "schedule_time": None # new: datetime object for scheduling
 #     }
 # }
 
@@ -127,57 +121,6 @@ async def log_to_channel(client, message_text):
     except Exception as e:
         logger.error(f"Failed to send message to log channel (ID: {LOG_CHANNEL_ID}): {e}")
 
-def safe_instagram_login_for_user(user_id, username=None, password=None):
-    """
-    Handles Instagram login for a specific user, saving session to DB.
-    It loads an existing session from MongoDB if available.
-    If no session or invalid, it attempts to log in with provided credentials.
-    """
-    user_doc = get_user_data(user_id)
-    if not user_doc:
-        raise ValueError(f"User {user_id} not found in database. Please send /start first.")
-
-    temp_insta_client = InstaClient()
-
-    if INSTAGRAM_PROXY:
-        temp_insta_client.set_proxy(INSTAGRAM_PROXY)
-
-    insta_session_data = user_doc.get("instagram_session")
-    if insta_session_data:
-        try:
-            temp_session_path = f"insta_settings_{user_id}.json"
-            with open(temp_session_path, "w") as f:
-                json.dump(insta_session_data, f)
-            
-            temp_insta_client.load_settings(temp_session_path)
-            
-            if temp_insta_client.validate_uuid() and temp_insta_client.api.user_id:
-                logger.info(f"Instagram session loaded and validated for user {user_id}")
-                return temp_insta_client
-            else:
-                logger.warning(f"Instagram session invalid for user {user_id}. Attempting re-login.")
-        except Exception as e:
-            logger.warning(f"Error loading Instagram session for user {user_id}: {e}. Attempting re-login.")
-        finally:
-            if os.path.exists(temp_session_path):
-                os.remove(temp_session_path)
-
-    if username and password:
-        logger.info(f"Attempting Instagram login for user {user_id} with provided credentials.")
-        temp_insta_client.login(username, password)
-        
-        temp_session_path = f"insta_settings_{user_id}.json"
-        temp_insta_client.dump_settings(temp_session_path)
-        with open(temp_session_path, "r") as f:
-            new_settings = json.load(f)
-        update_user_data(user_id, {"instagram_session": new_settings})
-        if os.path.exists(temp_session_path):
-            os.remove(temp_session_path)
-        logger.info(f"Instagram login successful and session saved for user {user_id}.")
-        return temp_insta_client
-    else:
-        raise ValueError("No Instagram session found and no credentials provided for login.")
-
 def get_facebook_access_token_for_user(user_id):
     """Retrieves Facebook access token from user data."""
     user_doc = get_user_data(user_id)
@@ -187,131 +130,70 @@ def store_facebook_access_token_for_user(user_id, token):
     """Stores Facebook access token in user data."""
     update_user_data(user_id, {"facebook_access_token": token})
 
-def upload_facebook_video(file_path, title, description, access_token, page_id):
+def upload_facebook_video(file_path, title, description, access_token, page_id, visibility="PUBLISHED"):
     """Uploads a video to Facebook Page using Graph API."""
     if not all([file_path, title, description, access_token, page_id]):
         raise ValueError("Missing required parameters for Facebook video upload.")
 
-    init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
-    init_params = {
+    # Facebook API supports different upload phases. For simplicity, we'll use resumable upload.
+    # This is a simplified version. For large files, you'd use chunked uploads.
+    # The 'status' parameter controls visibility: 'PUBLISHED', 'SCHEDULED_PUBLISH', 'DRAFT'
+    # For 'SCHEDULED_PUBLISH', you'd also need 'scheduled_publish_time'
+    
+    post_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
+    
+    params = {
         'access_token': access_token,
-        'upload_phase': 'start',
-        'file_size': os.path.getsize(file_path)
-    }
-    logger.info(f"Initiating Facebook video upload for {file_path}")
-    response = requests.post(init_url, params=init_params)
-    response.raise_for_status() 
-    init_data = response.json()
-    upload_session_id = init_data['upload_session_id']
-    video_id = init_data['video_id']
-    upload_url = f"https://graph-video.facebook.com/v19.0/{upload_session_id}"
-
-    with open(file_path, 'rb') as f:
-        files = {'video_file': f}
-        upload_params = {
-            'access_token': access_token,
-            'upload_phase': 'transfer',
-            'start_offset': 0,
-            'upload_session_id': upload_session_id
-        }
-        logger.info("Uploading video file to Facebook...")
-        response = requests.post(upload_url, params=upload_params, files=files)
-        response.raise_for_status()
-        upload_data = response.json()
-
-    finish_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
-    finish_params = {
-        'access_token': access_token,
-        'upload_phase': 'finish',
-        'upload_session_id': upload_session_id,
         'title': title,
         'description': description,
+        'published': 'false' if visibility == 'DRAFT' else 'true', # For draft, set published to false
+        'status_type': visibility # PUBLISHED, SCHEDULED_PUBLISH, DRAFT
     }
-    logger.info("Finishing Facebook video upload...")
-    response = requests.post(finish_url, params=finish_params)
-    response.raise_for_status()
-    result = response.json()
-    logger.info(f"Facebook video upload result: {result}")
-    return result
 
-
-def get_video_audio_streams(file_path):
-    """
-    Uses ffprobe to get details of audio streams in a video file.
-    Returns a list of dictionaries, each describing an audio stream.
-    """
-    command = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "a", # Select audio streams only
-        "-show_entries", "stream=index,codec_name:stream_tags=language",
-        "-of", "json",
-        file_path
-    ]
+    # If scheduling, add scheduled_publish_time (Unix timestamp)
+    # This requires 'SCHEDULED_PUBLISH' as status_type
+    # Example: if visibility == 'SCHEDULED_PUBLISH' and schedule_time:
+    #     params['scheduled_publish_time'] = int(schedule_time.timestamp())
     
-    try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        probe_output = json.loads(result.stdout)
-        
-        audio_streams = []
-        if 'streams' in probe_output:
-            for stream in probe_output['streams']:
-                # Ensure it's an audio stream and has an index
-                if stream.get('codec_type') == 'audio' and 'index' in stream:
-                    lang = stream.get('tags', {}).get('language', 'und') # 'und' for undefined
-                    audio_streams.append({
-                        "index": stream['index'],
-                        "codec_name": stream['codec_name'],
-                        "language": lang
-                    })
-        return audio_streams
-    except FileNotFoundError:
-        raise RuntimeError("FFprobe not found. Please install FFmpeg (which includes ffprobe) and ensure it's in your system's PATH.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFprobe failed for {file_path}. Command: {' '.join(e.cmd)}")
-        logger.error(f"STDOUT: {e.stdout}")
-        logger.error(f"STDERR: {e.stderr}")
-        return [] # Return empty list if ffprobe fails to parse or find streams
-    except json.JSONDecodeError as e:
-        logger.error(f"FFprobe output is not valid JSON for {file_path}: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during ffprobe processing for {file_path}: {e}")
-        return []
+    with open(file_path, 'rb') as f:
+        files = {'file': f}
+        logger.info(f"Uploading video to Facebook with visibility: {visibility}")
+        response = requests.post(post_url, params=params, files=files)
+        response.raise_for_status() 
+        result = response.json()
+        logger.info(f"Facebook video upload result: {result}")
+        return result
 
-
-def process_video_audio(input_path, output_path, selected_audio_config):
+def process_video_audio(input_path, output_path, audio_preference="all"):
     """
-    Processes video audio based on selected_audio_config using ffmpeg.
-    selected_audio_config: 'all', 'none', or an integer stream_index
+    Processes video audio based on preference using ffmpeg.
+    audio_preference: 'all' (keep all), 'none' (remove all), 'mp4' (ensure MP4 container)
     """
     command = ["ffmpeg", "-i", input_path]
 
-    if selected_audio_config == "none":
-        # Remove all audio tracks
+    # Check if output is MP4 and input is not, or if audio preference is 'none'
+    # This is a simplified approach. A robust solution would check input/output formats
+    # and codecs more thoroughly.
+    input_ext = os.path.splitext(input_path)[1].lower()
+    output_ext = os.path.splitext(output_path)[1].lower()
+
+    if audio_preference == "none":
         command.extend(["-c:v", "copy", "-an", "-y", output_path])
         logger.info(f"FFmpeg: Removing all audio tracks from {input_path}")
-    elif selected_audio_config == "all":
-        # Copy all streams (video and audio) without re-encoding
+    elif input_ext == ".mkv" and output_ext == ".mp4":
+        # Convert MKV to MP4, copying video and audio streams
+        command.extend(["-c:v", "copy", "-c:a", "copy", "-map", "0", "-y", output_path])
+        logger.info(f"FFmpeg: Converting MKV to MP4 for {input_path}")
+    else: # Default: copy all streams, no re-encoding
         command.extend(["-c", "copy", "-y", output_path])
         logger.info(f"FFmpeg: Copying all streams from {input_path}")
-    elif isinstance(selected_audio_config, int):
-        # Select a specific audio stream by index
-        # -map 0:v:0 to ensure first video stream
-        # -map 0:a:{index} to select the specific audio stream
-        command.extend(["-map", "0:v:0", "-map", f"0:a:{selected_audio_config}", "-c:v", "copy", "-c:a", "copy", "-y", output_path])
-        logger.info(f"FFmpeg: Selecting audio stream {selected_audio_config} from {input_path}")
-    else:
-        logger.warning(f"Invalid audio config '{selected_audio_config}'. Defaulting to copy all streams.")
-        command.extend(["-c", "copy", "-y", output_path])
-
 
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
         logger.info(f"FFmpeg command successful for {input_path}. Output: {result.stdout}")
         return output_path
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg audio processing failed for {input_path}. Command: {' '.join(e.cmd)}")
+        logger.error(f"FFmpeg audio/video processing failed for {input_path}. Command: {' '.join(e.cmd)}")
         logger.error(f"STDOUT: {e.stdout}")
         logger.error(f"STDERR: {e.stderr}")
         raise RuntimeError(f"FFmpeg processing error: {e.stderr}")
@@ -320,7 +202,6 @@ def process_video_audio(input_path, output_path, selected_audio_config):
     except Exception as e:
         logger.error(f"An unexpected error occurred during FFmpeg processing: {e}")
         raise
-
 
 # === PYROGRAM HANDLERS ===
 
@@ -333,9 +214,9 @@ async def start_command(client, message):
         update_user_data(user_id, {
             "user_id": user_id,
             "role": "user",
-            "instagram_session": None,
             "facebook_access_token": None,
-            "audio_preference": "all" # Default audio preference (used if dynamic selection is skipped)
+            "audio_preference": "all", # Default audio preference
+            "premium_platforms": [] # New: List of platforms user has premium for
         })
         await log_to_channel(client, f"New user started bot: `{user_id}` (`{message.from_user.first_name}`)")
         reply_markup = main_menu_user
@@ -350,42 +231,6 @@ async def start_command(client, message):
     
     await message.reply(welcome_message, reply_markup=reply_markup)
 
-
-@app.on_message(filters.command("login"))
-async def login_instagram_command(client, message):
-    user_id = message.from_user.id
-    if not get_user_data(user_id):
-        await message.reply("Please send /start first to initialize your account.")
-        return
-
-    try:
-        args = message.text.split(maxsplit=2)
-        if len(args) != 3:
-            await message.reply("❗ Usage: `/login <username> <password>`\n\n_This logs you into Instagram. Instagram proxy will be used if set in environment._")
-            return
-
-        username, password = args[1], args[2]
-        await message.reply("🔐 Logging into Instagram... This might take a moment. Please be patient.")
-
-        def do_login_sync():
-            return safe_instagram_login_for_user(user_id, username, password)
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(do_login_sync)
-            future.result(timeout=120) 
-
-        await message.reply("✅ Instagram login successful and session saved. You are now logged in as an original user.")
-        await log_to_channel(client, f"User `{user_id}` successfully logged into Instagram.")
-
-    except concurrent.futures.TimeoutError:
-        await message.reply("❌ Login timeout. This often happens if the proxy is slow or Instagram is blocking the login attempt. Please try again or check your proxy/credentials.")
-        logger.error(f"Instagram login timeout for user {user_id}")
-    except ValueError as ve:
-        await message.reply(f"❌ Instagram login failed: `{ve}`")
-        logger.error(f"Instagram login failed due to ValueError for user {user_id}: {ve}")
-    except Exception as e:
-        await message.reply(f"❌ Instagram login failed: `{e}`\n\n_Ensure your username/password are correct and if you're using a proxy, it's working._")
-        logger.error(f"Instagram login failed for user {user_id}: {e}")
 
 # --- Admin Commands ---
 @app.on_message(filters.command("addadmin") & filters.user(OWNER_ID))
@@ -483,11 +328,7 @@ async def back_to_main_menu(client, message):
     else:
         await message.reply("Returning to Main Menu.", reply_markup=main_menu_user)
 
-@app.on_message(filters.text & filters.regex("^🔑 Instagram Login$"))
-async def prompt_instagram_login_from_settings(client, message):
-    user_id = message.from_user.id
-    await message.reply("Please use the command `/login <your_instagram_username> <your_instagram_password>` to log in.")
-
+# Instagram login removed
 @app.on_message(filters.text & filters.regex("^🔑 Facebook Login$"))
 async def prompt_facebook_login_from_settings(client, message):
     user_id = message.from_user.id
@@ -539,48 +380,44 @@ async def facebook_login_command(client, message):
 async def video_audio_settings(client, message):
     user_id = message.from_user.id
     user_doc = get_user_data(user_id)
-    # This menu allows setting a DEFAULT. Dynamic selection happens per upload.
     current_pref_key = user_doc.get("audio_preference", "all")
     display_current_pref = {
         "all": "Keep All Audios",
-        "english": "Keep Only English Audio (Fallback if no specific audio selected per upload)",
         "none": "Remove All Audios"
     }.get(current_pref_key, "Unknown")
 
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Set Default: Keep All Audios", callback_data="default_audio_all")],
-            [InlineKeyboardButton("Set Default: Keep Only English Audio", callback_data="default_audio_english")],
-            [InlineKeyboardButton("Set Default: Remove All Audios", callback_data="default_audio_none")],
+            [InlineKeyboardButton("Keep All Audios", callback_data="audio_set_all")],
+            [InlineKeyboardButton("Remove All Audios", callback_data="audio_set_none")],
             [InlineKeyboardButton("Back to Settings", callback_data="back_to_settings")]
         ]
     )
     await message.reply(f"Select your **default** audio setting for future video uploads.\n\n"
-                        f"_This default will be used if no specific audio is selected during the upload process._\n\n"
+                        f"_This default will be used for all uploads._\n\n"
                         f"Current default preference: **{display_current_pref}**", reply_markup=keyboard)
 
 
-@app.on_callback_query(filters.regex("^default_audio_"))
+@app.on_callback_query(filters.regex("^audio_set_"))
 async def handle_default_audio_choice_callback(client, callback_query):
     user_id = callback_query.from_user.id
-    choice_raw = callback_query.data.split("_")[2] # e.g., "all", "english", "none"
+    choice_raw = callback_query.data.split("_")[2] 
 
-    valid_choices = ["all", "english", "none"]
+    valid_choices = ["all", "none"]
     if choice_raw not in valid_choices:
-        await callback_query.answer("Invalid default audio choice.", show_alert=True)
+        await callback_query.answer("Invalid audio choice.", show_alert=True)
         return
 
     update_user_data(user_id, {"audio_preference": choice_raw})
     display_choice = {
         "all": "Keep All Audios",
-        "english": "Keep Only English Audio (Fallback)",
         "none": "Remove All Audios"
     }.get(choice_raw)
 
-    await callback_query.answer(f"Default audio preference set to: {display_choice}", show_alert=True)
+    await callback_query.answer(f"Audio preference set to: {display_choice}", show_alert=True)
     await callback_query.message.edit_text(f"✅ Your **default** audio preference is now set to **{display_choice}**.\n\n"
-                                          "You can change this anytime or select a specific track during video upload.",
+                                          "You can change this anytime from Settings -> Video Audio Settings.",
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to Settings", callback_data="back_to_settings")]]))
     await log_to_channel(client, f"User `{user_id}` set default audio preference to `{choice_raw}`.")
 
@@ -591,26 +428,6 @@ async def handle_back_to_settings_callback(client, callback_query):
 
 
 # --- Upload Flow Handlers ---
-
-@app.on_message(filters.text & filters.regex("^📤 Upload a Reel (Instagram)$"))
-async def upload_reel_prompt(client, message):
-    user_id = message.chat.id
-    user_doc = get_user_data(user_id)
-    if not user_doc:
-        await message.reply("Please send /start first to initialize your account.")
-        return
-
-    try:
-        safe_instagram_login_for_user(user_id) 
-        user_states[user_id] = {"step": "awaiting_video", "platform": "instagram"} # Generic video step
-        await message.reply("🎥 Send your Instagram Reel video now.")
-    except ValueError as ve: 
-        await message.reply(f"❌ You are not logged into Instagram or your session is invalid. Please use `/login` command in Settings to log in first.")
-        logger.warning(f"User {user_id} tried to upload to Instagram without valid session: {ve}")
-    except Exception as e:
-        await message.reply(f"An unexpected error occurred while checking Instagram login: {e}")
-        logger.error(f"Unexpected error for user {user_id} checking Instagram login: {e}")
-
 
 @app.on_message(filters.text & filters.regex("^📤 Upload Video (Facebook)$"))
 async def upload_facebook_video_prompt(client, message):
@@ -629,7 +446,7 @@ async def upload_facebook_video_prompt(client, message):
         await message.reply("Bot's Facebook Page ID or Access Token is not configured. Please contact the admin.")
         return
 
-    user_states[user_id] = {"step": "awaiting_video", "platform": "facebook"} # Generic video step
+    user_states[user_id] = {"step": "awaiting_video_facebook", "platform": "facebook"} 
     await message.reply("🎥 Send your video for Facebook now.")
 
 @app.on_message(filters.video)
@@ -640,8 +457,8 @@ async def handle_video_upload(client, message):
         return
 
     state = user_states.get(user_id)
-    if not state or (state.get("step") != "awaiting_video"):
-        await message.reply("❗ Please click an upload button (e.g., '📤 Upload a Reel' or '📤 Upload Video (Facebook)') first.")
+    if not state or (state.get("step") != "awaiting_video_facebook"): # Only Facebook for now
+        await message.reply("❗ Please click an upload button (e.g., '📤 Upload Video (Facebook)') first.")
         return
 
     if not os.path.exists("downloads"):
@@ -651,95 +468,12 @@ async def handle_video_upload(client, message):
     try:
         file_path = await message.download(file_name=f"downloads/{user_id}_{message.video.file_id}.mp4")
         user_states[user_id]["file_path"] = file_path
-        
-        # --- NEW: Detect audio streams and ask for preference ---
-        await initial_status_msg.edit_text("🔍 Analyzing video audio tracks...")
-        def get_audio_streams_sync():
-            return get_video_audio_streams(file_path)
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(get_audio_streams_sync)
-            audio_streams = future.result(timeout=60) # Timeout for ffprobe
-
-        user_states[user_id]["audio_streams"] = audio_streams
-        user_states[user_id]["step"] = "awaiting_dynamic_audio_selection"
-
-        keyboard_buttons = []
-        if audio_streams:
-            for stream in audio_streams:
-                label = f"Track {stream['index']} ({stream['codec_name']}"
-                if stream['language'] and stream['language'] != 'und':
-                    label += f", {stream['language'].upper()})"
-                else:
-                    label += ")"
-                keyboard_buttons.append([InlineKeyboardButton(label, callback_data=f"audio_select_{stream['index']}")])
-            
-            keyboard_buttons.append([InlineKeyboardButton("Keep All Original Audios", callback_data="audio_select_all_original")])
-        else:
-            keyboard_buttons.append([InlineKeyboardButton("No Audio Tracks Detected (or failed to detect)", callback_data="audio_select_all_original")])
-            logger.warning(f"No audio streams detected for {file_path} or ffprobe failed.")
-
-        keyboard_buttons.append([InlineKeyboardButton("Remove All Audio", callback_data="audio_select_none")])
-
-        await initial_status_msg.edit_text(
-            "🎵 **Audio Detected!** Please select which audio track to keep for your upload:\n\n"
-            "_(If no selection is made or analysis fails, all original audios will be kept by default)_",
-            reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-        )
-
-    except concurrent.futures.TimeoutError:
-        await initial_status_msg.edit_text("❌ Video analysis timed out. This might happen with very large files or slow processing. Please try again.")
-        logger.error(f"FFprobe timeout for user {user_id}. File: {file_path}")
-        user_states.pop(user_id, None)
-    except RuntimeError as re:
-        await initial_status_msg.edit_text(f"❌ Video analysis error: `{re}`\n\n_Ensure FFmpeg/FFprobe are installed correctly._")
-        logger.error(f"FFprobe runtime error for user {user_id}: {re}")
-        user_states.pop(user_id, None)
+        user_states[user_id]["step"] = f"awaiting_title_{state['platform']}"
+        await initial_status_msg.edit_text("📝 Now send the title for your video.")
     except Exception as e:
-        await initial_status_msg.edit_text(f"❌ Failed to download or analyze video: {e}")
-        logger.error(f"Failed to download/analyze video for user {user_id}: {e}", exc_info=True)
+        await initial_status_msg.edit_text(f"❌ Failed to download video: {e}")
+        logger.error(f"Failed to download video for user {user_id}: {e}")
         user_states.pop(user_id, None) 
-
-
-@app.on_callback_query(filters.regex("^audio_select_"))
-async def handle_dynamic_audio_selection(client, callback_query):
-    user_id = callback_query.from_user.id
-    state = user_states.get(user_id)
-
-    if not state or state.get("step") != "awaiting_dynamic_audio_selection":
-        await callback_query.answer("Please send a video first to select audio.", show_alert=True)
-        return
-
-    choice_str = callback_query.data.split("audio_select_")[1]
-    selected_config = "all" # Default if 'all_original' or parse error
-    
-    if choice_str == "none":
-        selected_config = "none"
-        display_message = "All audio will be removed."
-    elif choice_str == "all_original":
-        selected_config = "all"
-        display_message = "All original audio tracks will be kept."
-    else:
-        try:
-            stream_index = int(choice_str)
-            # Verify stream index is actually in the detected streams
-            if any(s['index'] == stream_index for s in state.get('audio_streams', [])):
-                selected_config = stream_index
-                display_message = f"Audio track {stream_index} selected."
-            else:
-                await callback_query.answer("Invalid audio track selected.", show_alert=True)
-                return
-        except ValueError:
-            await callback_query.answer("Invalid audio selection.", show_alert=True)
-            return
-
-    user_states[user_id]["selected_audio_config"] = selected_config
-    user_states[user_id]["step"] = f"awaiting_title_{state['platform']}"
-
-    await callback_query.message.edit_text(f"✅ Audio preference set: **{display_message}**\n\n"
-                                          "📝 Now send the title for your video.")
-    await callback_query.answer("Audio selection successful.")
-
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step", "").startswith("awaiting_title_")))
 async def handle_upload_title(client, message):
@@ -748,9 +482,7 @@ async def handle_upload_title(client, message):
     user_states[user_id]["title"] = message.text
     user_states[user_id]["step"] = f"awaiting_caption_or_description_{platform}"
 
-    if platform == "instagram":
-        await message.reply("🏷️ Now send hashtags for your Instagram Reel (e.g., #funny #reel).")
-    elif platform == "facebook":
+    if platform == "facebook":
         await message.reply("📝 Now send a description for your Facebook video.")
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step", "").startswith("awaiting_caption_or_description_")))
@@ -761,97 +493,199 @@ async def handle_upload_caption_or_description(client, message):
     title = user_states[user_id]["title"]
     caption_or_description = message.text.strip()
     
-    # Get the dynamically selected audio config, or fallback to user's default setting
-    selected_audio_config = user_states[user_id].get("selected_audio_config", "all")
-    if selected_audio_config == "all": # If 'all' was selected, check user's default
-        user_doc = get_user_data(user_id)
-        # If 'english' default was set and no specific track was picked, use 'english' logic.
-        # Otherwise, 'all' means all original streams will be copied.
-        if user_doc.get("audio_preference") == "english":
-             # This means "english" will now function as "keep first stream" as per process_video_audio simplified logic
-             selected_audio_config = "english" # Re-purpose 'english' as a flag for simplified track selection
-        # If default was "none" and no dynamic selection overrode it, it would be 'none'
-        elif user_doc.get("audio_preference") == "none" and selected_audio_config != "none":
-             # This check is if the user selected 'all_original' dynamically but their default was 'none'
-             # The dynamic selection 'none' takes precedence if chosen, but if they picked 'all_original',
-             # and their default was 'none', it could cause confusion.
-             # For simplicity, dynamic selection always overrides default.
-             pass
+    user_states[user_id]["caption_or_description"] = caption_or_description
+    user_states[user_id]["step"] = f"awaiting_visibility_{platform}"
 
+    # Offer visibility options
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Public", callback_data="visibility_public")],
+            [InlineKeyboardButton("Private", callback_data="visibility_private")],
+            [InlineKeyboardButton("Draft", callback_data="visibility_draft")]
+        ]
+    )
+    await message.reply("🌐 Select video visibility:", reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex("^visibility_"))
+async def handle_visibility_selection(client, callback_query):
+    user_id = callback_query.from_user.id
+    state = user_states.get(user_id)
+
+    if not state or not state.get("step", "").startswith("awaiting_visibility_"):
+        await callback_query.answer("Please start an upload process first.", show_alert=True)
+        return
+
+    platform = state["platform"]
+    visibility_choice = callback_query.data.split("_")[1] # public, private, draft
+
+    user_states[user_id]["visibility"] = visibility_choice
+    user_states[user_id]["step"] = f"awaiting_schedule_{platform}"
+
+    # For Facebook, 'private' is 'SELF' and 'public' is 'EVERYONE' in some contexts,
+    # but for video uploads, 'PUBLISHED', 'DRAFT', 'SCHEDULED_PUBLISH' are the main types.
+    # We'll map 'private' to 'DRAFT' for simplicity for now, as direct 'private' view is complex.
+    # The user asked for public/private, so 'public' -> PUBLISHED, 'private' -> DRAFT.
+
+    if platform == "facebook":
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Publish Now", callback_data="schedule_now")],
+                [InlineKeyboardButton("Schedule Later", callback_data="schedule_later")]
+            ]
+        )
+        await callback_query.message.edit_text("⏰ Do you want to publish now or schedule for later?", reply_markup=keyboard)
+    else: # For other platforms if added later, default to publish now
+        await callback_query.message.edit_text("⏳ Processing your video and preparing for upload... Please wait.")
+        await callback_query.answer("Processing initiated.")
+        await initiate_upload(client, callback_query.message, user_id)
+
+
+@app.on_callback_query(filters.regex("^schedule_"))
+async def handle_schedule_selection(client, callback_query):
+    user_id = callback_query.from_user.id
+    state = user_states.get(user_id)
+
+    if not state or not state.get("step", "").startswith("awaiting_schedule_"):
+        await callback_query.answer("Please start an upload process first.", show_alert=True)
+        return
+
+    schedule_choice = callback_query.data.split("_")[1] # now, later
+
+    if schedule_choice == "now":
+        user_states[user_id]["schedule_time"] = None # No scheduling
+        await callback_query.message.edit_text("⏳ Processing your video and preparing for upload... Please wait.")
+        await callback_query.answer("Processing initiated.")
+        await initiate_upload(client, callback_query.message, user_id)
+    elif schedule_choice == "later":
+        user_states[user_id]["step"] = f"awaiting_schedule_datetime_{state['platform']}"
+        await callback_query.message.edit_text(
+            "📅 Please send the schedule date and time in `YYYY-MM-DD HH:MM` format (e.g., `2025-07-20 14:30`).\n"
+            "_Time will be interpreted in UTC._"
+        )
+        await callback_query.answer("Awaiting schedule time.")
+
+# This handler will be for parsing the schedule time
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step", "").startswith("awaiting_schedule_datetime_")))
+async def handle_schedule_datetime_input(client, message):
+    user_id = message.chat.id
+    state = user_states.get(user_id)
+    
+    try:
+        # Simple parsing, can be enhanced with more robust date/time libraries if needed
+        schedule_str = message.text.strip()
+        from datetime import datetime
+        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
+        
+        # Ensure schedule time is in the future
+        if schedule_dt <= datetime.utcnow():
+            await message.reply("❌ Schedule time must be in the future. Please try again.")
+            return
+
+        user_states[user_id]["schedule_time"] = schedule_dt
+        await message.reply("⏳ Processing your video and preparing for upload... Please wait.")
+        await initiate_upload(client, message, user_id)
+
+    except ValueError:
+        await message.reply("❌ Invalid date/time format. Please use `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`).")
+    except Exception as e:
+        await message.reply(f"❌ An error occurred while parsing schedule time: {e}")
+        logger.error(f"Error parsing schedule time for user {user_id}: {e}")
+
+async def initiate_upload(client, message, user_id):
+    state = user_states.get(user_id)
+    if not state:
+        await client.send_message(user_id, "❌ Upload process interrupted. Please start again.")
+        return
+
+    platform = state["platform"]
+    file_path = state["file_path"]
+    title = state["title"]
+    caption_or_description = state["caption_or_description"]
+    visibility = state.get("visibility", "public") # Default to public
+    schedule_time = state.get("schedule_time") # datetime object or None
 
     user_states[user_id]["step"] = "processing_and_uploading"
-    await message.reply("⏳ Processing your video and preparing for upload... This may take time depending on video size and audio settings. Please wait.")
-    await client.send_chat_action(message.chat.id, "upload_video")
-    await log_to_channel(client, f"User `{user_id}` initiating upload for {platform}. File: `{os.path.basename(file_path)}`. Audio config: {selected_audio_config}")
+    await client.send_chat_action(user_id, "upload_video")
+    await log_to_channel(client, f"User `{user_id}` initiating upload for {platform}. File: `{os.path.basename(file_path)}`. Visibility: {visibility}. Schedule: {schedule_time}")
 
-    processed_file_path = file_path # Default to original if no processing needed
+    processed_file_path = file_path 
 
     try:
-        # --- Audio Processing Logic ---
-        if selected_audio_config != "all": # Only process if not keeping all original streams as is
-            processed_file_path = f"downloads/processed_{user_id}_{os.path.basename(file_path)}"
-            await message.reply(f"Applying audio preference: **{selected_audio_config if isinstance(selected_audio_config, int) else selected_audio_config.replace('_', ' ').title()}**...")
-            await client.send_chat_action(message.chat.id, "upload_video")
+        # Determine output file path based on input extension and target platform
+        input_ext = os.path.splitext(file_path)[1].lower()
+        output_ext = ".mp4" # Most platforms prefer MP4
 
-            def do_audio_processing_sync():
-                return process_video_audio(file_path, processed_file_path, selected_audio_config)
-            
+        if input_ext != output_ext:
+            processed_file_path = f"downloads/processed_{user_id}_{os.path.basename(file_path).replace(input_ext, output_ext)}"
+            await client.send_message(user_id, f"Converting video to {output_ext.upper()} format...")
+            await client.send_chat_action(user_id, "upload_video")
+            def do_processing_sync():
+                return process_video_audio(file_path, processed_file_path, audio_preference="all") # Process to ensure MP4, keep all audio
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(do_audio_processing_sync)
+                future = executor.submit(do_processing_sync)
                 processed_file_path = future.result(timeout=600) 
-            
-            await message.reply("✅ Video audio processing complete.")
-            await log_to_channel(client, f"User `{user_id}` video audio processed to `{selected_audio_config}`. Output: `{os.path.basename(processed_file_path)}`")
+            await client.send_message(user_id, "✅ Video format conversion complete.")
+            await log_to_channel(client, f"User `{user_id}` video converted. Output: `{os.path.basename(processed_file_path)}`")
+        
+        # Apply audio preference (remove all audio) if selected
+        user_doc = get_user_data(user_id)
+        audio_preference = user_doc.get("audio_preference", "all")
+        if audio_preference == "none":
+            temp_processed_path = f"downloads/audio_removed_{user_id}_{os.path.basename(processed_file_path)}"
+            await client.send_message(user_id, "Removing all audio tracks...")
+            await client.send_chat_action(user_id, "upload_video")
+            def do_audio_removal_sync():
+                return process_video_audio(processed_file_path, temp_processed_path, audio_preference="none")
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(do_audio_removal_sync)
+                processed_file_path = future.result(timeout=600)
+            await client.send_message(user_id, "✅ Audio removal complete.")
+            await log_to_channel(client, f"User `{user_id}` audio removed. Output: `{os.path.basename(processed_file_path)}`")
+
 
         # --- Upload Logic ---
-        if platform == "instagram":
-            insta_caption = f"{title}\n\n{caption_or_description}"
-            def upload_to_instagram_sync():
-                temp_insta_client = safe_instagram_login_for_user(user_id) 
-                temp_insta_client.clip_upload(processed_file_path, insta_caption)
-
-            await message.reply("📤 Uploading to Instagram...")
-            await client.send_chat_action(message.chat.id, "upload_video")
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(upload_to_instagram_sync)
-                future.result(timeout=900) 
-            await message.reply("✅ Uploaded to Instagram!")
-            await log_to_channel(client, f"User `{user_id}` successfully uploaded to Instagram. File: `{os.path.basename(processed_file_path)}`")
-
-        elif platform == "facebook":
+        if platform == "facebook":
             fb_access_token = get_facebook_access_token_for_user(user_id)
             if not fb_access_token:
-                await message.reply("❌ Error: Facebook access token not found. Please re-authenticate via /fblogin.")
+                await client.send_message(user_id, "❌ Error: Facebook access token not found. Please re-authenticate via /fblogin.")
                 return
 
-            await message.reply("📤 Uploading to Facebook...")
-            await client.send_chat_action(message.chat.id, "upload_video")
+            await client.send_message(user_id, "📤 Uploading to Facebook...")
+            await client.send_chat_action(user_id, "upload_video")
             
+            # Map visibility choices to Facebook API status_type
+            fb_visibility = "PUBLISHED"
+            if visibility == "private" or visibility == "draft":
+                fb_visibility = "DRAFT" # Facebook treats 'private' or 'unlisted' generally as 'DRAFT' for videos
+            # If scheduling, it would be 'SCHEDULED_PUBLISH'
+            # For now, we'll simplify to PUBLISHED/DRAFT based on public/private/draft choice.
+            # Scheduling will be added in a later iteration.
+
             def upload_to_facebook_sync():
-                return upload_facebook_video(processed_file_path, title, caption_or_description, fb_access_token, FACEBOOK_PAGE_ID)
+                return upload_facebook_video(processed_file_path, title, caption_or_description, fb_access_token, FACEBOOK_PAGE_ID, visibility=fb_visibility)
 
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(upload_to_facebook_sync)
                 fb_result = future.result(timeout=900) 
             
             if fb_result and 'id' in fb_result:
-                await message.reply(f"✅ Uploaded to Facebook! Video ID: `{fb_result['id']}`")
+                await client.send_message(user_id, f"✅ Uploaded to Facebook! Video ID: `{fb_result['id']}`")
                 await log_to_channel(client, f"User `{user_id}` successfully uploaded to Facebook. Video ID: `{fb_result['id']}`. File: `{os.path.basename(processed_file_path)}`")
             else:
-                await message.reply(f"❌ Facebook upload failed: `{fb_result}`")
+                await client.send_message(user_id, f"❌ Facebook upload failed: `{fb_result}`")
                 logger.error(f"Facebook upload failed for user {user_id}: {fb_result}")
 
     except concurrent.futures.TimeoutError:
-        await message.reply("❌ Upload/processing timed out. The file might be too large or the network is slow. Please try again with a smaller file or better connection.")
+        await client.send_message(user_id, "❌ Upload/processing timed out. The file might be too large or the network is slow. Please try again with a smaller file or better connection.")
         logger.error(f"Upload/processing timeout for user {user_id}. Original file: {file_path}")
     except RuntimeError as re:
-        await message.reply(f"❌ Processing/Upload Error: `{re}`\n\n_Ensure FFmpeg is installed and your video file is not corrupted._")
+        await client.send_message(user_id, f"❌ Processing/Upload Error: `{re}`\n\n_Ensure FFmpeg is installed and your video file is not corrupted._")
         logger.error(f"Processing/Upload Error for user {user_id}: {re}")
     except requests.exceptions.RequestException as req_e:
-        await message.reply(f"❌ Network/API Error during upload: `{req_e}`\n\n_Please check your internet connection or Facebook API settings._")
+        await client.send_message(user_id, f"❌ Network/API Error during upload: `{req_e}`\n\n_Please check your internet connection or Facebook API settings._")
         logger.error(f"Network/API Error for user {user_id}: {req_e}")
     except Exception as e:
-        await message.reply(f"❌ Upload failed: An unexpected error occurred: `{e}`")
+        await client.send_message(user_id, f"❌ Upload failed: An unexpected error occurred: `{e}`")
         logger.error(f"Upload failed for user {user_id}: {e}", exc_info=True) 
     finally:
         if 'file_path' in user_states.get(user_id, {}) and os.path.exists(user_states[user_id]['file_path']):
@@ -880,7 +714,17 @@ async def view_user_stats(client, message):
         f"Admins: `{admin_users}`\n"
         f"Regular Users: `{regular_users}`\n"
     )
-    await message.reply(stats_message)
+    # New: List of users with their premium status
+    all_users_details = "All Users:\n"
+    for user_doc in users_collection.find({}):
+        user_id = user_doc.get("user_id")
+        user_role = user_doc.get("role", "user")
+        premium_platforms = user_doc.get("premium_platforms", [])
+        
+        premium_status = f"Premium: {', '.join(premium_platforms)}" if premium_platforms else "No Premium"
+        all_users_details += f"- `{user_id}` ({user_role}, {premium_status})\n"
+
+    await message.reply(stats_message + "\n" + all_users_details)
     await log_to_channel(client, f"Admin `{message.from_user.id}` viewed user stats.")
 
 
