@@ -31,11 +31,11 @@ INSTAGRAM_PROXY = os.getenv("INSTAGRAM_PROXY", "")  # Leave empty if no proxy
 
 # === NEW: MongoDB Configuration ===
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-DB_NAME = "bot_database" # You can choose a more descriptive name if you like
+DB_NAME = "InstaFb" # You can choose a more descriptive name if you like
 
 # === NEW: Admin and Log Channel Configuration ===
-OWNER_ID = int(os.getenv("OWNER_ID", "YOUR_TELEGRAM_OWNER_ID")) # IMPORTANT: Replace with your actual Telegram User ID
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-100YOUR_LOG_CHANNEL_ID")) # IMPORTANT: Replace with your actual log channel ID
+OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) # IMPORTANT: Replace with your actual Telegram User ID
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737")) # IMPORTANT: Replace with your actual log channel ID
 
 # === NEW: Facebook API Configuration ===
 # IMPORTANT: You'll need to create a Facebook App and get an Access Token with required permissions (pages_show_list, pages_manage_posts).
