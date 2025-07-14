@@ -1,6 +1,7 @@
-pyrogram==2.0.106
+Pyrogram==2.0.106
 instagrapi==1.19.1
 moviepy==1.0.3
 TgCrypto
 python-dotenv
 ntplib==0.4.0
+pymongo
