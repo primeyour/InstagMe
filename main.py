@@ -29,8 +29,8 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cl
 DB_NAME = "bot_database" 
 
 # === NEW: Admin and Log Channel Configuration ===
-OWNER_ID = int(os.getenv("OWNER_ID", "YOUR_TELEGRAM_OWNER_ID")) 
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-100YOUR_LOG_CHANNEL_ID")) 
+OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) 
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737D")) 
 
 # === NEW: Facebook API Configuration ===
 FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID", "")
