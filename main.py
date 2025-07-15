@@ -26,8 +26,8 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # === NEW: MongoDB Configuration ===
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.emlgbc7.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-DB_NAME = "bot_database"
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://primemastix:o84aVniXFmKfyMwH@cluster0.qgiry.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+DB_NAME = "YtBot"
 
 # === NEW: Admin and Log Channel Configuration ===
 OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) # Your provided Admin ID
