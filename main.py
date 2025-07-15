@@ -7,6 +7,7 @@ import json
 import time
 import subprocess
 from datetime import datetime
+import sys # For sys.exit()
 
 from pyrogram import Client, filters
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -25,12 +26,12 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # === NEW: MongoDB Configuration ===
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.emlgbc7.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 DB_NAME = "bot_database"
 
 # === NEW: Admin and Log Channel Configuration ===
-OWNER_ID = int(os.getenv("OWNER_ID", "7577977996"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737"))
+OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) # Your provided Admin ID
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737")) # Your provided Log Channel ID
 
 # === NEW: Facebook API Configuration ===
 FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID", "")
@@ -82,16 +83,31 @@ admin_panel_menu_kb = ReplyKeyboardMarkup(
 def get_general_settings_inline_keyboard(user_id):
     keyboard = []
     # User Settings for premium users
-    if is_premium_user(user_id):
-        keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
+    # For demonstration, let's assume if user is admin, they also get user settings.
+    # In a real app, this would check a dedicated premium status field.
+    if is_premium_user(user_id) or is_admin(user_id): # Admin can always access user settings for testing/management
+         keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
     # Admin-specific options
     if is_admin(user_id):
         keyboard.append([
-            InlineKeyboardButton("Admin Panel", callback_data='settings_admin_panel_inline'),
+            InlineKeyboardButton("Admin Panel (Inline)", callback_data='settings_admin_panel_inline'),
             InlineKeyboardButton("Bot Status", callback_data='settings_bot_status_inline')
         ])
     keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main_menu_reply')]) # Back to main menu
     return InlineKeyboardMarkup(keyboard)
+
+# NEW: Inline Admin Panel specific to settings flow
+admin_settings_inline_menu = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📢 Broadcast Message (Admin Cmd)", callback_data='admin_broadcast_prompt')],
+        [InlineKeyboardButton("➕ Add Admin (Admin Cmd)", callback_data='admin_add_admin_prompt')],
+        [InlineKeyboardButton("➖ Remove Admin (Admin Cmd)", callback_data='admin_remove_admin_prompt')],
+        [InlineKeyboardButton("🔄 Restart Bot", callback_data='admin_restart_bot')], # New Restart Button
+        [InlineKeyboardButton("📤 Admin Upload Video (Facebook)", callback_data='admin_upload_fb')], # New Admin FB Upload Button
+        [InlineKeyboardButton("⬅️ Back to General Settings", callback_data='settings_main_menu_inline')]
+    ]
+)
+
 
 # User Settings inline menu (TikTok, FB, YT settings)
 user_settings_inline_menu = InlineKeyboardMarkup(
@@ -323,6 +339,7 @@ async def start_command(client, message):
     user_doc = get_user_data(user_id)
 
     if not user_doc:
+        # Initialize user data only if they are new
         update_user_data(user_id, {
             "user_id": user_id,
             "role": "user",
@@ -358,15 +375,20 @@ async def start_command(client, message):
             }
         })
         await log_to_channel(client, f"New user started bot: `{user_id}` (`{message.from_user.first_name}`)")
-        reply_markup = main_menu_user
-        welcome_message = "👋 Welcome! I'm your media upload bot. Choose an option below:"
+        # Make the owner an admin upon their first start
+        if user_id == OWNER_ID:
+            update_user_data(user_id, {"role": "admin"})
+            await message.reply("🎉 You are the OWNER! You have been automatically set as an admin.", reply_markup=main_menu_admin)
+            await log_to_channel(client, f"Owner `{user_id}` initialized as admin.")
+            return # Exit to avoid sending user message again
+
+    # Determine keyboard based on role
+    if is_admin(user_id):
+        reply_markup = main_menu_admin
+        welcome_message = "👋 Welcome back Admin! Choose an option below:"
     else:
-        if is_admin(user_id):
-            reply_markup = main_menu_admin
-            welcome_message = "👋 Welcome back Admin! Choose an option below:"
-        else:
-            reply_markup = main_menu_user
-            welcome_message = "👋 Welcome back! Choose an option below:"
+        reply_markup = main_menu_user
+        welcome_message = "👋 Welcome back! Choose an option below:"
 
     await message.reply(welcome_message, reply_markup=reply_markup)
 
@@ -407,6 +429,10 @@ async def remove_admin_command(client, message):
         user_doc = get_user_data(target_user_id)
 
         if user_doc and user_doc.get("role") == "admin":
+            if target_user_id == OWNER_ID:
+                await message.reply("❌ You cannot remove the owner's admin status.")
+                return
+
             update_user_data(target_user_id, {"role": "user"})
             await message.reply(f"✅ User `{target_user_id}` has been demoted to a regular user.")
             await client.send_message(target_user_id, "You have been demoted from admin status.")
@@ -431,7 +457,7 @@ async def broadcast_message(client, message):
 
         for user_id in user_ids:
             try:
-                if user_id == message.from_user.id:
+                if user_id == message.from_user.id: # Don't send broadcast to self
                     continue
                 await client.send_message(user_id, text)
                 success_count += 1
@@ -491,13 +517,17 @@ async def back_to_main_menu_from_inline(client, callback_query):
     else:
         await callback_query.message.reply("Returning to Main Menu.", reply_markup=main_menu_user)
     # Delete the inline message to clean up UI
-    await callback_query.message.delete()
+    try:
+        await callback_query.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete inline message: {e}") # Message might have been deleted by user or another action
 
 
 @app.on_callback_query(filters.regex("^settings_user_menu_inline$"))
 async def settings_user_menu_callback(client, callback_query):
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
+    # Allowing admin to access user settings as well for full control
+    if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("You need a premium subscription to access user settings.", show_alert=True)
         return
     await callback_query.answer()
@@ -512,10 +542,80 @@ async def settings_admin_panel_inline_callback(client, callback_query):
     if not is_admin(user_id):
         await callback_query.answer("You are not authorized to access admin settings.", show_alert=True)
         return
-    await callback_query.answer("Switching to Admin Panel (Reply Keyboard).")
-    await callback_query.message.reply("👋 Welcome to the Admin Panel!", reply_markup=admin_panel_menu_kb)
-    # Optionally delete the inline message to clean up
-    await callback_query.message.delete()
+    await callback_query.answer()
+    await callback_query.edit_message_text(
+        "👋 Welcome to the Inline Admin Panel!",
+        reply_markup=admin_settings_inline_menu
+    )
+
+# NEW: Admin Action handlers from inline admin panel
+@app.on_callback_query(filters.regex("^admin_broadcast_prompt$"))
+async def admin_broadcast_prompt_inline(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    await callback_query.answer()
+    await callback_query.message.edit_text("Please send the message you want to broadcast using the command: `/broadcast <your message>`\n\nReturning to Main Menu for command input.", reply_markup=main_menu_admin)
+    try:
+        await callback_query.message.delete() # Clean up inline message
+    except Exception as e:
+        logger.warning(f"Could not delete inline message: {e}")
+
+@app.on_callback_query(filters.regex("^admin_add_admin_prompt$"))
+async def admin_add_admin_prompt_inline(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    await callback_query.answer()
+    await callback_query.message.edit_text("To add an admin, use the command: `/addadmin <user_id>` (Replace `<user_id>` with the Telegram ID of the user).\n\nReturning to Main Menu for command input.", reply_markup=main_menu_admin)
+    try:
+        await callback_query.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete inline message: {e}")
+
+@app.on_callback_query(filters.regex("^admin_remove_admin_prompt$"))
+async def admin_remove_admin_prompt_inline(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    await callback_query.answer()
+    await callback_query.message.edit_text("To remove an admin, use the command: `/removeadmin <user_id>` (Replace `<user_id>` with the Telegram ID of the admin to demote).\n\nReturning to Main Menu for command input.", reply_markup=main_menu_admin)
+    try:
+        await callback_query.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete inline message: {e}")
+
+@app.on_callback_query(filters.regex("^admin_restart_bot$"))
+async def admin_restart_bot_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    await callback_query.answer("Bot is restarting...", show_alert=True)
+    await callback_query.message.edit_text("🔄 Bot is restarting now. This may take a moment. Please send /start in a few seconds.")
+    await log_to_channel(client, f"Admin `{user_id}` initiated bot restart.")
+    # Exit the current process, ideally a process manager (like systemd, Docker, or forever) will restart it.
+    sys.exit(0)
+
+@app.on_callback_query(filters.regex("^admin_upload_fb$"))
+async def admin_upload_fb_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "Initiating Facebook video upload for admin. Please send the video file directly now.",
+        reply_markup=main_menu_admin # Switch back to reply keyboard for video upload flow
+    )
+    user_states[user_id] = {"step": "awaiting_video_facebook", "platform": "facebook"}
+    try:
+        await callback_query.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete inline message: {e}")
 
 
 @app.on_callback_query(filters.regex("^settings_bot_status_inline$"))
@@ -594,7 +694,7 @@ async def tiktok_login_command(client, message):
         # Simulate token validation (in a real app, this would be an API call)
         access_token = args[1].strip()
         if access_token: # Simple check for non-empty token
-            update_user_data(user_id, {"tiktok_settings.logged_in": True, "tiktok_access_token": access_token})
+            update_user_data(user_id, {"tiktok_settings.logged_in": True, "tiktok_access_token": access_token, "premium_platforms": ["tiktok"]}) # Add tiktok to premium
             await message.reply("✅ TikTok login successful! (Token saved - simulation).", reply_markup=tiktok_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully 'logged into' TikTok.")
         else:
@@ -735,6 +835,8 @@ async def facebook_login_command(client, message):
 
         if response.status_code == 200 and 'id' in response_data:
             store_facebook_access_token_for_user(user_id, access_token)
+            # Add facebook to premium platforms for this user
+            users_collection.update_one({"user_id": user_id}, {"$addToSet": {"premium_platforms": "facebook"}})
             await message.reply("✅ Facebook login successful! Access token saved.", reply_markup=facebook_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully logged into Facebook.")
         else:
@@ -888,7 +990,7 @@ async def youtube_login_command(client, message):
         # Simulate token validation
         access_token = args[1].strip()
         if access_token: # Simple check for non-empty token
-            update_user_data(user_id, {"youtube_logged_in": True, "youtube_access_token": access_token})
+            update_user_data(user_id, {"youtube_logged_in": True, "youtube_access_token": access_token, "premium_platforms": ["youtube"]}) # Add youtube to premium
             await message.reply("✅ YouTube login successful! (Token saved - simulation).", reply_markup=youtube_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully 'logged into' YouTube.")
         else:
@@ -1271,6 +1373,8 @@ async def admin_panel_menu_reply(client, message):
 
 @app.on_message(filters.text & filters.regex("^(📢 Broadcast Message|➕ Add Admin|➖ Remove Admin)$") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_sub_menu_options(client, message):
+    # These handlers simply provide instructions on how to use the commands
+    # The actual command logic is in the @app.on_message(filters.command(...)) handlers
     if message.text == "📢 Broadcast Message":
         await message.reply("Please send the message you want to broadcast using the command: `/broadcast <your message>`")
     elif message.text == "➕ Add Admin":
