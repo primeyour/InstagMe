@@ -26,7 +26,7 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # === MongoDB Configuration ===
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://primemastix:o84aVniXFmKfyMwH@cluster0.qgiry.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://primemastix:o84aVniXmKfyMwH@cluster0.qgiry.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 DB_NAME = "YtBot"
 
 # === Admin and Log Channel Configuration ===
@@ -49,14 +49,10 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 users_collection = db["users"]
 
-# --- Ensure indexes for quick lookups ---
-# Ensure _id is the primary key. If you had a separate 'user_id' field
-# that was indexed uniquely, it needs to be cleared or data migrated.
-# The previous error "dup key: { user_id: null }" suggests an old 'user_id' index
-# was problematic. If you want to keep 'user_id' as a *field* separate from '_id',
-# you need to make sure it's never null during insertion if it has a unique index.
-# For this code, we're explicitly making the Telegram user_id the MongoDB _id.
-# No extra index needed on 'user_id' if it's the _id.
+# --- IMPORTANT: Ensure there is NO unique index on a field named 'user_id' ---
+# The primary key '_id' is already unique. If you manually created a unique index
+# on a separate 'user_id' field, it will cause 'DuplicateKeyError' if that field
+# is ever 'null'. Please remove any such index in MongoDB Atlas.
 
 # === KEYBOARDS ===
 main_menu_user = ReplyKeyboardMarkup(
@@ -77,7 +73,7 @@ main_menu_admin = ReplyKeyboardMarkup(
 
 def get_general_settings_inline_keyboard(user_id):
     keyboard = []
-    if is_premium_user(user_id) or is_admin(user_id): # is_premium_user also covers admins now
+    if is_premium_user(user_id) or is_admin(user_id):
          keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
     if is_admin(user_id):
         keyboard.append([InlineKeyboardButton("Bot Status", callback_data='settings_bot_status_inline')])
@@ -100,7 +96,7 @@ user_settings_inline_menu = InlineKeyboardMarkup(
         [InlineKeyboardButton("🎵 Tik Settings", callback_data='settings_tiktok')],
         [InlineKeyboardButton("📘 Fb Settings", callback_data='settings_facebook')],
         [InlineKeyboardButton("▶️ YT Settings", callback_data='settings_youtube')],
-        [InlineKeyboardButton("⬅️ Back to General Settings", callback_data='settings_main_menu_inline')]
+        [InlineKeyboardButton("⬅️ Back to General Settings", callback_data='settings_user_menu_inline')]
     ]
 )
 
@@ -302,7 +298,10 @@ async def start_command(client, message):
     user_username = message.from_user.username or "N/A"
 
     # Define base user data for new users or for updates
-    # IMPORTANT: _id is set to user_id, no separate 'user_id' field unless needed for legacy
+    # We are using '_id' as the unique identifier, which is the Telegram user_id.
+    # We do not need a separate 'user_id' field unless there's a specific reason.
+    # If a 'user_id' field was previously created with a unique index,
+    # it must be removed from MongoDB as instructed above.
     user_data_to_set = {
         "first_name": user_first_name,
         "username": user_username,
@@ -329,19 +328,25 @@ async def start_command(client, message):
         user_data_to_set["is_premium"] = True
 
     # Use update_one with upsert=True to handle both insertion and update
-    # This prevents DuplicateKeyError if _id (which is user_id) already exists
-    users_collection.update_one(
-        {"_id": user_id},
-        {"$set": user_data_to_set, "$setOnInsert": {"added_at": datetime.now(), "added_by": "self_start"}},
-        upsert=True
-    )
+    # This ensures that even if the document exists, it's updated, and if not, it's created.
+    try:
+        users_collection.update_one(
+            {"_id": user_id},
+            {"$set": user_data_to_set, "$setOnInsert": {"added_at": datetime.now(), "added_by": "self_start"}},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Error during user data update/upsert for user {user_id}: {e}")
+        await message.reply("An error occurred while initializing your account. Please try again later or contact support.")
+        return # Prevent further execution if DB operation failed
 
     # Fetch the updated user document to ensure it reflects current state
     user_doc = get_user_data(user_id)
+    if not user_doc: # This should ideally not happen after upsert, but as a safeguard
+        logger.error(f"Could not retrieve user document for {user_id} after upsert.")
+        await message.reply("Failed to retrieve your account data. Please try /start again.")
+        return
 
-    # Log new user if inserted (this needs a slight change in logic to detect new insert vs update)
-    # A simple way to check if it was truly a new user is to check 'added_at' field existence before the update.
-    # For now, relying on $setOnInsert and just logging the _id.
     await log_to_channel(client, f"User `{user_id}` (`{user_username}` - `{user_first_name}`) performed /start. Role: `{user_doc.get('role')}`, Premium: `{user_doc.get('is_premium')}`.")
 
     if is_admin(user_id):
