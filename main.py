@@ -12,7 +12,7 @@ import sys # For sys.exit()
 from pyrogram import Client, filters, enums # Import enums for ParseMode
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
 import requests
 
 # --- Configure Logging ---
@@ -26,8 +26,9 @@ TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # === MongoDB Configuration ===
+# UPDATED MONGODB URI AND DB_NAME
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://primemastix:o84aVniXFmKfyMwH@cluster0.qgiry.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-DB_NAME = "YtBot"
+DB_NAME = "YtBot" # New database name as requested
 
 # === Admin and Log Channel Configuration ===
 OWNER_ID = int(os.getenv("OWNER_ID", "7577977996")) # Your provided Admin ID
@@ -47,10 +48,14 @@ app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, b
 
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
-users_collection = db["users"] # Using 'users_collection' as established
+users_collection = db["users"] # Using 'users_collection' within the 'YtBot' database
 
 # --- Ensure indexes for quick lookups ---
-users_collection.create_index("user_id", unique=True) # Ensure 'user_id' is indexed
+# Using _id as primary key and ensuring user_id is the _id for users_collection
+# If you decide to keep 'user_id' as a separate field and not as _id, then we'd need:
+# users_collection.create_index([("user_id", ASCENDING)], unique=True)
+# For now, let's assume _id IS the user ID for simplicity and efficiency.
+# The `_id` field is automatically indexed by MongoDB, but we need to ensure our operations use it correctly.
 
 # === KEYBOARDS ===
 # Main menu remains ReplyKeyboardMarkup as it's the primary navigation
@@ -92,12 +97,12 @@ def get_general_settings_inline_keyboard(user_id):
 # NEW: Your provided Admin Markup (Inline) - This is the main inline admin panel
 Admin_markup = InlineKeyboardMarkup([
     [InlineKeyboardButton("👥 Users List", callback_data="admin_users_list")],
-    [InlineKeyboardButton("➕ Add User", callback_data="admin_add_user_prompt")], # Changed callback_data for consistency
-    [InlineKeyboardButton("➖ Remove User", callback_data="admin_remove_user_prompt")], # Changed callback_data for consistency
-    [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_prompt")], # Changed callback_data for consistency
-    [InlineKeyboardButton("🔄 Restart Bot", callback_data='admin_restart_bot')], # Added Restart Bot here as per previous request
-    [InlineKeyboardButton("📤 Admin Upload Video (Facebook)", callback_data='admin_upload_fb')], # Added Admin FB Upload
-    [InlineKeyboardButton("🔙 Back to General Settings", callback_data="settings_main_menu_inline")] # Changed back button target
+    [InlineKeyboardButton("➕ Add User", callback_data="admin_add_user_prompt")],
+    [InlineKeyboardButton("➖ Remove User", callback_data="admin_remove_user_prompt")],
+    [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_prompt")],
+    [InlineKeyboardButton("🔄 Restart Bot", callback_data='admin_restart_bot')],
+    [InlineKeyboardButton("📤 Admin Upload Video (Facebook)", callback_data='admin_upload_fb')],
+    [InlineKeyboardButton("🔙 Back to General Settings", callback_data="settings_main_menu_inline")] # Corrected back button target
 ])
 
 
@@ -231,12 +236,12 @@ AWAITING_TIKTOK_ACCESS_TOKEN = "awaiting_tiktok_access_token" # Placeholder for 
 
 # === HELPERS ===
 def get_user_data(user_id):
-    """Retrieves user data from MongoDB."""
-    return users_collection.find_one({"user_id": user_id}) # Using 'user_id' as key
+    """Retrieves user data from MongoDB using _id."""
+    return users_collection.find_one({"_id": user_id})
 
 def update_user_data(user_id, data):
-    """Updates user data in MongoDB."""
-    users_collection.update_one({"user_id": user_id}, {"$set": data}, upsert=True)
+    """Updates user data in MongoDB using _id for upsert."""
+    users_collection.update_one({"_id": user_id}, {"$set": data}, upsert=True)
 
 def is_admin(user_id):
     """Checks if a user is an admin."""
@@ -244,10 +249,9 @@ def is_admin(user_id):
     return user_doc and user_doc.get("role") == "admin"
 
 def is_premium_user(user_id):
-    """Checks if a user is a premium user (has access to any premium platform)."""
+    """Checks if a user is a premium user (checks 'is_premium' boolean)."""
     user_doc = get_user_data(user_id)
-    # A user is premium if their 'premium_platforms' list is not empty
-    return user_doc and user_doc.get("premium_platforms") and len(user_doc.get("premium_platforms")) > 0
+    return user_doc and user_doc.get("is_premium", False) # Default to False if not present
 
 async def log_to_channel(client, message_text):
     """Sends a message to the designated log channel."""
@@ -337,7 +341,7 @@ async def start_command(client, message):
     if not user_doc:
         # Initialize new user data
         initial_user_data = {
-            "user_id": user_id,
+            "_id": user_id, # Use user_id as the MongoDB _id
             "role": "user", # Default role
             "first_name": user_first_name,
             "username": user_username,
@@ -346,9 +350,7 @@ async def start_command(client, message):
             "added_by": "self_start",
             "added_at": datetime.now(),
             "facebook_access_token": None,
-            "tiktok_logged_in": False,
-            "youtube_logged_in": False,
-            "premium_platforms": [], # e.g., ["facebook", "tiktok"]
+            "premium_platforms": [], # e.g., ["facebook", "tiktok", "youtube"]
             "total_uploads": 0,
             "tiktok_settings": {
                 "logged_in": False,
@@ -376,7 +378,7 @@ async def start_command(client, message):
                 "expiry_date": ""
             }
         }
-        update_user_data(user_id, initial_user_data)
+        users_collection.insert_one(initial_user_data) # Use insert_one for new documents
         await log_to_channel(client, f"🌟 New user started bot: `{user_id}` (`{user_username}` - `{user_first_name}`).")
         user_doc = get_user_data(user_id) # Reload user_doc after insert
 
@@ -384,12 +386,14 @@ async def start_command(client, message):
         if user_id == OWNER_ID:
             update_user_data(user_id, {"role": "admin", "is_premium": True}) # Owner is always admin and premium
             await log_to_channel(client, f"Owner `{user_id}` initialized as admin and premium.")
-            # Reload user_doc after update
-            user_doc = get_user_data(user_id)
+            user_doc = get_user_data(user_id) # Reload user_doc after update
 
-    # Always update last_active
-    update_user_data(user_id, {"last_active": datetime.now(), "first_name": user_first_name, "username": user_username})
-
+    # Always update last_active, first_name, and username
+    update_user_data(user_id, {
+        "last_active": datetime.now(),
+        "first_name": user_first_name,
+        "username": user_username # Ensure username is updated
+    })
 
     if is_admin(user_id):
         welcome_msg = (
@@ -412,10 +416,13 @@ async def start_command(client, message):
         contact_admin_text = (
             f"👋 **Hi {user_first_name}!**\n\n"
             "**This Bot Lets You Upload Any Size Instagram Reels & Posts Directly From Telegram**.\n\n"
-            "• **Unlock Full Premium Features**:\n"
-            "• **Upload Unlimited Videos**\n"
-            "• **Auto Captions & Hashtags**\n"
-            "• **Reel Or Post Type Selection**\n\n"
+            "• **Unlock Full Premium Features for:**\n"
+            "  • **YouTube (Shorts & Videos)**\n"
+            "  • **Facebook (Reels & Posts)**\n"
+            "  • **TikTok (Videos)**\n\n"
+            "• **Enjoy Unlimited Video Uploads**\n"
+            "• **Automatic Captions & Hashtags (Configurable)**\n"
+            "• **Reel, Post, or Short Type Selection**\n\n"
             f"👤 Contact **[ADMIN TOM](https://t.me/{ADMIN_TOM_USERNAME})** **To Upgrade Your Access**.\n"
             "🔐 **Your Data Is Fully ✅Encrypted**\n\n"
             f"🆔 Your User ID: `{user_id}`"
@@ -432,13 +439,6 @@ async def start_command(client, message):
             reply_markup=join_channel_markup,
             parse_mode=enums.ParseMode.MARKDOWN
         )
-        # Ensure they don't see the main menu after this.
-        # If they've used the bot before, clear existing reply keyboard.
-        # This might not be strictly necessary if send_photo effectively replaces,
-        # but it's good practice for clarity.
-        # For simplicity, we just send the photo and caption.
-        # They will only get the full menu if they are upgraded.
-
 
 # --- Admin Commands --- (UNCHANGED, but `is_admin` check ensures proper access)
 @app.on_message(filters.command("addadmin") & filters.user(OWNER_ID))
@@ -455,7 +455,10 @@ async def add_admin_command(client, message):
         if user_doc:
             update_user_data(target_user_id, {"role": "admin", "is_premium": True}) # Admins are also premium
             await message.reply(f"✅ User `{target_user_id}` has been promoted to admin and premium.")
-            await client.send_message(target_user_id, "🎉 You have been promoted to an admin! Use /start to see your new options.")
+            try:
+                await client.send_message(target_user_id, "🎉 You have been promoted to an admin! Use /start to see your new options.")
+            except Exception:
+                logger.warning(f"Could not notify user {target_user_id} about admin promotion.")
             await log_to_channel(client, f"User `{target_user_id}` promoted to admin by `{message.from_user.id}`.")
         else:
             await message.reply(f"User `{target_user_id}` not found in database. Ask them to send /start first.")
@@ -482,7 +485,10 @@ async def remove_admin_command(client, message):
 
             update_user_data(target_user_id, {"role": "user", "is_premium": False, "premium_platforms": []}) # Demote and remove premium
             await message.reply(f"✅ User `{target_user_id}` has been demoted to a regular user and removed from premium.")
-            await client.send_message(target_user_id, "You have been demoted from admin status.")
+            try:
+                await client.send_message(target_user_id, "You have been demoted from admin status.")
+            except Exception:
+                logger.warning(f"Could not notify user {target_user_id} about admin demotion.")
             await log_to_channel(client, f"User `{target_user_id}` demoted from admin by `{message.from_user.id}`.")
         else:
             await message.reply(f"User `{target_user_id}` is not an admin or not found.")
@@ -490,11 +496,6 @@ async def remove_admin_command(client, message):
     except Exception as e:
         await message.reply(f"❌ Failed to remove admin: {e}")
         logger.error(f"Failed to remove admin: {e}")
-
-# Broadcast command is now triggered by an inline button prompt
-# @app.on_message(filters.command("broadcast") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
-# async def broadcast_message(client, message):
-# This will now be handled by a conversation state. See below.
 
 # --- Settings Menu Handlers (Reply Keyboard & Inline) ---
 
@@ -532,10 +533,11 @@ async def back_to_main_menu_from_inline(client, callback_query):
     user_id = callback_query.from_user.id
     user_states.pop(user_id, None) # Clear any ongoing conversation state
     await callback_query.answer("Returning to Main Menu.")
+    # Send a new message with the reply keyboard
     if is_admin(user_id):
-        await callback_query.message.reply("Returning to Main Menu.", reply_markup=main_menu_admin)
+        await client.send_message(user_id, "Returning to Main Menu.", reply_markup=main_menu_admin)
     else:
-        await callback_query.message.reply("Returning to Main Menu.", reply_markup=main_menu_user)
+        await client.send_message(user_id, "Returning to Main Menu.", reply_markup=main_menu_user)
     # Delete the inline message to clean up UI
     try:
         await callback_query.message.delete()
@@ -571,7 +573,7 @@ async def admin_users_list_inline(client, callback_query):
         return
     await callback_query.answer("Fetching users list...")
 
-    all_users = list(users_collection.find({}, {"user_id": 1, "first_name": 1, "username": 1, "role": 1, "is_premium": 1}))
+    all_users = list(users_collection.find({}, {"_id": 1, "first_name": 1, "username": 1, "role": 1, "is_premium": 1}))
     user_list_text = "**👥 All Users:**\n\n"
     if not all_users:
         user_list_text += "No users found in the database."
@@ -580,7 +582,7 @@ async def admin_users_list_inline(client, callback_query):
             role = user.get("role", "user").capitalize()
             premium_status = "⭐ Premium" if user.get("is_premium") else ""
             user_list_text += (
-                f"ID: `{user['user_id']}`\n"
+                f"ID: `{user['_id']}`\n" # Use _id here
                 f"Name: `{user.get('first_name', 'N/A')}`\n"
                 f"Username: `@{user.get('username', 'N/A')}`\n"
                 f"Role: `{role}` {premium_status}\n\n"
@@ -599,8 +601,7 @@ async def admin_add_user_prompt_inline(client, callback_query):
     user_states[user_id] = {"step": "admin_awaiting_user_id_to_add"}
     await callback_query.edit_message_text(
         "Please send the Telegram User ID of the user you want to add as premium (or add to DB if new).\n"
-        "Usage: `/addpremium <user_id>`\n"
-        "Or simply enter the ID if the user has already sent /start.",
+        "Simply enter the ID.", # Removed /addpremium as it's now an inline flow
         reply_markup=Admin_markup # Keep admin markup for easy navigation
     )
 
@@ -626,7 +627,7 @@ async def admin_add_user_id_input(client, message):
         else:
             # If user not in DB, add them as premium directly
             new_user_data = {
-                "user_id": target_user_id,
+                "_id": target_user_id, # Use _id as the user ID
                 "role": "user",
                 "first_name": "Unknown", # Can't get real name without a message from them
                 "username": "N/A",
@@ -640,7 +641,7 @@ async def admin_add_user_id_input(client, message):
                 "tiktok_settings": {},
                 "youtube_settings": {}
             }
-            update_user_data(target_user_id, new_user_data)
+            users_collection.insert_one(new_user_data) # Use insert_one for new documents
             await message.reply(f"✅ User `{target_user_id}` not found, added to database and marked as premium.", reply_markup=Admin_markup)
             try:
                 await client.send_message(target_user_id, "🎉 Congratulations! Your account has been created and upgraded to premium! Use /start to begin.")
@@ -664,8 +665,7 @@ async def admin_remove_user_prompt_inline(client, callback_query):
     user_states[user_id] = {"step": "admin_awaiting_user_id_to_remove"}
     await callback_query.edit_message_text(
         "Please send the Telegram User ID of the user you want to remove from premium access.\n"
-        "Usage: `/removepremium <user_id>`\n"
-        "Or simply enter the ID.",
+        "Simply enter the ID.", # Removed /removepremium
         reply_markup=Admin_markup
     )
 
@@ -724,7 +724,8 @@ async def broadcast_message_handler(client, message):
     await message.reply("Starting broadcast...")
     await log_to_channel(client, f"Broadcast initiated by `{user_id}` with message: '{text_to_broadcast[:50]}...'")
 
-    all_user_ids = [user["user_id"] for user in users_collection.find({}, {"user_id": 1})]
+    # Fetch all user IDs, using _id as the unique identifier
+    all_user_ids = [user["_id"] for user in users_collection.find({}, {"_id": 1})]
     success_count = 0
     fail_count = 0
 
@@ -772,12 +773,15 @@ async def admin_upload_fb_callback(client, callback_query):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
     await callback_query.answer()
+    # Edit the inline message to prompt for video, keeping the admin in a flow
     await callback_query.message.edit_text(
         "Initiating Facebook video upload for admin. Please send the video file directly now.",
-        reply_markup=main_menu_admin # Switch back to reply keyboard for video upload flow
+        reply_markup=None # Remove the inline admin menu temporarily
     )
+    # Also, send a reply keyboard so they can easily go back if needed
+    await client.send_message(user_id, "You can use '🔙 Main Menu' to cancel the upload.", reply_markup=main_menu_admin)
     user_states[user_id] = {"step": "awaiting_video_facebook", "platform": "facebook"}
-    # No need to delete message as we edited it.
+
 
 @app.on_callback_query(filters.regex("^settings_bot_status_inline$"))
 async def settings_bot_status_inline_callback(client, callback_query):
@@ -854,7 +858,18 @@ async def tiktok_login_command(client, message):
 
         access_token = args[1].strip()
         if access_token:
-            update_user_data(user_id, {"tiktok_settings.logged_in": True, "tiktok_access_token": access_token, "premium_platforms": ["tiktok"], "is_premium": True}) # Add tiktok to premium, set is_premium
+            # Ensure premium_platforms is a list and add 'tiktok' if not present
+            user_doc = get_user_data(user_id)
+            premium_platforms = user_doc.get("premium_platforms", [])
+            if "tiktok" not in premium_platforms:
+                premium_platforms.append("tiktok")
+
+            update_user_data(user_id, {
+                "tiktok_settings.logged_in": True,
+                "tiktok_access_token": access_token,
+                "premium_platforms": premium_platforms,
+                "is_premium": True
+            })
             await message.reply("✅ TikTok login successful! (Token saved - simulation).", reply_markup=tiktok_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully 'logged into' TikTok and set as premium.")
         else:
@@ -994,8 +1009,17 @@ async def facebook_login_command(client, message):
         response_data = response.json()
 
         if response.status_code == 200 and 'id' in response_data:
-            store_facebook_access_token_for_user(user_id, access_token)
-            users_collection.update_one({"user_id": user_id}, {"$addToSet": {"premium_platforms": "facebook"}, "$set": {"is_premium": True}}) # Add facebook to premium, set is_premium
+            # Ensure premium_platforms is a list and add 'facebook' if not present
+            user_doc = get_user_data(user_id)
+            premium_platforms = user_doc.get("premium_platforms", [])
+            if "facebook" not in premium_platforms:
+                premium_platforms.append("facebook")
+
+            update_user_data(user_id, {
+                "facebook_access_token": access_token,
+                "premium_platforms": premium_platforms,
+                "is_premium": True
+            })
             await message.reply("✅ Facebook login successful! Access token saved.", reply_markup=facebook_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully logged into Facebook and set as premium.")
         else:
@@ -1149,7 +1173,18 @@ async def youtube_login_command(client, message):
         # Simulate token validation
         access_token = args[1].strip()
         if access_token: # Simple check for non-empty token
-            update_user_data(user_id, {"youtube_logged_in": True, "youtube_access_token": access_token, "premium_platforms": ["youtube"], "is_premium": True}) # Add youtube to premium, set is_premium
+            # Ensure premium_platforms is a list and add 'youtube' if not present
+            user_doc = get_user_data(user_id)
+            premium_platforms = user_doc.get("premium_platforms", [])
+            if "youtube" not in premium_platforms:
+                premium_platforms.append("youtube")
+
+            update_user_data(user_id, {
+                "youtube_logged_in": True,
+                "youtube_access_token": access_token,
+                "premium_platforms": premium_platforms,
+                "is_premium": True
+            })
             await message.reply("✅ YouTube login successful! (Token saved - simulation).", reply_markup=youtube_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` successfully 'logged into' YouTube and set as premium.")
         else:
@@ -1506,7 +1541,7 @@ async def initiate_upload(client, message, user_id):
             if fb_result and 'id' in fb_result:
                 await client.send_message(user_id, f"✅ Uploaded to Facebook! Video ID: `{fb_result['id']}`")
                 # Increment total uploads
-                users_collection.update_one({"user_id": user_id}, {"$inc": {"total_uploads": 1}})
+                users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1}}) # Use _id
                 await log_to_channel(client, f"User `{user_id}` successfully uploaded to Facebook. Video ID: `{fb_result['id']}`. File: `{os.path.basename(processed_file_path)}`")
             else:
                 await client.send_message(user_id, f"❌ Facebook upload failed: `{fb_result}`")
