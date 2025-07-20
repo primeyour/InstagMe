@@ -5,5 +5,3 @@ TgCrypto
 python-dotenv
 ntplib==0.4.0
 pymongo
-google-auth
-google-api-python-client
