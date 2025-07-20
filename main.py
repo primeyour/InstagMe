@@ -8,22 +8,12 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 import sys
-import urllib.parse
-import uuid # For unique filenames
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 import requests
-
-# Google API Client Imports (for YouTube)
-# You need to install these: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -46,16 +36,16 @@ ADMIN_TOM_USERNAME = "CjjTom"
 CHANNEL_LINK = "https://t.me/KeralaCaptain"
 CHANNEL_PHOTO_URL = "https://i.postimg.cc/SXDxJ92z/x.jpg"
 
-# === Facebook API Configuration ===
+# === Facebook API Configuration (APP ID and SECRET needed for token exchange if implemented fully) ===
 FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID", "")
 FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "")
-FACEBOOK_REDIRECT_URI = os.getenv("FACEBOOK_REDIRECT_URI", "http://localhost:8080/facebook_oauth_callback")
+# FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN are now specific to user's choice,
+# but might be used as a fallback or for admin's direct uploads.
+# For dynamic selection, these are less critical for end-user functionality.
+# Keeping them for potential admin-level bot-managed page or fallback.
+FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "") # This will be for admin or fallback
+FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "") # This will be for admin or fallback
 
-# === YouTube API Configuration ===
-YOUTUBE_CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID", "")
-YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", "")
-YOUTUBE_REDIRECT_URI = os.getenv("YOUTUBE_REDIRECT_URI", "http://localhost:8080/youtube_oauth_callback")
-YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube", "https://www.googleapis.com/auth/userinfo.profile"]
 
 # === GLOBAL CLIENTS AND DB ===
 app = Client("upload_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=TELEGRAM_BOT_TOKEN)
@@ -75,11 +65,11 @@ try:
 except Exception as e:
     logger.error(f"Error checking/dropping problematic user_id index: {e}")
 
+
 # === KEYBOARDS ===
-# MODIFIED: Added YouTube Upload button to main menus
 main_menu_user = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📤 Upload Video (Facebook)"), KeyboardButton("📤 Upload Video (YouTube)")],
+        [KeyboardButton("📤 Upload Video (Facebook)")],
         [KeyboardButton("⚙️ Settings")]
     ],
     resize_keyboard=True
@@ -87,7 +77,7 @@ main_menu_user = ReplyKeyboardMarkup(
 
 main_menu_admin = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("📤 Upload Video (Facebook)"), KeyboardButton("📤 Upload Video (YouTube)")],
+        [KeyboardButton("📤 Upload Video (Facebook)")],
         [KeyboardButton("⚙️ Settings"), KeyboardButton("👤 Admin Panel")]
     ],
     resize_keyboard=True
@@ -119,7 +109,7 @@ user_settings_inline_menu = InlineKeyboardMarkup(
         [InlineKeyboardButton("🎵 TikTok Settings", callback_data='settings_tiktok')],
         [InlineKeyboardButton("📘 Facebook Settings", callback_data='settings_facebook')],
         [InlineKeyboardButton("▶️ YouTube Settings", callback_data='settings_youtube')],
-        [InlineKeyboardButton("⬅️ Back to General Settings", callback_data='settings_user_menu_inline')]
+        [InlineKeyboardButton("⬅️ Back to General Settings", callback_data='settings_main_menu_inline')]
     ]
 )
 
@@ -137,25 +127,21 @@ tiktok_settings_inline_menu = InlineKeyboardMarkup(
 
 # New: Inline keyboard for Facebook pages for settings/info
 def get_facebook_page_selection_markup(user_id, for_upload=False):
-    """Generates inline keyboard for selecting Facebook pages, dynamically including linked pages."""
     user_doc = get_user_data(user_id)
     linked_pages = user_doc.get("facebook_linked_pages", [])
-
+    
     keyboard = []
     if linked_pages:
         for page in linked_pages:
             page_name = page.get("name", "Unnamed Page")
+            # Optionally, add a checkmark if this page is the 'active' one in user_states
+            # For this implementation, we'll just list them.
             callback_data = f'select_fb_page_{page["id"]}'
-            if for_upload:
-                callback_data += f'_upload' # Differentiate callback for upload flow
             keyboard.append([InlineKeyboardButton(page_name, callback_data=callback_data)])
-    else:
-        # Added message if no pages are linked
-        keyboard.append([InlineKeyboardButton("No Pages Linked Yet", callback_data='no_fb_pages')])
-
+    
     # Add a 'Login/Link New Page' button
     keyboard.append([InlineKeyboardButton("🔑 Link/Refresh Facebook Pages", callback_data='fb_login_prompt')])
-
+    
     # Add settings buttons if not for upload flow
     if not for_upload:
         keyboard.extend([
@@ -185,6 +171,7 @@ facebook_settings_inline_menu_main = InlineKeyboardMarkup(
         [InlineKeyboardButton("⬅️ Back to User Settings", callback_data='settings_user_menu_inline')]
     ]
 )
+
 
 youtube_settings_inline_menu = InlineKeyboardMarkup(
     [
@@ -234,6 +221,7 @@ def get_privacy_inline_menu(platform):
         keyboard.append([InlineKeyboardButton("Unlisted", callback_data='yt_privacy_unlisted')])
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f'settings_{platform}')])
     return InlineKeyboardMarkup(keyboard)
+
 
 # === USER STATES (for sequential conversation flows) ===
 user_states = {}
@@ -300,6 +288,17 @@ async def log_to_channel(client, message_text):
     except Exception as e:
         logger.error(f"Failed to send message to log channel (ID: {LOG_CHANNEL_ID}): {e}")
 
+# This function is now deprecated for dynamic page selection
+# def get_facebook_access_token_for_user(user_id):
+#     """Retrieves Facebook access token from user data."""
+#     user_doc = get_user_data(user_id)
+#     return user_doc.get("facebook_access_token")
+
+# This function is now deprecated for dynamic page selection
+# def store_facebook_access_token_for_user(user_id, token):
+#     """Stores Facebook access token in user data."""
+#     update_user_data(user_id, {"facebook_access_token": token})
+
 def upload_facebook_video(file_path, title, description, page_access_token, page_id, visibility="PUBLISHED", schedule_time=None):
     """Uploads a video to a specific Facebook Page using Graph API and its Page Access Token."""
     if not all([file_path, title, description, page_access_token, page_id]):
@@ -308,7 +307,7 @@ def upload_facebook_video(file_path, title, description, page_access_token, page
     post_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
 
     params = {
-        'access_token': page_access_token,
+        'access_token': page_access_token, # Use page_access_token
         'title': title,
         'description': description,
     }
@@ -336,86 +335,10 @@ def upload_facebook_video(file_path, title, description, page_access_token, page
         logger.info(f"Facebook video upload result for page {page_id}: {result}")
         return result
 
-async def upload_youtube_video(file_path, title, description, user_id):
-    """
-    Uploads a video to YouTube using the user's stored credentials.
-    Requires google-api-python-client, google-auth-oauthlib, google-auth-httplib2.
-    """
-    user_doc = get_user_data(user_id)
-    creds_data = user_doc.get("youtube_credentials")
-
-    if not creds_data:
-        raise ValueError("YouTube credentials not found for this user. Please link your YouTube account.")
-
-    # Convert stored JSON credentials back to Credentials object
-    creds = Credentials.from_authorized_user_info(json.loads(creds_data), YOUTUBE_SCOPES)
-
-
-    # If the token is expired and there's a refresh token, refresh it.
-    if not creds.valid and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            update_user_data(user_id, {"youtube_credentials": creds.to_json()})
-            logger.info(f"YouTube credentials refreshed for user {user_id}.")
-        except Exception as e:
-            logger.error(f"Error refreshing YouTube token for user {user_id}: {e}")
-            raise ValueError("Failed to refresh YouTube access token. Please re-link your account.")
-    elif not creds.valid and not creds.refresh_token:
-        raise ValueError("YouTube access token expired and no refresh token available. Please re-link your account.")
-    elif not creds.valid:
-        raise ValueError("YouTube access token is invalid. Please re-link your account.")
-
-
-    try:
-        youtube = build('youtube', 'v3', credentials=creds)
-
-        body = {
-            'snippet': {
-                'title': title,
-                'description': description,
-                'tags': user_doc.get('youtube_settings', {}).get('tag', '').split(','),
-                'categoryId': '22' # Example category: People & Blogs
-            },
-            'status': {
-                'privacyStatus': user_doc.get('youtube_settings', {}).get('privacy', 'public').lower(),
-                'selfDeclaredMadeForKids': False, # You might want to make this configurable
-            }
-        }
-
-        # If it's a Short, mark it as such. YouTube detects shorts based on aspect ratio usually.
-        # This metadata helps, but the video dimensions are key.
-        if user_doc.get('youtube_settings', {}).get('video_type') == 'Shorts (Short Vertical Video)':
-            body['snippet']['description'] = f"{description}\n#shorts" # Add shorts hashtag to description
-
-        media_body = MediaFileUpload(file_path, chunksize=-1, resumable=True)
-
-        logger.info(f"Initiating YouTube upload for user {user_id} with title: {title}")
-        request = youtube.videos().insert(
-            part='snippet,status',
-            body=body,
-            media_body=media_body
-        )
-
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                logger.info(f"Uploaded {int(status.resumable_progress * 100)}% of YouTube video for user {user_id}")
-
-        logger.info(f"YouTube video upload complete for user {user_id}. Video ID: {response.get('id')}")
-        return response
-
-    except HttpError as e:
-        logger.error(f"An HTTP error occurred during YouTube upload for user {user_id}: {e.resp.status} - {e.content}")
-        raise RuntimeError(f"YouTube API Error: {e.content.decode()}")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during YouTube upload for user {user_id}: {e}")
-        raise RuntimeError(f"YouTube upload failed: {e}")
-
-
 def convert_video_to_mp4(input_path, output_path):
     """
-    Converts video to MP4 format, copying video and audio streams. Ensures output is MP4.
+    Converts video to MP4 format, copying video and audio streams.
+    Ensures output is MP4.
     """
     command = ["ffmpeg", "-i", input_path, "-c:v", "copy", "-c:a", "copy", "-map", "0", "-y", output_path]
     logger.info(f"[FFmpeg] Initiating video conversion for {input_path}")
@@ -435,181 +358,6 @@ def convert_video_to_mp4(input_path, output_path):
     except Exception as e:
         logger.error(f"An unexpected error occurred during FFmpeg conversion: {e}")
         raise
-
-
-# === KEEP ALIVE SERVER (for OAuth Callbacks) ===
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed_path = urllib.parse.urlparse(self.path)
-        query_params = urllib.parse.parse_qs(parsed_path.query)
-
-        if parsed_path.path == "/facebook_oauth_callback":
-            self.handle_facebook_oauth_callback(query_params)
-        elif parsed_path.path == "/youtube_oauth_callback":
-            self.handle_youtube_oauth_callback(query_params)
-        else:
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b"<h1>Bot Server is Running!</h1><p>This port is used for OAuth callbacks.</p>")
-
-    def handle_facebook_oauth_callback(self, query_params):
-        code = query_params.get('code', [None])[0]
-        state = query_params.get('state', [None])[0] # This 'state' should be the user_id
-
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-
-        if not code or not state:
-            self.wfile.write(b"<h1>Facebook OAuth Failed</h1><p>Missing code or state parameter.</p><p>Please try again from the Telegram bot.</p>")
-            logger.error(f"Facebook OAuth callback missing code or state. Query: {query_params}")
-            return
-
-        user_id = int(state) # Convert state back to user_id
-
-        try:
-            # Exchange code for access token
-            token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
-            token_params = {
-                'client_id': FACEBOOK_APP_ID,
-                'client_secret': FACEBOOK_APP_SECRET,
-                'redirect_uri': FACEBOOK_REDIRECT_URI,
-                'code': code
-            }
-            response = requests.get(token_url, params=token_params)
-            response.raise_for_status()
-            token_data = response.json()
-            user_access_token = token_data.get('access_token')
-
-            if not user_access_token:
-                raise ValueError("No user access token received from Facebook.")
-
-            # Get user's linked pages and their access tokens
-            pages_url = f"https://graph.facebook.com/v19.0/me/accounts?access_token={user_access_token}"
-            pages_response = requests.get(pages_url)
-            pages_response.raise_for_status()
-            pages_data = pages_response.json()
-            linked_pages = []
-            for page in pages_data.get('data', []):
-                linked_pages.append({
-                    "id": page.get("id"),
-                    "name": page.get("name"),
-                    "access_token": page.get("access_token"), # This is the page access token
-                    "category": page.get("category"),
-                    "perms": page.get("perms", []),
-                    "linked_at": datetime.now().isoformat()
-                })
-
-            # Update user data in MongoDB
-            update_user_data(user_id, {
-                "facebook_user_access_token": user_access_token, # Store user access token for future use if needed
-                "facebook_linked_pages": linked_pages
-            })
-
-            # IMPROVED: Feedback if no pages were linked
-            feedback_message = ""
-            if not linked_pages:
-                feedback_message = "<p><b>Important:</b> No Facebook Pages were found linked to your account with the granted permissions. Please ensure you granted 'Manage your Pages' and 'Show a list of the Pages you manage' permissions during the Facebook login process.</p>"
-            else:
-                feedback_message = f"<p>Successfully linked {len(linked_pages)} Facebook Page(s).</p>"
-
-            self.wfile.write(f"<h1>Facebook Account Linked Successfully!</h1>{feedback_message}<p>You can now close this window and return to the Telegram bot.</p>".encode())
-            # Send confirmation message to Telegram bot
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "Facebook", True, len(linked_pages))).start()
-            logger.info(f"Facebook OAuth successful for user {user_id}. Linked {len(linked_pages)} pages.")
-
-        except requests.exceptions.RequestException as req_e:
-            self.wfile.write(b"<h1>Facebook OAuth Failed</h1><p>Network or API error during token exchange/page fetch.</p><p>Please try again from the Telegram bot. Check your Redirect URI setup.</p>")
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "Facebook", False, 0, f"Network/API Error: {req_e}")).start()
-            logger.error(f"Facebook OAuth Request Error for user {user_id}: {req_e}", exc_info=True)
-        except Exception as e:
-            self.wfile.write(b"<h1>Facebook OAuth Failed</h1><p>An unexpected error occurred: " + str(e).encode() + b"</p><p>Please try again from the Telegram bot.</p>")
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "Facebook", False, 0, f"Unexpected Error: {e}")).start()
-            logger.error(f"Facebook OAuth General Error for user {user_id}: {e}", exc_info=True)
-
-    def handle_youtube_oauth_callback(self, query_params):
-        code = query_params.get('code', [None])[0]
-        state = query_params.get('state', [None])[0] # This 'state' should be the user_id
-
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-
-        if not code or not state:
-            self.wfile.write(b"<h1>YouTube OAuth Failed</h1><p>Missing code or state parameter.</p><p>Please try again from the Telegram bot.</p>")
-            logger.error(f"YouTube OAuth callback missing code or state. Query: {query_params}")
-            return
-
-        user_id = int(state) # Convert state back to user_id
-
-        try:
-            # The 'token_uri' and 'scopes' are needed for Credentials.from_authorized_user_info
-            credentials_data = {
-                "client_id": YOUTUBE_CLIENT_ID,
-                "client_secret": YOUTUBE_CLIENT_SECRET,
-                "redirect_uri": YOUTUBE_REDIRECT_URI,
-                "code": code,
-                "grant_type": "authorization_code",
-                "token_uri": "https://oauth2.googleapis.com/token", # Essential for Credential object
-                "scopes": YOUTUBE_SCOPES # Essential for Credential object
-            }
-            
-            token_response = requests.post("https://oauth2.googleapis.com/token", data=credentials_data)
-            token_response.raise_for_status()
-            token_json = token_response.json()
-
-            # Add missing fields to token_json for Credentials.from_authorized_user_info
-            token_json['client_id'] = YOUTUBE_CLIENT_ID
-            token_json['client_secret'] = YOUTUBE_CLIENT_SECRET
-            token_json['token_uri'] = "https://oauth2.googleapis.com/token"
-            token_json['scopes'] = YOUTUBE_SCOPES
-
-
-            creds = Credentials.from_authorized_user_info(token_json, YOUTUBE_SCOPES)
-
-            # Store the credentials in MongoDB
-            update_user_data(user_id, {"youtube_credentials": creds.to_json()})
-
-            self.wfile.write(b"<h1>YouTube Account Linked Successfully!</h1><p>You can now close this window and return to the Telegram bot.</p>")
-            # Send confirmation message to Telegram bot
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "YouTube", True, 0)).start()
-            logger.info(f"YouTube OAuth successful for user {user_id}.")
-
-        except requests.exceptions.RequestException as req_e:
-            self.wfile.write(b"<h1>YouTube OAuth Failed</h1><p>Network or API error during token exchange.</p><p>Please try again from the Telegram bot. Check your Redirect URI setup.</p>")
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "YouTube", False, 0, f"Network/API Error: {req_e}")).start()
-            logger.error(f"YouTube OAuth Request Error for user {user_id}: {req_e}", exc_info=True)
-        except Exception as e:
-            self.wfile.write(b"<h1>YouTube OAuth Failed</h1><p>An unexpected error occurred: " + str(e).encode() + b"</p><p>Please try again from the Telegram bot.</p>")
-            threading.Thread(target=self.send_telegram_confirmation, args=(user_id, "YouTube", False, 0, f"Unexpected Error: {e}")).start()
-            logger.error(f"YouTube OAuth General Error for user {user_id}: {e}", exc_info=True)
-
-    # MODIFIED: Added num_linked_pages for Facebook feedback, and made error_message optional
-    def send_telegram_confirmation(self, user_id, platform, success, num_linked_pages=0, error_message=""):
-        try:
-            if success:
-                if platform == "Facebook":
-                    if num_linked_pages > 0:
-                        app.send_message(user_id, f"✅ **Facebook Account Linked!**\n\nYour Facebook account has been successfully connected, and **{num_linked_pages} page(s)** detected. You can now upload videos to your Facebook Pages.")
-                    else:
-                        app.send_message(user_id, f"✅ **Facebook Account Linked! (No Pages Found)**\n\nYour Facebook account has been connected. However, no pages were detected. Please ensure you granted 'Manage your Pages' and 'Show a list of the Pages you manage' permissions during the Facebook login process if you want to upload to pages.")
-                else: # YouTube
-                    app.send_message(user_id, f"✅ **{platform} Account Linked!**\n\nYour {platform} account has been successfully connected. You can now use the bot's upload features for {platform}.")
-            else:
-                app.send_message(user_id, f"❌ **{platform} Account Linking Failed!**\n\nThere was an issue connecting your {platform} account. Please try again. Error: `{error_message}`")
-            logger.info(f"Sent {platform} OAuth confirmation to user {user_id}: Success={success}")
-        except Exception as e:
-            logger.error(f"Failed to send Telegram confirmation for user {user_id}, platform {platform}: {e}", exc_info=True)
-
-
-def run_server():
-    httpd = HTTPServer(('0.0.0.0', 8080), Handler)
-    logger.info("Keep-alive HTTP server started on port 8080 for OAuth callbacks.")
-    httpd.serve_forever()
-
-threading.Thread(target=run_server, daemon=True).start()
-
 
 # === PYROGRAM HANDLERS ===
 
@@ -637,8 +385,7 @@ async def start_command(client, message):
         "facebook_linked_pages": [], # NEW: To store multiple linked Facebook pages
         "youtube_settings": {
             "title": "Default YouTube Title", "tag": "#youtube #video #shorts", "description": "Default YouTube Description", "video_type": "Video (Standard Horizontal/Square)", "schedule_time": None, "privacy": "Public"
-        },
-        "youtube_credentials": None # NEW: To store YouTube OAuth credentials
+        }
     }
 
     if user_id == OWNER_ID:
@@ -847,7 +594,7 @@ async def admin_panel_menu_reply(client, message):
 
 @app.on_callback_query(filters.regex("^admin_users_list$"))
 async def admin_users_list_inline(client, callback_query):
-    """Displays a list of all registered users for admin, or sends as file if too long."""
+    """Displays a list of all registered users for admin."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
@@ -870,23 +617,7 @@ async def admin_users_list_inline(client, callback_query):
                 f"  Status: `{role}` {premium_status}\n\n"
             )
 
-    if len(user_list_text) > 4000: # Telegram message character limit
-        temp_file_path = f"user_list_{uuid.uuid4().hex}.txt"
-        try:
-            with open(temp_file_path, "w", encoding="utf-8") as f:
-                f.write(user_list_text)
-            await client.send_document(user_id, document=temp_file_path, caption="**👥 Registered System Users List (Too long for direct message):**")
-            await callback_query.message.edit_text("✅ **User list sent as a file.**", reply_markup=Admin_markup)
-            logger.info(f"Admin {user_id} received user list as file due to length.")
-        except Exception as e:
-            logger.error(f"Failed to send user list as file to admin {user_id}: {e}", exc_info=True)
-            await callback_query.edit_message_text("❌ **Error generating user list file.** Try again later.", reply_markup=Admin_markup)
-        finally:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-    else:
-        await callback_query.edit_message_text(user_list_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
-
+    await callback_query.edit_message_text(user_list_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed system users list.")
 
 @app.on_callback_query(filters.regex("^admin_add_user_prompt$"))
@@ -917,7 +648,7 @@ async def admin_add_user_id_input(client, message):
         update_user_data(target_user_id, {"is_premium": True, "role": "user"})
         await message.reply(f"✅ **Success!** User `{target_user_id}` has been granted **PREMIUM ACCESS**.", reply_markup=Admin_markup)
         try:
-            await client.send_message(target_user_id, "🎉 **System Notification!** You have been upgraded to **PREMIUM** status! Use `/start` to access your enhanced features.")
+            await client.send_message(target_user_id, "🎉 **System Notification!** Your account has been upgraded to **PREMIUM** status! Use `/start` to access your enhanced features.")
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about premium upgrade: {e}")
         await log_to_channel(client, f"Admin `{user_id}` (`{message.from_user.username}`) upgraded user `{target_user_id}` to premium.")
@@ -959,6 +690,7 @@ async def admin_remove_user_id_input(client, message):
             return
 
         user_doc = get_user_data(target_user_id)
+
         if user_doc and user_doc.get("is_premium"):
             update_user_data(target_user_id, {"is_premium": False, "premium_platforms": []})
             await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS**.", reply_markup=Admin_markup)
@@ -998,6 +730,7 @@ async def broadcast_message_handler(client, message):
     user_id = message.from_user.id
     text_to_broadcast = message.text
     user_states.pop(user_id, None)
+
     await message.reply("📡 **Initiating Global Transmission...**")
     await log_to_channel(client, f"Broadcast initiated by `{user_id}` (`{message.from_user.username}`). Message preview: '{text_to_broadcast[:50]}...'")
 
@@ -1007,11 +740,11 @@ async def broadcast_message_handler(client, message):
 
     for target_user_id in all_user_ids:
         try:
-            if target_user_id == user_id: # Don't send broadcast to self
+            if target_user_id == user_id:
                 continue
             await client.send_message(target_user_id, f"📢 **ADMIN BROADCAST MESSAGE:**\n\n{text_to_broadcast}")
             success_count += 1
-            time.sleep(0.05) # Small delay to avoid rate limits
+            time.sleep(0.05)
         except Exception as e:
             fail_count += 1
             logger.warning(f"Failed to send broadcast to user {target_user_id}: {e}")
@@ -1033,514 +766,1373 @@ async def cancel_broadcast_callback(client, callback_query):
 
 @app.on_callback_query(filters.regex("^admin_restart_bot$"))
 async def admin_restart_bot_callback(client, callback_query):
-    """Restarts the bot (exits the current process)."""
+    """Restarts the bot (exits the process, assuming a process manager will restart it)."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         return
+    await callback_query.answer("System reboot sequence initiated...", show_alert=True)
+    await callback_query.message.edit_text("🔄 **System Rebooting...** This may take a moment. Please send `/start` in a few seconds to re-establish connection.", reply_markup=None)
+    await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) initiated bot restart.")
+    sys.exit(0)
 
-    await callback_query.answer("Initiating system reboot sequence...")
-    await callback_query.edit_message_text("🔄 **System Rebooting...** Please wait a moment while the bot restarts.", reply_markup=Admin_markup)
-    await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) initiated a bot restart.")
+@app.on_callback_query(filters.regex("^admin_upload_fb$"))
+async def admin_upload_fb_callback(client, callback_query):
+    """Initiates Facebook video upload flow for admin."""
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
+        return
+    await callback_query.answer("Initiating Facebook upload protocol for Administrator...")
+    # Admin upload will use the globally configured FACEBOOK_PAGE_ID and FACEBOOK_PAGE_ACCESS_TOKEN
+    # This is a simplification; for a full admin feature, you might want to allow selecting any user's page.
+    if not FACEBOOK_PAGE_ID or not FACEBOOK_PAGE_ACCESS_TOKEN:
+         await callback_query.message.edit_text("❌ **System Error.** Admin Facebook Page ID or Access Token is not configured in environment variables. Cannot proceed with admin upload.", reply_markup=Admin_markup)
+         await log_to_channel(client, f"Admin {user_id} attempted admin FB upload but bot's global FACEBOOK_PAGE_ID/TOKEN is missing.")
+         return
 
-    # Properly close Pyrogram client before exiting
-    await app.stop()
-    logger.info("Pyrogram client stopped. Initiating sys.exit(0).")
-    sys.exit(0) # Exit the process, relying on external process manager to restart
+    user_states[user_id] = {
+        "step": AWAITING_UPLOAD_VIDEO,
+        "platform": "facebook",
+        "fb_page_id": FACEBOOK_PAGE_ID, # Pre-set for admin upload
+        "fb_page_access_token": FACEBOOK_PAGE_ACCESS_TOKEN # Pre-set for admin upload
+    }
+    await callback_query.message.edit_text(
+        "🎥 **Facebook Upload Protocol Active.** Please transmit the video data file directly now.",
+        reply_markup=None
+    )
+    await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=main_menu_admin)
+    logger.info(f"Admin {user_id} initiated Facebook upload.")
 
-# --- Settings Navigation Callbacks ---
+@app.on_callback_query(filters.regex("^settings_bot_status_inline$"))
+async def settings_bot_status_inline_callback(client, callback_query):
+    """Displays bot status and statistics for admin."""
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("🚫 **Access Restricted.** You are not authorized to access system diagnostics.", show_alert=True)
+        return
+
+    await callback_query.answer("Fetching system diagnostics...")
+    total_users = users_collection.count_documents({})
+    admin_users = users_collection.count_documents({"role": "admin"})
+    premium_users = users_collection.count_documents({"is_premium": True})
+
+    total_fb_accounts = users_collection.count_documents({"facebook_linked_pages": {"$exists": True, "$ne": []}}) # Check for non-empty array
+    total_tiktok_accounts = users_collection.count_documents({"tiktok_settings.logged_in": True})
+    total_youtube_accounts = users_collection.count_documents({"youtube_logged_in": True})
+
+    total_uploads_count = sum(user.get("total_uploads", 0) for user in users_collection.find({}, {"total_uploads": 1}))
+
+    stats_message = (
+        f"**📊 System Diagnostics & Statistics:**\n\n"
+        f"**User Matrix:**\n"
+        f"• Total Registered Users: `{total_users}`\n"
+        f"• System Administrators: `{admin_users}`\n"
+        f"• Premium Access Users: `{premium_users}`\n\n"
+        f"**Integrated Accounts:**\n"
+        f"• Facebook Accounts Synced: `{total_fb_accounts}`\n"
+        f"• TikTok Accounts Synced: `{total_tiktok_accounts}`\n"
+        f"• YouTube Accounts Synced: `{total_youtube_accounts}`\n\n"
+        f"**Operational Metrics:**\n"
+        f"• Total Content Transmissions: `{total_uploads_count}`\n\n"
+        f"_Note: 'People left' metric is not tracked directly by this system._"
+    )
+    await callback_query.edit_message_text(stats_message, reply_markup=get_general_settings_inline_keyboard(user_id), parse_mode=enums.ParseMode.MARKDOWN)
+    await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed detailed system status.")
+
+# --- Platform Specific Settings Menus ---
 @app.on_callback_query(filters.regex("^settings_tiktok$"))
-async def settings_tiktok_callback(client, callback_query):
+async def show_tiktok_settings(client, callback_query):
     """Displays TikTok settings menu."""
     user_id = callback_query.from_user.id
-    user_doc = get_user_data(user_id)
-    if not user_doc or not is_premium_user(user_id):
+    if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing TikTok configurations...")
-    await callback_query.edit_message_text(
-        "🎵 **TikTok Configuration Interface:**\n\nAdjust your TikTok preferences:",
-        reply_markup=tiktok_settings_inline_menu
-    )
+    await callback_query.edit_message_text("🎵 **TikTok Configuration Module:**", reply_markup=tiktok_settings_inline_menu)
+    logger.info(f"User {user_id} accessed TikTok settings.")
 
 @app.on_callback_query(filters.regex("^settings_facebook$"))
-async def settings_facebook_callback(client, callback_query):
-    """Displays Facebook settings menu (now leads to page management)."""
+async def show_facebook_settings(client, callback_query):
+    """Displays Facebook settings menu."""
     user_id = callback_query.from_user.id
-    user_doc = get_user_data(user_id)
-    if not user_doc or not is_premium_user(user_id):
+    if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing Facebook configurations...")
-    await callback_query.edit_message_text(
-        "📘 **Facebook Configuration Interface:**\n\nManage your linked pages or set global preferences:",
-        reply_markup=facebook_settings_inline_menu_main # Directs to the main Facebook settings with "Manage Linked Pages"
-    )
+    await callback_query.edit_message_text("📘 **Facebook Configuration Module:**", reply_markup=facebook_settings_inline_menu_main) # Use the new main menu
+    logger.info(f"User {user_id} accessed Facebook settings.")
 
+# New: Handle 'Manage Linked Pages' button
 @app.on_callback_query(filters.regex("^fb_manage_pages$"))
 async def fb_manage_pages_callback(client, callback_query):
-    """Displays the linked Facebook pages and login/refresh option."""
     user_id = callback_query.from_user.id
-    user_doc = get_user_data(user_id)
-    if not user_doc or not is_premium_user(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-    await callback_query.answer("Retrieving Facebook pages...")
-    
-    # Get the dynamic markup for page selection/linking
-    markup = get_facebook_page_selection_markup(user_id, for_upload=False)
-    
-    # MODIFIED: Improved message when no pages are linked
-    user_pages = user_doc.get("facebook_linked_pages", [])
-    if not user_pages:
-        message_text = (
-            "🗂️ **Your Linked Facebook Pages:**\n\n"
-            "Currently, no Facebook Pages are linked to your account. To upload to Facebook, "
-            "you need to link your account and grant permissions to your pages.\n\n"
-            "➡️ Click '🔑 Link/Refresh Facebook Pages' to start. Ensure you accept all permissions, especially for managing pages."
-        )
-    else:
-        message_text = (
-            "🗂️ **Your Linked Facebook Pages:**\n\n"
-            "Select a page to view/edit its specific settings, or link a new one:"
-        )
-
-    await callback_query.edit_message_text(
-        message_text,
-        reply_markup=markup
-    )
-
-@app.on_callback_query(filters.regex("^settings_youtube$"))
-async def settings_youtube_callback(client, callback_query):
-    """Displays YouTube settings menu."""
-    user_id = callback_query.from_user.id
-    user_doc = get_user_data(user_id)
-    if not user_doc or not is_premium_user(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-    await callback_query.answer("Accessing YouTube configurations...")
-    await callback_query.edit_message_text(
-        "▶️ **YouTube Configuration Interface:**\n\nAdjust your YouTube preferences:",
-        reply_markup=youtube_settings_inline_menu
-    )
-
-# --- Platform-specific Login Callbacks ---
-@app.on_callback_query(filters.regex("^fb_login_prompt$"))
-async def fb_login_prompt_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-
-    # Generate Facebook OAuth URL
-    oauth_url = (
-        f"https://www.facebook.com/v19.0/dialog/oauth?"
-        f"client_id={FACEBOOK_APP_ID}&"
-        f"redirect_uri={urllib.parse.quote(FACEBOOK_REDIRECT_URI)}&"
-        f"scope=public_profile,pages_show_list,pages_read_engagement,pages_manage_posts,pages_manage_metadata,business_management,read_insights&" # Request necessary permissions
-        f"response_type=code&"
-        f"state={user_id}" # Pass user ID as state
-    )
-    
-    inline_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Link Facebook Account", url=oauth_url)],
-        [InlineKeyboardButton("⬅️ Back to FB Settings", callback_data='settings_facebook')]
-    ])
-    
-    await callback_query.edit_message_text(
-        "Click the button below to link your Facebook account and grant the necessary permissions. "
-        "This will allow the bot to manage your pages and upload videos on your behalf.\n\n"
-        "**Important:** During the Facebook login process, you **must** grant permissions for 'Manage your Pages' and 'Show a list of the Pages you manage' if you want to use the page upload features.",
-        reply_markup=inline_keyboard,
-        disable_web_page_preview=True
-    )
-    await callback_query.answer("Redirecting to Facebook for login...")
-    logger.info(f"User {user_id} initiated Facebook OAuth.")
-
-@app.on_callback_query(filters.regex("^yt_login_prompt$"))
-async def yt_login_prompt_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-
-    # Generate Google OAuth URL for YouTube
-    oauth_url = (
-        f"https://accounts.google.com/o/oauth2/auth?"
-        f"client_id={YOUTUBE_CLIENT_ID}&"
-        f"redirect_uri={urllib.parse.quote(YOUTUBE_REDIRECT_URI)}&"
-        f"scope={urllib.parse.quote(' '.join(YOUTUBE_SCOPES))}&"
-        f"response_type=code&"
-        f"access_type=offline&" # Request a refresh token
-        f"prompt=consent&" # Ensure consent screen is shown for refresh token
-        f"state={user_id}" # Pass user ID as state
-    )
-
-    inline_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Link YouTube Account", url=oauth_url)],
-        [InlineKeyboardButton("⬅️ Back to YT Settings", callback_data='settings_youtube')]
-    ])
-
-    await callback_query.edit_message_text(
-        "Click the button below to link your YouTube account and grant the necessary permissions. "
-        "This will allow the bot to upload videos on your behalf.",
-        reply_markup=inline_keyboard,
-        disable_web_page_preview=True
-    )
-    await callback_query.answer("Redirecting to Google for YouTube login...")
-    logger.info(f"User {user_id} initiated YouTube OAuth.")
-
-# --- Upload Video (Facebook) Main Entry ---
-@app.on_message(filters.text & filters.regex("^📤 Upload Video (Facebook)$") & filters.create(lambda _, __, m: is_premium_user(m.from_user.id)))
-async def upload_video_facebook_prompt(client, message):
-    user_id = message.from_user.id
     user_doc = get_user_data(user_id)
     linked_pages = user_doc.get("facebook_linked_pages", [])
 
     if not linked_pages:
-        # IMPROVED: Clearer message when no pages are linked
-        await message.reply(
-            "❌ **No Facebook Pages Linked!**\n\n"
-            "To upload to Facebook, you first need to link your Facebook account and grant access to your pages.\n"
-            "Go to `⚙️ Settings` -> `📘 Facebook Settings` -> `🗂️ Manage Linked Pages` and use '🔑 Link/Refresh Facebook Pages'.\n\n"
-            "**Important:** During the Facebook login process, make sure to grant 'Manage your Pages' and 'Show a list of the Pages you manage' permissions.",
-            reply_markup=main_menu_user
+        await callback_query.answer("No Facebook pages currently linked.", show_alert=True)
+        await callback_query.message.edit_text(
+            "🗂️ **Facebook Linked Pages:**\n\n"
+            "No pages are currently associated with your account. "
+            "Please use '🔑 Link/Refresh Facebook Pages' to add or update your linked pages.",
+            reply_markup=get_facebook_page_selection_markup(user_id)
         )
-        return
-
-    # Set user state to await page selection for upload
-    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION_UPLOAD, "platform": "facebook"}
-    
-    # Get the dynamic markup for page selection for upload
-    markup = get_facebook_page_selection_markup(user_id, for_upload=True)
-
-    await message.reply(
-        "📤 **Facebook Video Upload Initiated!**\n\n"
-        "Please select the Facebook Page you wish to upload the video to:",
-        reply_markup=markup
-    )
-    logger.info(f"User {user_id} started Facebook video upload flow, awaiting page selection.")
-
-# NEW: Upload Video (YouTube) Main Entry
-@app.on_message(filters.text & filters.regex("^📤 Upload Video (YouTube)$") & filters.create(lambda _, __, m: is_premium_user(m.from_user.id)))
-async def upload_video_youtube_prompt(client, message):
-    user_id = message.from_user.id
-    user_doc = get_user_data(user_id)
-    youtube_creds = user_doc.get("youtube_credentials")
-
-    if not youtube_creds:
-        await message.reply(
-            "❌ **YouTube Account Not Linked!**\n\n"
-            "To upload to YouTube, you first need to link your YouTube account.\n"
-            "Go to `⚙️ Settings` -> `▶️ YouTube Settings` -> `🔑 YouTube Login`.",
-            reply_markup=main_menu_user
+    else:
+        await callback_query.answer("Displaying linked Facebook pages.")
+        await callback_query.message.edit_text(
+            "🗂️ **Facebook Linked Pages:**\n\n"
+            "Select a page to view/manage settings, or link a new one.",
+            reply_markup=get_facebook_page_selection_markup(user_id)
         )
-        return
+    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION_SETTINGS} # Set state for page selection in settings
+    logger.info(f"User {user_id} accessing Facebook linked pages management.")
 
-    # Set user state to await video
-    user_states[user_id] = {"step": AWAITING_UPLOAD_VIDEO, "platform": "youtube"}
-    
-    await message.reply(
-        "📤 **YouTube Video Upload Initiated!**\n\n"
-        "Please send the video file you wish to upload to YouTube. "
-        "Supported formats will be converted to MP4 automatically.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Upload", callback_data="cancel_upload")]])
-    )
-    logger.info(f"User {user_id} started YouTube video upload flow, awaiting video.")
-
-
-@app.on_callback_query(filters.regex("^select_fb_page_(.*)_upload$") & filters.create(lambda _, __, m: user_states.get(m.message.chat.id, {}).get("step") == AWAITING_FB_PAGE_SELECTION_UPLOAD))
-async def select_fb_page_for_upload(client, callback_query):
+# Handle selection of a specific Facebook page from settings
+@app.on_callback_query(filters.regex("^select_fb_page_"))
+async def select_fb_page_for_settings(client, callback_query):
     user_id = callback_query.from_user.id
-    page_id = callback_query.matches[0].group(1) # Extract page_id from regex match
+    page_id = callback_query.data.split("_")[3] # Extract page ID
 
     user_doc = get_user_data(user_id)
     linked_pages = user_doc.get("facebook_linked_pages", [])
-    
-    selected_page = next((p for p in linked_pages if p["id"] == page_id), None)
+    selected_page_info = next((page for page in linked_pages if page["id"] == page_id), None)
 
-    if not selected_page or not selected_page.get("access_token"):
-        await callback_query.answer("❌ Selected page not found or its access token is invalid. Please re-link your Facebook account.", show_alert=True)
-        logger.error(f"User {user_id} selected non-existent Facebook page {page_id} or missing token for upload.")
-        user_states.pop(user_id, None)
-        await callback_query.edit_message_text(
-            "❌ **Error!** Selected Facebook Page not found or its access token is invalid. Please start the upload process again and ensure your pages are properly linked.",
-            reply_markup=main_menu_user
+    if selected_page_info:
+        # Store selected page info in user_states for current interaction context
+        user_states[user_id] = {
+            "step": "fb_page_selected_for_settings",
+            "selected_fb_page_id": selected_page_info["id"],
+            "selected_fb_page_name": selected_page_info["name"],
+            "selected_fb_page_access_token": selected_page_info["access_token"]
+        }
+        await callback_query.answer(f"Selected page: {selected_page_info['name']}", show_alert=True)
+        await callback_query.message.edit_text(
+            f"✅ **Page Selected:** `{selected_page_info['name']}`\n\n"
+            f"Now, any settings (title, description, etc.) you configure will apply to this page. "
+            f"You can also proceed with content transmission to this page.",
+            reply_markup=get_facebook_page_selection_markup(user_id, for_upload=False) # Show page settings options
         )
-        return
-    
-    page_name = selected_page.get("name", "Unnamed Page")
-    user_states[user_id]["selected_facebook_page_id"] = page_id
-    user_states[user_id]["selected_facebook_page_access_token"] = selected_page["access_token"]
-    user_states[user_id]["step"] = AWAITING_UPLOAD_VIDEO # Next step is to await video
-    user_states[user_id]["platform"] = "facebook" # Ensure platform is set
+        logger.info(f"User {user_id} selected Facebook page {page_id} ({selected_page_info['name']}) for settings.")
+    else:
+        await callback_query.answer("Error: Page not found in your linked accounts.", show_alert=True)
+        logger.warning(f"User {user_id} attempted to select non-existent FB page {page_id}.")
+        await callback_query.message.edit_text(
+            "❌ **Page Not Found.** Please try linking your pages again.",
+            reply_markup=get_facebook_page_selection_markup(user_id)
+        )
 
-    await callback_query.answer(f"Selected page: {page_name}", show_alert=False)
+
+@app.on_callback_query(filters.regex("^settings_youtube$"))
+async def show_youtube_settings(client, callback_query):
+    """Displays YouTube settings menu."""
+    user_id = callback_query.from_user.id
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
+        return
+    await callback_query.answer("Accessing YouTube configurations...")
+    await callback_query.edit_message_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
+    logger.info(f"User {user_id} accessed YouTube settings.")
+
+# --- TikTok Settings Handlers ---
+@app.on_callback_query(filters.regex("^tiktok_login$"))
+async def tiktok_login_prompt(client, callback_query):
+    """Prompts for TikTok login details (placeholder for direct login)."""
+    user_id = callback_query.from_user.id
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to connect platforms.", show_alert=True)
+        return
+    await callback_query.answer("Initiating TikTok login procedure...")
+    user_states[user_id] = {"step": AWAITING_TIKTOK_LOGIN_DETAILS}
     await callback_query.edit_message_text(
-        f"✅ **Page Selected:** `{page_name}`\n\n"
-        "Please send the video file you wish to upload to this Facebook Page. "
-        "Supported formats will be converted to MP4 automatically.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Upload", callback_data="cancel_upload")]])
+        "🔑 **TikTok Authentication Protocol:**\n\n"
+        "To perform a **direct TikTok login**, please transmit your credentials using the format below.\n"
+        "**Format:** `/tiktoklogin <username_or_email> <password> [optional_proxy_url]`\n\n"
+        "**Example:**\n"
+        "`/tiktoklogin mytiktokuser MyS3cur3P@ss http://user:pass@proxy.example.com:8080`\n"
+        "`/tiktoklogin mytiktokemail@example.com MyS3cur3P@ss`\n\n"
+        "_**System Warning:** Direct login functionality is simulated in this version and for demonstration. Real-world direct login for TikTok is complex, often changes, and may violate platform terms of service. For robust integration, consider official OAuth APIs or dedicated third-party libraries for web automation._"
     )
-    logger.info(f"User {user_id} selected Facebook page {page_id} ({page_name}) for upload. Awaiting video.")
+    logger.info(f"User {user_id} prompted for TikTok direct login.")
 
-
-# --- Unified Video Upload Handler ---
-@app.on_message(filters.video & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_UPLOAD_VIDEO))
-async def handle_video_upload(client, message):
+@app.on_message(filters.command("tiktoklogin") & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_TIKTOK_LOGIN_DETAILS))
+async def tiktok_login_command(client, message):
+    """Handles TikTok direct login command (simulated)."""
     user_id = message.from_user.id
-    current_state = user_states.get(user_id, {})
-    platform = current_state.get("platform")
-
-    if not platform:
-        await message.reply("❌ **Error!** No platform selected for upload. Please start the upload process again.", reply_markup=main_menu_user)
-        user_states.pop(user_id, None)
-        return
-
-    await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
-    status_message = await message.reply("⏳ **Initiating video processing...** Please wait, this might take a moment.")
-    logger.info(f"User {user_id} sent video for {platform} upload.")
-
-    file_path = None
-    processed_file_path = None
+    user_states.pop(user_id, None)
 
     try:
-        # Download the video
-        await status_message.edit_text("⬇️ **Downloading video...**")
-        file_path = await message.download(file_name=f"downloads/{user_id}_{uuid.uuid4().hex}")
-        logger.info(f"Downloaded video to: {file_path}")
+        args = message.text.split(maxsplit=3)
+        if not (3 <= len(args) <= 4):
+            await message.reply("❗ **Syntax Error.** Usage: `/tiktoklogin <username_or_email> <password> [optional_proxy_url]`", reply_markup=tiktok_settings_inline_menu)
+            return
 
-        # Convert to MP4 if necessary
-        if not file_path.lower().endswith(".mp4"):
-            await status_message.edit_text("🔄 **Converting video to MP4...**")
-            processed_file_path = f"{file_path}.mp4"
-            processed_file_path = convert_video_to_mp4(file_path, processed_file_path)
-            logger.info(f"Video converted to MP4: {processed_file_path}")
-        else:
-            processed_file_path = file_path
+        username_or_email = args[1].strip()
+        password = args[2].strip()
+        proxy_url = args[3].strip() if len(args) == 4 else None
+
+        if not username_or_email or not password:
+            await message.reply("❌ **Authentication Failed.** Both username/email and password are required.", reply_markup=tiktok_settings_inline_menu)
+            return
 
         user_doc = get_user_data(user_id)
-        settings = user_doc.get(f"{platform}_settings", {})
-        title = settings.get("title", "Default Title")
-        description = settings.get("description", "Default Description")
-        visibility = settings.get("privacy", "public")
-        schedule_time = settings.get("schedule_time") # This needs parsing if it's a string
+        premium_platforms = user_doc.get("premium_platforms", [])
+        if "tiktok" not in premium_platforms:
+            premium_platforms.append("tiktok")
 
-        # Placeholder for dynamic title/description input during upload (future enhancement)
-        # For now, it uses defaults from settings
+        update_user_data(user_id, {
+            "tiktok_settings.logged_in": True,
+            "tiktok_username_or_email": username_or_email,
+            "tiktok_proxy": proxy_url,
+            "premium_platforms": premium_platforms,
+            "is_premium": True
+        })
+        await message.reply("✅ **TikTok Login Simulated Successfully!** Your credentials and proxy (if provided) have been recorded. You can now use TikTok upload features.", reply_markup=tiktok_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' TikTok (simulated, proxy: {proxy_url}). Set as premium.")
+
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** Error during TikTok login simulation: `{e}`", reply_markup=tiktok_settings_inline_menu)
+        logger.error(f"Failed to process TikTok login for user {user_id}: {e}", exc_info=True)
+
+@app.on_callback_query(filters.regex("^tiktok_set_caption$"))
+async def tiktok_set_caption_prompt(client, callback_query):
+    """Prompts user to set TikTok caption."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting caption input...")
+    user_states[user_id] = {"step": AWAITING_TIKTOK_CAPTION}
+    await callback_query.edit_message_text(
+        "📝 **TikTok Caption Input Module:**\n\nPlease transmit the new TikTok caption for your uploads.\n"
+        "_(Type 'skip' to use the default caption.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_tiktok')]])
+    )
+    logger.info(f"User {user_id} prompted for TikTok caption.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_TIKTOK_CAPTION))
+async def tiktok_set_caption_save(client, message):
+    """Saves the provided TikTok caption or uses default."""
+    user_id = message.from_user.id
+    caption = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if caption.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_caption = user_doc.get("tiktok_settings", {}).get("caption", "Default TikTok Caption")
+        await message.reply(f"✅ **TikTok Caption Skipped.** Using default: '{default_caption}'", reply_markup=tiktok_settings_inline_menu)
+        logger.info(f"User {user_id} skipped TikTok caption, using default.")
+    else:
+        update_user_data(user_id, {"tiktok_settings.caption": caption})
+        await message.reply(f"✅ **TikTok Caption Configured.** New caption set to: '{caption}'", reply_markup=tiktok_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set TikTok caption.")
+    logger.info(f"User {user_id} saved TikTok caption.")
+
+
+@app.on_callback_query(filters.regex("^tiktok_set_tag$"))
+async def tiktok_set_tag_prompt(client, callback_query):
+    """Prompts user to set TikTok tags."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting tag input...")
+    user_states[user_id] = {"step": AWAITING_TIKTOK_TAG}
+    await callback_query.edit_message_text(
+        "🏷️ **TikTok Tag Input Module:**\n\nPlease transmit the new TikTok tags (e.g., `#myvideo #foryou`). Separate with spaces.\n"
+        "_(Type 'skip' to use default tags.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_tiktok')]])
+    )
+    logger.info(f"User {user_id} prompted for TikTok tags.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_TIKTOK_TAG))
+async def tiktok_set_tag_save(client, message):
+    """Saves the provided TikTok tags or uses default."""
+    user_id = message.from_user.id
+    tag = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if tag.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_tag = user_doc.get("tiktok_settings", {}).get("tag", "#tiktok #video #fyp")
+        await message.reply(f"✅ **TikTok Tags Skipped.** Using default: '{default_tag}'", reply_markup=tiktok_settings_inline_menu)
+        logger.info(f"User {user_id} skipped TikTok tags, using default.")
+    else:
+        update_user_data(user_id, {"tiktok_settings.tag": tag})
+        await message.reply(f"✅ **TikTok Tags Configured.** New tags set to: '{tag}'", reply_markup=tiktok_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set TikTok tag.")
+    logger.info(f"User {user_id} saved TikTok tags.")
+
+@app.on_callback_query(filters.regex("^tiktok_video_type$"))
+async def tiktok_video_type_selection(client, callback_query):
+    """Displays options for TikTok video type/aspect ratio."""
+    await callback_query.answer("Awaiting video type selection...")
+    await callback_query.edit_message_text("🎥 **TikTok Video Type Selector:**\n\nSelect TikTok video type/aspect ratio:", reply_markup=tiktok_video_type_inline_menu)
+    logger.info(f"User {callback_query.from_user.id} accessed TikTok video type selection.")
+
+@app.on_callback_query(filters.regex("^tiktok_aspect_ratio_"))
+async def tiktok_set_aspect_ratio(client, callback_query):
+    """Sets the TikTok video aspect ratio."""
+    user_id = callback_query.from_user.id
+    aspect_ratio = "1:1 Aspect Ratio (Square)" if '1_1' in callback_query.data else "9:16 Aspect Ratio (Vertical)"
+    update_user_data(user_id, {"tiktok_settings.video_type": aspect_ratio})
+    await callback_query.answer(f"TikTok aspect ratio set to: {aspect_ratio}", show_alert=True)
+    await callback_query.edit_message_text(
+        f"✅ **TikTok Video Type Configured.** Set to: {aspect_ratio}",
+        reply_markup=tiktok_settings_inline_menu
+    )
+    await log_to_channel(client, f"User `{user_id}` set TikTok aspect ratio to `{aspect_ratio}`.")
+    logger.info(f"User {user_id} set TikTok aspect ratio to {aspect_ratio}.")
+
+@app.on_callback_query(filters.regex("^tiktok_set_description$"))
+async def tiktok_set_description_prompt(client, callback_query):
+    """Prompts user to set TikTok description."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting description input...")
+    user_states[user_id] = {"step": AWAITING_TIKTOK_DESCRIPTION}
+    await callback_query.edit_message_text(
+        "📄 **TikTok Description Input Module:**\n\nPlease transmit the new TikTok description for your uploads.\n"
+        "_(Type 'skip' to use the default description.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_tiktok')]])
+    )
+    logger.info(f"User {user_id} prompted for TikTok description.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_TIKTOK_DESCRIPTION))
+async def tiktok_set_description_save(client, message):
+    """Saves the provided TikTok description or uses default."""
+    user_id = message.from_user.id
+    description = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if description.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_description = user_doc.get("tiktok_settings", {}).get("description", "Default TikTok Description")
+        await message.reply(f"✅ **TikTok Description Skipped.** Using default: '{default_description}'", reply_markup=tiktok_settings_inline_menu)
+        logger.info(f"User {user_id} skipped TikTok description, using default.")
+    else:
+        update_user_data(user_id, {"tiktok_settings.description": description})
+        await message.reply(f"✅ **TikTok Description Configured.** New description set to: '{description}'", reply_markup=tiktok_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set TikTok description.")
+    logger.info(f"User {user_id} saved TikTok description.")
+
+@app.on_callback_query(filters.regex("^tiktok_check_account_info$"))
+async def tiktok_check_account_info(client, callback_query):
+    """Displays current TikTok account settings."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Retrieving TikTok account status...")
+    user_doc = get_user_data(user_id)
+    tiktok_settings = user_doc.get("tiktok_settings", {})
+
+    logged_in_status = "✅ Active Session" if tiktok_settings.get("logged_in") else "❌ Logged Out"
+    username_or_email = tiktok_settings.get("tiktok_username_or_email", "N/A")
+    proxy_info = tiktok_settings.get("tiktok_proxy", "None")
+    caption = tiktok_settings.get("caption", "Not set")
+    tag = tiktok_settings.get("tag", "Not set")
+    video_type = tiktok_settings.get("video_type", "Not set")
+    description = tiktok_settings.get("description", "Not set")
+
+    info_text = (
+        f"**🎵 TikTok Account Diagnostics:**\n"
+        f"Status: {logged_in_status}\n"
+        f"Registered Account: `{username_or_email}`\n"
+        f"Proxy Configured: `{proxy_info}`\n"
+        f"Default Caption: `{caption}`\n"
+        f"Default Tags: `{tag}`\n"
+        f"Default Video Type: `{video_type}`\n"
+        f"Default Description: `{description}`"
+    )
+    await callback_query.edit_message_text(info_text, reply_markup=tiktok_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+    logger.info(f"User {user_id} checked TikTok account info.")
+
+
+# --- Facebook Settings Handlers ---
+@app.on_callback_query(filters.regex("^fb_login_prompt$"))
+async def prompt_facebook_login_from_settings(client, callback_query):
+    """Prompts for Facebook login access token (User Access Token or Page Access Token)."""
+    user_id = callback_query.from_user.id
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to connect platforms.", show_alert=True)
+        return
+    await callback_query.answer("Initiating Facebook authentication protocol...")
+    user_states[user_id] = {"step": AWAITING_FB_ACCESS_TOKEN}
+    await callback_query.message.edit_text(
+        "🔑 **Facebook Access Token Input Module:**\n\n"
+        "To link your Facebook account and manage pages, please transmit your **User Access Token** "
+        "(with `pages_show_list` and `pages_manage_posts` permissions) or a **Page Access Token**.\n\n"
+        "**Format:** `/fblogin <your_facebook_access_token>`\n\n"
+        "**Recommendation:** For full page management, acquire a User Access Token first, then exchange it for long-lived Page Access Tokens.\n"
+        "_**System Note:** The bot will attempt to fetch all pages linked to the provided token and store them._",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    logger.info(f"User {user_id} prompted for Facebook access token.")
+
+@app.on_message(filters.command("fblogin") & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_ACCESS_TOKEN))
+async def facebook_login_command(client, message):
+    """Handles Facebook access token input, fetches pages, and saves them."""
+    user_id = message.from_user.id
+    user_states.pop(user_id, None)
+
+    try:
+        args = message.text.split(maxsplit=1)
+        if len(args) != 2:
+            await message.reply("❗ **Syntax Error.** Usage: `/fblogin <your_facebook_access_token>`", reply_markup=facebook_settings_inline_menu_main)
+            return
+
+        provided_access_token = args[1].strip()
+
+        # Attempt to get pages using the provided token. This token could be a User Access Token or a Page Access Token.
+        # If it's a Page Access Token, it will likely only return that one page's info.
+        # If it's a User Access Token, it should list all managed pages.
+        pages_url = f"https://graph.facebook.com/v19.0/me/accounts?access_token={provided_access_token}"
+        response = requests.get(pages_url)
+        response_data = response.json()
+
+        if response.status_code == 200 and 'data' in response_data:
+            linked_pages = []
+            for page_data in response_data['data']:
+                # Ensure we get the page-specific access token, which is better for publishing
+                # The 'access_token' field in page_data is the page access token
+                if 'access_token' in page_data and 'id' in page_data and 'name' in page_data:
+                    linked_pages.append({
+                        "id": page_data["id"],
+                        "name": page_data["name"],
+                        "access_token": page_data["access_token"]
+                    })
+            
+            if not linked_pages:
+                # If 'me/accounts' returned nothing, try to validate if the token is a direct Page Access Token
+                # by fetching info about that page itself (assuming the ID from FACEBOOK_PAGE_ID for example)
+                # This fallback is for when a user provides just a Page Access Token for a single page.
+                # This part is complex without knowing the page ID first. A simpler approach is to tell them to provide a token that gives pages_show_list.
+                # However, for the purpose of the request, if they input a valid page token, we can just save it as one page.
+                
+                # Let's try to get info about the token itself to see if it's a valid page token
+                debug_token_url = f"https://graph.facebook.com/debug_token?input_token={provided_access_token}&access_token={FACEBOOK_APP_ID}|{FACEBOOK_APP_SECRET}"
+                debug_response = requests.get(debug_token_url)
+                debug_data = debug_response.json()
+
+                if debug_response.status_code == 200 and debug_data.get('data', {}).get('is_valid') and debug_data.get('data', {}).get('type') == 'PAGE':
+                    page_id = debug_data['data']['page_id']
+                    # Try to fetch page name with this token
+                    page_info_url = f"https://graph.facebook.com/v19.0/{page_id}?fields=name&access_token={provided_access_token}"
+                    page_info_response = requests.get(page_info_url)
+                    page_info_data = page_info_response.json()
+
+                    if page_info_response.status_code == 200 and 'name' in page_info_data:
+                        linked_pages.append({
+                            "id": page_id,
+                            "name": page_info_data["name"],
+                            "access_token": provided_access_token
+                        })
+                        await message.reply("✅ **Facebook Page Linked!** Your page has been successfully added. You can now transmit content.", reply_markup=facebook_settings_inline_menu_main)
+                        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) linked single Facebook page: {page_info_data['name']}.")
+                    else:
+                        await message.reply("❌ **Facebook Token Invalid.** The provided token is valid but could not retrieve page information or it's not a page token for a known page.", reply_markup=facebook_settings_inline_menu_main)
+                        logger.error(f"User {user_id} provided valid FB token, but could not get page info: {page_info_data}")
+                        return
+                else:
+                    await message.reply("❌ **Facebook Token Invalid.** No pages found or token is not a valid User Access Token with `pages_show_list` permission, nor a valid Page Access Token. Please ensure the token has the necessary permissions.", reply_markup=facebook_settings_inline_menu_main)
+                    logger.error(f"Facebook token validation failed for user {user_id}. No pages found or debug_token invalid: {response_data}, Debug: {debug_data}")
+                    return
+
+            user_doc = get_user_data(user_id)
+            premium_platforms = user_doc.get("premium_platforms", [])
+            if "facebook" not in premium_platforms:
+                premium_platforms.append("facebook")
+
+            update_user_data(user_id, {
+                "facebook_linked_pages": linked_pages, # Store the list of pages
+                "premium_platforms": premium_platforms,
+                "is_premium": True
+            })
+
+            if len(linked_pages) > 0:
+                 await message.reply(f"✅ **Facebook Linked Pages Synced!** Found {len(linked_pages)} page(s) linked to your account. You can now manage them.", reply_markup=facebook_settings_inline_menu_main)
+                 await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully linked {len(linked_pages)} Facebook pages. Set as premium.")
+            else:
+                 await message.reply("⚠️ **Facebook Link Warning:** Token was valid but no pages could be retrieved. Ensure it has `pages_show_list` permission.", reply_markup=facebook_settings_inline_menu_main)
+
+        else:
+            error_message = response_data.get('error', {}).get('message', 'Unknown API error')
+            await message.reply(f"❌ **Authentication Failed.** Invalid or expired Facebook token. Error Code: `{response_data.get('error', {}).get('code', 'N/A')}`, Message: `{error_message}`", reply_markup=facebook_settings_inline_menu_main)
+            logger.error(f"Facebook token validation failed for user {user_id}: {response_data}")
+
+    except requests.exceptions.RequestException as req_e:
+        await message.reply(f"❌ **Network Error.** Could not connect to Facebook API: `{req_e}`", reply_markup=facebook_settings_inline_menu_main)
+        logger.error(f"Network error during FB login for user {user_id}: {req_e}", exc_info=True)
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** Error during Facebook login procedure: `{e}`", reply_markup=facebook_settings_inline_menu_main)
+        logger.error(f"Failed to process Facebook login for user {user_id}: {e}", exc_info=True)
+
+
+@app.on_callback_query(filters.regex("^fb_set_title$"))
+async def fb_set_title_prompt(client, callback_query):
+    """Prompts user to set Facebook title."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting title input...")
+    user_states[user_id] = {"step": AWAITING_FB_TITLE}
+    await callback_query.message.edit_text(
+        "📝 **Facebook Title Input Module:**\n\nPlease transmit the new Facebook video title.\n"
+        "_(Type 'skip' to use the default title.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]])
+    )
+    logger.info(f"User {user_id} prompted for Facebook title.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_TITLE))
+async def fb_set_title_save(client, message):
+    """Saves the provided Facebook title or uses default."""
+    user_id = message.from_user.id
+    title = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if title.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_title = user_doc.get("facebook_settings", {}).get("title", "Default Facebook Title")
+        await message.reply(f"✅ **Facebook Title Skipped.** Using default: '{default_title}'", reply_markup=facebook_settings_inline_menu_main)
+        logger.info(f"User {user_id} skipped Facebook title, using default.")
+    else:
+        update_user_data(user_id, {"facebook_settings.title": title})
+        await message.reply(f"✅ **Facebook Title Configured.** New title set to: '{title}'", reply_markup=facebook_settings_inline_menu_main)
+        await log_to_channel(client, f"User `{user_id}` set Facebook title.")
+    logger.info(f"User {user_id} saved Facebook title.")
+
+@app.on_callback_query(filters.regex("^fb_set_tag$"))
+async def fb_set_tag_prompt(client, callback_query):
+    """Prompts user to set Facebook tags."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting tag input...")
+    user_states[user_id] = {"step": AWAITING_FB_TAG}
+    await callback_query.message.edit_text(
+        "🏷️ **Facebook Tag Input Module:**\n\nPlease transmit the new Facebook tags (e.g., `#reels #video`). Separate with spaces.\n"
+        "_(Type 'skip' to use default tags.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]])
+    )
+    logger.info(f"User {user_id} prompted for Facebook tags.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_TAG))
+async def fb_set_tag_save(client, message):
+    """Saves the provided Facebook tags or uses default."""
+    user_id = message.from_user.id
+    tag = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if tag.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_tag = user_doc.get("facebook_settings", {}).get("tag", "#facebook #video #reels")
+        await message.reply(f"✅ **Facebook Tags Skipped.** Using default: '{default_tag}'", reply_markup=facebook_settings_inline_menu_main)
+        logger.info(f"User {user_id} skipped Facebook tags, using default.")
+    else:
+        update_user_data(user_id, {"facebook_settings.tag": tag})
+        await message.reply(f"✅ **Facebook Tags Configured.** New tags set to: '{tag}'", reply_markup=facebook_settings_inline_menu_main)
+        await log_to_channel(client, f"User `{user_id}` set Facebook tag.")
+    logger.info(f"User {user_id} saved Facebook tags.")
+
+@app.on_callback_query(filters.regex("^fb_set_description$"))
+async def fb_set_description_prompt(client, callback_query):
+    """Prompts user to set Facebook description."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting description input...")
+    user_states[user_id] = {"step": AWAITING_FB_DESCRIPTION}
+    await callback_query.message.edit_text(
+        "📄 **Facebook Description Input Module:**\n\nPlease transmit the new Facebook description for your uploads.\n"
+        "_(Type 'skip' to use the default description.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]])
+    )
+    logger.info(f"User {user_id} prompted for Facebook description.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_DESCRIPTION))
+async def fb_set_description_save(client, message):
+    """Saves the provided Facebook description or uses default."""
+    user_id = message.from_user.id
+    description = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if description.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_description = user_doc.get("facebook_settings", {}).get("description", "Default Facebook Description")
+        await message.reply(f"✅ **Facebook Description Skipped.** Using default: '{default_description}'", reply_markup=facebook_settings_inline_menu_main)
+        logger.info(f"User {user_id} skipped Facebook description, using default.")
+    else:
+        update_user_data(user_id, {"facebook_settings.description": description})
+        await message.reply(f"✅ **Facebook Description Configured.** New description set to: '{description}'", reply_markup=facebook_settings_inline_menu_main)
+        await log_to_channel(client, f"User `{user_id}` set Facebook description.")
+    logger.info(f"User {user_id} saved Facebook description.")
+
+
+@app.on_callback_query(filters.regex("^fb_video_type$"))
+async def fb_video_type_selection(client, callback_query):
+    """Displays options for Facebook video type."""
+    await callback_query.answer("Awaiting video type selection...")
+    await callback_query.message.edit_text("🎥 **Facebook Video Type Selector:**\n\nSelect Facebook content type:", reply_markup=facebook_video_type_inline_menu)
+    logger.info(f"User {callback_query.from_user.id} accessed Facebook video type selection.")
+
+@app.on_callback_query(filters.regex("^fb_video_type_"))
+async def fb_set_video_type(client, callback_query):
+    """Sets the Facebook video type."""
+    user_id = callback_query.from_user.id
+    video_type = "Reels (Short Vertical Video)" if 'reels' in callback_query.data else "Video (Standard Horizontal/Square)"
+    update_user_data(user_id, {"facebook_settings.video_type": video_type})
+    await callback_query.answer(f"Facebook video type set to: {video_type}", show_alert=True)
+    await callback_query.message.edit_text(
+        f"✅ **Facebook Video Type Configured.** Set to: {video_type}",
+        reply_markup=facebook_settings_inline_menu_main
+    )
+    await log_to_channel(client, f"User `{user_id}` set Facebook video type to `{video_type}`.")
+    logger.info(f"User {user_id} set Facebook video type to {video_type}.")
+
+@app.on_callback_query(filters.regex("^fb_set_schedule_time$"))
+async def fb_set_schedule_time_prompt(client, callback_query):
+    """Prompts user to set Facebook schedule time."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting schedule time input...")
+    user_states[user_id] = {"step": AWAITING_FB_SCHEDULE_TIME}
+    await callback_query.message.edit_text(
+        "⏰ **Facebook Schedule Configuration Module:**\n\nPlease transmit the desired schedule date and time.\n"
+        "**Format:** `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`)\n"
+        "_**System Note:** Time will be interpreted in UTC._\n"
+        "_(Type 'clear' to remove any existing schedule.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]])
+    )
+    logger.info(f"User {user_id} prompted for Facebook schedule time.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_SCHEDULE_TIME))
+async def fb_set_schedule_time_save(client, message):
+    """Saves the provided Facebook schedule time or clears it."""
+    user_id = message.from_user.id
+    schedule_str = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if schedule_str.lower() == "clear":
+        update_user_data(user_id, {"facebook_settings.schedule_time": None})
+        await message.reply("✅ **Facebook Schedule Cleared.** Your uploads will now publish immediately (unless privacy is Draft).", reply_markup=facebook_settings_inline_menu_main)
+        await log_to_channel(client, f"User `{user_id}` cleared Facebook schedule time.")
+        logger.info(f"User {user_id} cleared Facebook schedule time.")
+        return
+
+    try:
+        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
+        if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
+            await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please try again with a later time.")
+            return
+
+        update_user_data(user_id, {"facebook_settings.schedule_time": schedule_dt.isoformat()})
+        await message.reply(f"✅ **Facebook Schedule Configured.** Content set for transmission at: '{schedule_str}' (UTC)", reply_markup=facebook_settings_inline_menu_main)
+        await log_to_channel(client, f"User `{user_id}` set Facebook schedule time to `{schedule_str}`.")
+        logger.info(f"User {user_id} set Facebook schedule time to {schedule_str}.")
+    except ValueError:
+        await message.reply("❌ **Input Error.** Invalid date/time format. Please use `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`).")
+        logger.warning(f"User {user_id} provided invalid Facebook schedule time format: {schedule_str}")
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** An error occurred while parsing schedule time: `{e}`")
+        logger.error(f"Error parsing Facebook schedule time for user {user_id}: {e}")
+
+@app.on_callback_query(filters.regex("^fb_set_privacy$"))
+async def fb_set_privacy_selection(client, callback_query):
+    """Displays options for Facebook privacy setting."""
+    await callback_query.answer("Awaiting privacy selection...")
+    await callback_query.message.edit_text("🔒 **Facebook Privacy Configuration Module:**\n\nSelect Facebook privacy setting:", reply_markup=get_privacy_inline_menu('fb'))
+    logger.info(f"User {callback_query.from_user.id} accessed Facebook privacy selection.")
+
+@app.on_callback_query(filters.regex("^fb_privacy_"))
+async def fb_set_privacy(client, callback_query):
+    """Sets the Facebook privacy setting."""
+    user_id = callback_query.from_user.id
+    privacy = "Public" if 'public' in callback_query.data else ("Private" if 'private' in callback_query.data else "Draft")
+    update_user_data(user_id, {"facebook_settings.privacy": privacy})
+    await callback_query.answer(f"Facebook privacy set to: {privacy}", show_alert=True)
+    await callback_query.message.edit_text(
+        f"✅ **Facebook Privacy Configured.** Set to: {privacy}",
+        reply_markup=facebook_settings_inline_menu_main
+    )
+    await log_to_channel(client, f"User `{user_id}` set Facebook privacy to `{privacy}`.")
+    logger.info(f"User {user_id} set Facebook privacy to {privacy}.")
+
+@app.on_callback_query(filters.regex("^fb_check_expiry_date$"))
+async def fb_check_expiry_date(client, callback_query):
+    """Displays current Facebook token expiry date (placeholder)."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Retrieving Facebook token expiry data...")
+    user_doc = get_user_data(user_id)
+    # This now checks for linked pages and mentions general token validity for them
+    linked_pages = user_doc.get("facebook_linked_pages", [])
+    
+    info_text = "**🗓️ Facebook Token Expiry Status:**\n\n"
+    if linked_pages:
+        info_text += "Your linked Page Access Tokens are generally long-lived and typically do not expire unless:\n"
+        info_text += "• The user changes their password.\n"
+        info_text += "• The user revokes the app's permissions.\n"
+        info_text += "• The user's account is compromised.\n\n"
+        info_text += "To refresh or re-check, you can use '🔑 Link/Refresh Facebook Pages'."
+    else:
+        info_text += "_No Facebook pages are currently linked to your account. No token expiry information available._"
+
+    await callback_query.message.edit_text(info_text, reply_markup=facebook_settings_inline_menu_main, parse_mode=enums.ParseMode.MARKDOWN)
+    logger.info(f"User {user_id} checked Facebook expiry date.")
+
+
+# --- YouTube Settings Handlers ---
+@app.on_callback_query(filters.regex("^yt_login_prompt$"))
+async def yt_login_prompt(client, callback_query):
+    """Prompts for YouTube login access token (placeholder)."""
+    user_id = callback_query.from_user.id
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to connect platforms.", show_alert=True)
+        return
+    await callback_query.answer("Initiating YouTube authentication protocol...")
+    user_states[user_id] = {"step": AWAITING_YT_ACCESS_TOKEN}
+    await callback_query.message.edit_text(
+        "🔑 **YouTube Access Token Input Module:**\n\n"
+        "To establish a connection to YouTube, please transmit your **YouTube Access Token**.\n\n"
+        "**Format:** `/youtubelogin <your_youtube_access_token>`\n\n"
+        "_**System Note:** This is a placeholder for a real YouTube OAuth 2.0 flow. Obtaining YouTube access tokens securely usually involves a multi-step web authentication process._",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+    logger.info(f"User {user_id} prompted for YouTube access token.")
+
+@app.on_message(filters.command("youtubelogin") & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_ACCESS_TOKEN))
+async def youtube_login_command(client, message):
+    """Handles YouTube access token input and saves it (simulated)."""
+    user_id = message.from_user.id
+    user_states.pop(user_id, None)
+
+    try:
+        args = message.text.split(maxsplit=1)
+        if len(args) != 2:
+            await message.reply("❗ **Syntax Error.** Usage: `/youtubelogin <your_youtube_access_token>`", reply_markup=youtube_settings_inline_menu)
+            return
+
+        access_token = args[1].strip()
+        if access_token:
+            user_doc = get_user_data(user_id)
+            premium_platforms = user_doc.get("premium_platforms", [])
+            if "youtube" not in premium_platforms:
+                premium_platforms.append("youtube")
+
+            update_user_data(user_id, {
+                "youtube_logged_in": True,
+                "youtube_access_token": access_token,
+                "premium_platforms": premium_platforms,
+                "is_premium": True
+            })
+            await message.reply("✅ **YouTube Login Simulated Successfully!** Token recorded. Connection established.", reply_markup=youtube_settings_inline_menu)
+            await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' YouTube (simulated). Set as premium.")
+        else:
+            await message.reply("❌ **Authentication Failed.** Invalid token provided.", reply_markup=youtube_settings_inline_menu)
+            logger.error(f"YouTube token validation failed for user {user_id}: Empty token provided.")
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** Error during YouTube login procedure: `{e}`", reply_markup=youtube_settings_inline_menu)
+        logger.error(f"Failed to process YouTube login for user {user_id}: {e}", exc_info=True)
+
+@app.on_callback_query(filters.regex("^yt_set_title$"))
+async def yt_set_title_prompt(client, callback_query):
+    """Prompts user to set YouTube title."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting title input...")
+    user_states[user_id] = {"step": AWAITING_YT_TITLE}
+    await callback_query.message.edit_text(
+        "📝 **YouTube Title Input Module:**\n\nPlease transmit the new YouTube video title.\n"
+        "_(Type 'skip' to use the default title.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_youtube')]])
+    )
+    logger.info(f"User {user_id} prompted for YouTube title.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_TITLE))
+async def yt_set_title_save(client, message):
+    """Saves the provided YouTube title or uses default."""
+    user_id = message.from_user.id
+    title = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if title.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_title = user_doc.get("youtube_settings", {}).get("title", "Default YouTube Title")
+        await message.reply(f"✅ **YouTube Title Skipped.** Using default: '{default_title}'", reply_markup=youtube_settings_inline_menu)
+        logger.info(f"User {user_id} skipped YouTube title, using default.")
+    else:
+        update_user_data(user_id, {"youtube_settings.title": title})
+        await message.reply(f"✅ **YouTube Title Configured.** New title set to: '{title}'", reply_markup=youtube_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set YouTube title.")
+    logger.info(f"User {user_id} saved YouTube title.")
+
+@app.on_callback_query(filters.regex("^yt_set_tag$"))
+async def yt_set_tag_prompt(client, callback_query):
+    """Prompts user to set YouTube tags."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting tag input...")
+    user_states[user_id] = {"step": AWAITING_YT_TAG}
+    await callback_query.message.edit_text(
+        "🏷️ **YouTube Tag Input Module:**\n\nPlease transmit the new YouTube tags (e.g., `#shorts #video`). Separate with spaces.\n"
+        "_(Type 'skip' to use default tags.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_youtube')]])
+    )
+    logger.info(f"User {user_id} prompted for YouTube tags.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_TAG))
+async def yt_set_tag_save(client, message):
+    """Saves the provided YouTube tags or uses default."""
+    user_id = message.from_user.id
+    tag = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if tag.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_tag = user_doc.get("youtube_settings", {}).get("tag", "#youtube #video #shorts")
+        await message.reply(f"✅ **YouTube Tags Skipped.** Using default: '{default_tag}'", reply_markup=youtube_settings_inline_menu)
+        logger.info(f"User {user_id} skipped YouTube tags, using default.")
+    else:
+        update_user_data(user_id, {"youtube_settings.tag": tag})
+        await message.reply(f"✅ **YouTube Tags Configured.** New tags set to: '{tag}'", reply_markup=youtube_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set YouTube tag.")
+    logger.info(f"User {user_id} saved YouTube tags.")
+
+@app.on_callback_query(filters.regex("^yt_set_description$"))
+async def yt_set_description_prompt(client, callback_query):
+    """Prompts user to set YouTube description."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting description input...")
+    user_states[user_id] = {"step": AWAITING_YT_DESCRIPTION}
+    await callback_query.message.edit_text(
+        "📄 **YouTube Description Input Module:**\n\nPlease transmit the new YouTube description.\n"
+        "_(Type 'skip' to use the default description.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_youtube')]])
+    )
+    logger.info(f"User {user_id} prompted for YouTube description.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_DESCRIPTION))
+async def yt_set_description_save(client, message):
+    """Saves the provided YouTube description or uses default."""
+    user_id = message.from_user.id
+    description = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if description.lower() == "skip":
+        user_doc = get_user_data(user_id)
+        default_description = user_doc.get("youtube_settings", {}).get("description", "Default YouTube Description")
+        await message.reply(f"✅ **YouTube Description Skipped.** Using default: '{default_description}'", reply_markup=youtube_settings_inline_menu)
+        logger.info(f"User {user_id} skipped YouTube description, using default.")
+    else:
+        update_user_data(user_id, {"youtube_settings.description": description})
+        await message.reply(f"✅ **YouTube Description Configured.** New description set to: '{description}'", reply_markup=youtube_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set YouTube description.")
+    logger.info(f"User {user_id} saved YouTube description.")
+
+@app.on_callback_query(filters.regex("^yt_video_type$"))
+async def yt_video_type_selection(client, callback_query):
+    """Displays options for YouTube video type."""
+    await callback_query.answer("Awaiting video type selection...")
+    await callback_query.message.edit_text("🎥 **YouTube Video Type Selector:**\n\nSelect YouTube content type:", reply_markup=youtube_video_type_inline_menu)
+    logger.info(f"User {callback_query.from_user.id} accessed YouTube video type selection.")
+
+@app.on_callback_query(filters.regex("^yt_video_type_"))
+async def yt_set_video_type(client, callback_query):
+    """Sets the YouTube video type."""
+    user_id = callback_query.from_user.id
+    video_type = "Shorts (Short Vertical Video)" if 'shorts' in callback_query.data else "Video (Standard Horizontal/Square)"
+    update_user_data(user_id, {"youtube_settings.video_type": video_type})
+    await callback_query.answer(f"YouTube video type set to: {video_type}", show_alert=True)
+    await callback_query.message.edit_text(
+        f"✅ **YouTube Video Type Configured.** Set to: {video_type}",
+        reply_markup=youtube_settings_inline_menu
+    )
+    await log_to_channel(client, f"User `{user_id}` set YouTube video type to `{video_type}`.")
+    logger.info(f"User {user_id} set YouTube video type to {video_type}.")
+
+@app.on_callback_query(filters.regex("^yt_set_schedule_time$"))
+async def yt_set_schedule_time_prompt(client, callback_query):
+    """Prompts user to set YouTube schedule time."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Awaiting schedule time input...")
+    user_states[user_id] = {"step": AWAITING_YT_SCHEDULE_TIME}
+    await callback_query.message.edit_text(
+        "⏰ **YouTube Schedule Configuration Module:**\n\nPlease transmit the desired schedule date and time.\n"
+        "**Format:** `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`)\n"
+        "_**System Note:** Time will be interpreted in UTC._\n"
+        "_(Type 'clear' to remove any existing schedule.)_",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_youtube')]])
+    )
+    logger.info(f"User {user_id} prompted for YouTube schedule time.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_SCHEDULE_TIME))
+async def yt_set_schedule_time_save(client, message):
+    """Saves the provided YouTube schedule time or clears it."""
+    user_id = message.from_user.id
+    schedule_str = message.text.strip()
+    user_states.pop(user_id, None)
+
+    if schedule_str.lower() == "clear":
+        update_user_data(user_id, {"youtube_settings.schedule_time": None})
+        await message.reply("✅ **YouTube Schedule Cleared.** Your uploads will now publish immediately (unless privacy is Private/Unlisted).", reply_markup=youtube_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` cleared YouTube schedule time.")
+        logger.info(f"User {user_id} cleared YouTube schedule time.")
+        return
+
+    try:
+        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
+        if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
+            await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please try again with a later time.")
+            return
+
+        update_user_data(user_id, {"youtube_settings.schedule_time": schedule_dt.isoformat()})
+        await message.reply(f"✅ **YouTube Schedule Configured.** Content set for transmission at: '{schedule_str}' (UTC)", reply_markup=youtube_settings_inline_menu)
+        await log_to_channel(client, f"User `{user_id}` set YouTube schedule time to `{schedule_str}`.")
+        logger.info(f"User {user_id} set YouTube schedule time to {schedule_str}.")
+    except ValueError:
+        await message.reply("❌ **Input Error.** Invalid date/time format. Please use `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`).")
+        logger.warning(f"User {user_id} provided invalid YouTube schedule time format: {schedule_str}")
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** An error occurred while parsing schedule time: `{e}`")
+        logger.error(f"Error parsing YouTube schedule time for user {user_id}: {e}")
+
+@app.on_callback_query(filters.regex("^yt_set_privacy$"))
+async def yt_set_privacy_selection(client, callback_query):
+    """Displays options for YouTube privacy setting."""
+    await callback_query.answer("Awaiting privacy selection...")
+    await callback_query.message.edit_text("🔒 **YouTube Privacy Configuration Module:**\n\nSelect YouTube privacy setting:", reply_markup=get_privacy_inline_menu('yt'))
+    logger.info(f"User {callback_query.from_user.id} accessed YouTube privacy selection.")
+
+@app.on_callback_query(filters.regex("^yt_privacy_"))
+async def yt_set_privacy(client, callback_query):
+    """Sets the YouTube privacy setting."""
+    user_id = callback_query.from_user.id
+    privacy = ""
+    if 'public' in callback_query.data:
+        privacy = "Public"
+    elif 'private' in callback_query.data:
+        privacy = "Private"
+    elif 'unlisted' in callback_query.data:
+        privacy = "Unlisted"
+
+    update_user_data(user_id, {"youtube_settings.privacy": privacy})
+    await callback_query.answer(f"YouTube privacy set to: {privacy}", show_alert=True)
+    await callback_query.message.edit_text(
+        f"✅ **YouTube Privacy Configured.** Set to: {privacy}",
+        reply_markup=youtube_settings_inline_menu
+    )
+    await log_to_channel(client, f"User `{user_id}` set YouTube privacy to `{privacy}`.")
+    logger.info(f"User {user_id} set YouTube privacy to {privacy}.")
+
+@app.on_callback_query(filters.regex("^yt_check_expiry_date$"))
+async def yt_check_expiry_date(client, callback_query):
+    """Displays current YouTube token expiry date (placeholder)."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Retrieving YouTube token expiry data...")
+    user_doc = get_user_data(user_id)
+    yt_settings = user_doc.get("youtube_settings", {})
+    expiry_date = yt_settings.get("expiry_date", "Not Integrated (Requires OAuth Token Refresh)")
+    await callback_query.message.edit_text(f"🗓️ **YouTube Token Expiry Status:** `{expiry_date}`\n\n_**System Note:** YouTube OAuth 2.0 access tokens are typically short-lived and require a refresh token mechanism for persistent access. This is not fully implemented._", reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+    logger.info(f"User {user_id} checked YouTube expiry date.")
+
+
+# --- Upload Flow Handlers ---
+
+@app.on_message(filters.text & filters.regex("^📤 Upload Video (Facebook)$"))
+async def upload_facebook_video_prompt(client, message):
+    """Initiates the Facebook video upload process, first by checking pages."""
+    user_id = message.chat.id
+    user_doc = get_user_data(user_id)
+    if not user_doc:
+        await message.reply("⛔ **Access Denied!** Please send `/start` first to initialize your account in the system.")
+        return
+
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** to use the Facebook upload feature. Please contact the administrator to upgrade your privileges.")
+        return
+
+    linked_pages = user_doc.get("facebook_linked_pages", [])
+    if not linked_pages:
+        await message.reply("❌ **Authentication Required.** No Facebook pages are linked to your account. Please navigate to `⚙️ Settings` -> `📘 Facebook Settings` -> `🔑 Link/Refresh Facebook Pages` to link your pages first.",
+                            reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
+        return
+
+    # If there are linked pages, prompt the user to select one
+    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION_UPLOAD, "platform": "facebook"}
+    
+    # Create dynamic buttons for linked pages
+    page_buttons = []
+    for page in linked_pages:
+        page_buttons.append([InlineKeyboardButton(page["name"], callback_data=f"upload_select_fb_page_{page['id']}")])
+    page_buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main_menu_reply_from_inline')])
+
+    await message.reply(
+        "🗂️ **Facebook Page Selection.** Please select the Facebook page to which you wish to transmit your content:",
+        reply_markup=InlineKeyboardMarkup(page_buttons)
+    )
+    logger.info(f"User {user_id} prompted to select Facebook page for upload.")
+
+@app.on_callback_query(filters.regex("^upload_select_fb_page_"))
+async def select_fb_page_for_upload(client, callback_query):
+    """Handles selection of a Facebook page for video upload."""
+    user_id = callback_query.from_user.id
+    page_id_to_upload = callback_query.data.split("_")[4] # Extract page ID
+
+    user_doc = get_user_data(user_id)
+    linked_pages = user_doc.get("facebook_linked_pages", [])
+    selected_page_info = next((page for page in linked_pages if page["id"] == page_id_to_upload), None)
+
+    if selected_page_info:
+        # Store selected page info in user_states for the current upload session
+        user_states[user_id] = {
+            "step": AWAITING_UPLOAD_VIDEO,
+            "platform": "facebook",
+            "fb_page_id": selected_page_info["id"],
+            "fb_page_name": selected_page_info["name"],
+            "fb_page_access_token": selected_page_info["access_token"]
+        }
+        await callback_query.answer(f"Selected page: {selected_page_info['name']}", show_alert=True)
+        await callback_query.message.edit_text(
+            f"✅ **Page Selected:** `{selected_page_info['name']}`\n\n"
+            "🎥 **Content Transmission Protocol Active.** Please transmit your video file for Facebook now.",
+            reply_markup=None # Remove inline keyboard
+        )
+        await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin) # Keep reply keyboard
+        logger.info(f"User {user_id} selected Facebook page {page_id_to_upload} ({selected_page_info['name']}) for upload.")
+    else:
+        await callback_query.answer("Error: Selected page not found in your linked accounts. Please try linking your pages again.", show_alert=True)
+        logger.warning(f"User {user_id} attempted to select non-existent FB page {page_id_to_upload} for upload.")
+        # Re-prompt page selection or go back to main menu
+        await callback_query.message.edit_text(
+            "❌ **Page Not Found.** Please select an existing page or link a new one.",
+            reply_markup=get_facebook_page_selection_markup(user_id, for_upload=True)
+        )
+
+
+@app.on_message(filters.video)
+async def handle_video_upload(client, message):
+    """Handles incoming video files for upload."""
+    user_id = message.chat.id
+    if not get_user_data(user_id):
+        await message.reply("⛔ **Access Denied!** Please send `/start` first to initialize your account in the system.")
+        return
+
+    state = user_states.get(user_id)
+    # Ensure the state is AWAITING_UPLOAD_VIDEO and platform is Facebook
+    if not state or not (state.get("step") == AWAITING_UPLOAD_VIDEO and state.get("platform") == "facebook"):
+        await message.reply("❗ **Invalid Operation.** Please initiate an upload process by clicking a dedicated upload button (e.g., '📤 Upload Video (Facebook)') first and select a page.",
+                            reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
+        logger.warning(f"User {user_id} sent video without active Facebook upload state or selected page.")
+        return
+
+    if not is_premium_user(user_id) and not is_admin(user_id):
+        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** to upload video content. Please contact the administrator.")
+        user_states.pop(user_id, None)
+        logger.warning(f"Non-premium user {user_id} attempted video upload.")
+        return
+
+    # Critical check: Ensure page details are in state
+    if not state.get("fb_page_id") or not state.get("fb_page_access_token"):
+        await message.reply("❌ **Facebook Page Not Selected.** Please restart the Facebook upload process and select a page.",
+                            reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
+        user_states.pop(user_id, None)
+        logger.error(f"User {user_id} attempting upload without selected Facebook page details in state.")
+        return
+
+    if not os.path.exists("downloads"):
+        os.makedirs("downloads")
+        logger.info("Created 'downloads' directory for video processing.")
+
+    initial_status_msg = await message.reply("⏳ **Data Acquisition In Progress...** Downloading your video. This operation may require significant processing time for large data files.")
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        file_extension = os.path.splitext(message.video.file_name or "video")[1]
+        download_filename = f"downloads/{user_id}_{timestamp}{file_extension}"
+        
+        file_path = await message.download(file_name=download_filename)
+        
+        user_states[user_id]["file_path"] = file_path
+        user_states[user_id]["step"] = AWAITING_UPLOAD_TITLE
+        
+        user_doc = get_user_data(user_id)
+        default_title = user_doc.get(f"{state['platform']}_settings", {}).get("title", "Default Title")
+        
+        await initial_status_msg.edit_text(
+            f"📝 **Metadata Input Required.** Now, transmit the **title** for your `{state['platform'].capitalize()}` video.\n"
+            f"_(Type 'skip' to use your default title: '{default_title}')_"
+        )
+        logger.info(f"User {user_id} video downloaded to {file_path}. Awaiting title for {state.get('fb_page_name', 'selected page')}.")
+    except Exception as e:
+        await initial_status_msg.edit_text(f"❌ **Data Acquisition Failed.** Error downloading video: `{e}`")
+        logger.error(f"Failed to download video for user {user_id}: {e}", exc_info=True)
+        user_states.pop(user_id, None)
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_UPLOAD_TITLE))
+async def handle_upload_title(client, message):
+    """Handles input for video title."""
+    user_id = message.chat.id
+    state = user_states.get(user_id)
+    if not state:
+        await message.reply("❌ **Session Interrupted.** Please restart the upload process.")
+        return
+
+    title_input = message.text.strip()
+    platform = state["platform"]
+    user_doc = get_user_data(user_id)
+    
+    if title_input.lower() == "skip":
+        state["title"] = user_doc.get(f"{platform}_settings", {}).get("title", "Default Title")
+        await message.reply(f"✅ **Title Input Skipped.** Using default title: '{state['title']}'.")
+        logger.info(f"User {user_id} skipped title input for {platform}.")
+    else:
+        state["title"] = title_input
+        await message.reply(f"✅ **Title Recorded.** New title: '{title_input}'.")
+        logger.info(f"User {user_id} provided title for {platform}: '{title_input}'.")
+
+    user_states[user_id]["step"] = AWAITING_UPLOAD_DESCRIPTION
+
+    default_description = user_doc.get(f"{platform}_settings", {}).get("description", "Default Description")
+
+    await message.reply(
+        f"📝 **Metadata Input Required.** Now, transmit a **description** for your `{platform.capitalize()}` video.\n"
+        f"_(Type 'skip' to use your default description: '{default_description}')_"
+    )
+    logger.info(f"User {user_id} awaiting description for {platform}.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_UPLOAD_DESCRIPTION))
+async def handle_upload_description(client, message):
+    """Handles input for video description."""
+    user_id = message.chat.id
+    state = user_states.get(user_id)
+    if not state:
+        await message.reply("❌ **Session Interrupted.** Please restart the upload process.")
+        return
+
+    description_input = message.text.strip()
+    platform = state["platform"]
+    user_doc = get_user_data(user_id)
+
+    if description_input.lower() == "skip":
+        state["description"] = user_doc.get(f"{platform}_settings", {}).get("description", "Default Description")
+        await message.reply(f"✅ **Description Input Skipped.** Using default description: '{state['description']}'.")
+        logger.info(f"User {user_id} skipped description input for {platform}.")
+    else:
+        state["description"] = description_input
+        await message.reply(f"✅ **Description Recorded.** New description: '{description_input}'.")
+        logger.info(f"User {user_id} provided description for {platform}: '{description_input}'.")
+
+    user_states[user_id]["step"] = AWAITING_UPLOAD_VISIBILITY
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Public", callback_data="visibility_public")],
+            [InlineKeyboardButton("Private", callback_data="visibility_private")],
+            [InlineKeyboardButton("Draft", callback_data="visibility_draft")]
+        ]
+    )
+    await message.reply("🌐 **Visibility Configuration Module.** Select content visibility:", reply_markup=keyboard)
+    logger.info(f"User {user_id} awaiting visibility choice for {platform}.")
+
+
+@app.on_callback_query(filters.regex("^visibility_"))
+async def handle_visibility_selection(client, callback_query):
+    """Handles selection for video visibility."""
+    user_id = callback_query.from_user.id
+    state = user_states.get(user_id)
+
+    if not state or state.get("step") != AWAITING_UPLOAD_VISIBILITY:
+        await callback_query.answer("❗ **Invalid Operation.** Please ensure you are in an active upload sequence.", show_alert=True)
+        return
+
+    platform = state["platform"]
+    visibility_choice = callback_query.data.split("_")[1]
+
+    state["visibility"] = visibility_choice
+    user_states[user_id]["step"] = AWAITING_UPLOAD_SCHEDULE
+
+    await callback_query.answer(f"Visibility set to: {visibility_choice.capitalize()}", show_alert=True)
+    logger.info(f"User {user_id} set visibility for {platform} to {visibility_choice}.")
+
+    if platform == "facebook":
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Publish Now", callback_data="schedule_now")],
+                [InlineKeyboardButton("Schedule Later", callback_data="schedule_later")]
+            ]
+        )
+        await callback_query.message.edit_text("⏰ **Content Release Protocol.** Do you wish to publish now or schedule for later?", reply_markup=keyboard)
+        logger.info(f"User {user_id} awaiting schedule choice for {platform}.")
+    else:
+        await callback_query.message.edit_text("⏳ **Data Processing Initiated...** Preparing your content for transmission. Please standby.")
+        await callback_query.answer("Processing initiated.")
+        await initiate_upload(client, callback_query.message, user_id)
+        logger.info(f"User {user_id} skipping schedule for {platform}, initiating upload.")
+
+
+@app.on_callback_query(filters.regex("^schedule_"))
+async def handle_schedule_selection(client, callback_query):
+    """Handles selection for video scheduling (now or later)."""
+    user_id = callback_query.from_user.id
+    state = user_states.get(user_id)
+
+    if not state or state.get("step") != AWAITING_UPLOAD_SCHEDULE:
+        await callback_query.answer("❗ **Invalid Operation.** Please ensure you are in an active upload sequence.", show_alert=True)
+        return
+
+    schedule_choice = callback_query.data.split("_")[1]
+    platform = state["platform"]
+
+    if schedule_choice == "now":
+        state["schedule_time"] = None
+        await callback_query.answer("Publishing now selected.", show_alert=True)
+        await callback_query.message.edit_text("⏳ **Data Processing Initiated...** Preparing your content for immediate transmission. Please standby.")
+        await initiate_upload(client, callback_query.message, user_id)
+        logger.info(f"User {user_id} chose 'publish now' for {platform}.")
+    elif schedule_choice == "later":
+        user_states[user_id]["step"] = AWAITING_UPLOAD_SCHEDULE_DATETIME
+        await callback_query.answer("Awaiting schedule time input...", show_alert=True)
+        await callback_query.message.edit_text(
+            "📅 **Temporal Configuration Module.** Please transmit the desired schedule date and time.\n"
+            "**Format:** `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`)\n"
+            "_**System Note:** Time will be interpreted in UTC._"
+        )
+        logger.info(f"User {user_id} chose 'schedule later' for {platform}.")
+
+@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_UPLOAD_SCHEDULE_DATETIME))
+async def handle_schedule_datetime_input(client, message):
+    """Handles input for specific schedule date and time."""
+    user_id = message.chat.id
+    state = user_states.get(user_id)
+    if not state:
+        await message.reply("❌ **Session Interrupted.** Please restart the upload process.")
+        return
+
+    schedule_str = message.text.strip()
+    try:
+        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
+
+        if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
+            await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please transmit a later time.")
+            return
+
+        state["schedule_time"] = schedule_dt
+        user_states[user_id]["step"] = "processing_and_uploading"
+        await message.reply("⏳ **Data Processing Initiated...** Preparing your content for scheduled transmission. Please standby.")
+        await initiate_upload(client, message, user_id)
+        logger.info(f"User {user_id} provided schedule datetime for {state['platform']}: {schedule_str}.")
+
+    except ValueError:
+        await message.reply("❌ **Input Error.** Invalid date/time format. Please use `YYYY-MM-DD HH:MM` (e.g., `2025-07-20 14:30`).")
+        logger.warning(f"User {user_id} provided invalid schedule datetime format: {schedule_str}")
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** An error occurred while processing schedule time: `{e}`")
+        logger.error(f"Error processing schedule time for user {user_id}: {e}")
+
+
+async def initiate_upload(client, message, user_id):
+    """Initiates the actual video upload to the chosen platform."""
+    state = user_states.get(user_id)
+    if not state:
+        await client.send_message(user_id, "❌ **Upload Process Aborted.** Session state lost. Please re-initiate the content transmission protocol.")
+        logger.error(f"Upload initiated without valid state for user {user_id}.")
+        return
+
+    platform = state["platform"]
+    file_path = state.get("file_path")
+    title = state.get("title")
+    description = state.get("description")
+    visibility = state.get("visibility", "public")
+    schedule_time = state.get("schedule_time")
+
+    if not all([file_path, title, description]):
+        await client.send_message(user_id, "❌ **Upload Protocol Failure.** Missing essential content metadata (file, title, or description). Please restart the upload sequence.")
+        logger.error(f"Missing essential upload data for user {user_id}. State: {state}")
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        user_states.pop(user_id, None)
+        return
+
+    user_states[user_id]["step"] = "processing_and_uploading"
+    await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
+    await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) initiating upload for {platform}. File: `{os.path.basename(file_path)}`. Visibility: `{visibility}`. Schedule: `{schedule_time}`.")
+
+    processed_file_path = file_path
+
+    try:
+        input_ext = os.path.splitext(file_path)[1].lower()
+        
+        if input_ext not in [".mp4", ".mov", ".mkv"]:
+            target_ext = ".mp4"
+            processed_file_path = f"downloads/processed_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}{target_ext}"
+            await client.send_message(user_id, f"🔄 **Data Conversion Protocol.** Converting video to {target_ext.upper()} format. Please standby...")
+            await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
+            
+            def do_processing_sync():
+                return convert_video_to_mp4(file_path, processed_file_path)
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(do_processing_sync)
+                processed_file_path = future.result(timeout=600)
+            
+            await client.send_message(user_id, "✅ **Video Data Conversion Complete.**")
+            await log_to_channel(client, f"User `{user_id}` video converted. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
+        else:
+            await client.send_message(user_id, "✅ **Video Format Verified.** Proceeding with direct transmission.")
+            logger.info(f"User {user_id} video already suitable format for {platform}. Skipping conversion.")
 
         if platform == "facebook":
-            page_id = current_state.get("selected_facebook_page_id")
-            page_access_token = current_state.get("selected_facebook_page_access_token")
+            # Retrieve the specific page_id and page_access_token from the user_states
+            fb_page_id = state.get("fb_page_id")
+            fb_page_access_token = state.get("fb_page_access_token")
 
-            if not page_id or not page_access_token:
-                await status_message.edit_text("❌ **Upload Failed!** No Facebook Page selected or invalid token. Please start the upload process again.", reply_markup=main_menu_user)
-                return
+            if not fb_page_id or not fb_page_access_token:
+                await client.send_message(user_id, "❌ **Facebook Page Details Missing.** Please restart the Facebook upload process and ensure a page is selected.",
+                                            reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
+                user_states.pop(user_id, None) # Clear state as critical info is missing
+                return # Exit early
 
-            await status_message.edit_text("⬆️ **Uploading video to Facebook...**")
-            result = upload_facebook_video(
-                processed_file_path,
-                title,
-                description,
-                page_access_token,
-                page_id,
-                visibility=visibility,
-                schedule_time=schedule_time
-            )
-            video_id = result.get('id')
-            post_id = result.get('post_id')
-            await status_message.edit_text(f"✅ **Video Uploaded to Facebook!**\n\n"
-                                           f"Video ID: `{video_id}`\n"
-                                           f"Post ID: `{post_id}`\n"
-                                           f"Check your Facebook Page for the uploaded video.",
-                                           reply_markup=main_menu_user)
-            await log_to_channel(client, f"Video uploaded to Facebook by `{user_id}`. Video ID: `{video_id}`.")
+            await client.send_message(user_id, f"📤 **Initiating Facebook Content Transmission to '{state.get('fb_page_name', 'selected page')}'...**")
+            await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
 
-        elif platform == "youtube":
-            await status_message.edit_text("⬆️ **Uploading video to YouTube...**")
-            result = await upload_youtube_video(
-                processed_file_path,
-                title,
-                description,
-                user_id
-            )
-            video_id = result.get('id')
-            # CORRECTED: YouTube video URL format
-            await status_message.edit_text(f"✅ **Video Uploaded to YouTube!**\n\n"
-                                           f"Video ID: `{video_id}`\n"
-                                           f"Link: `https://youtu.be/{video_id}`\n"
-                                           f"Check your YouTube channel for the uploaded video.",
-                                           reply_markup=main_menu_user)
-            await log_to_channel(client, f"Video uploaded to YouTube by `{user_id}`. Video ID: `{video_id}`.")
+            def upload_to_facebook_sync():
+                return upload_facebook_video(processed_file_path, title, description, fb_page_access_token, fb_page_id, visibility=visibility, schedule_time=schedule_time)
 
-        await client.send_chat_action(user_id, enums.ChatAction.CANCEL) # End chat action
-        logger.info(f"Video upload completed for user {user_id} to {platform}.")
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(upload_to_facebook_sync)
+                fb_result = future.result(timeout=900)
 
-    except ValueError as ve:
-        await status_message.edit_text(f"❌ **Upload Failed!** Configuration error: `{ve}`", reply_markup=main_menu_user)
-        logger.error(f"Upload failed for user {user_id} due to value error: {ve}", exc_info=True)
+            if fb_result and 'id' in fb_result:
+                status_text = "Scheduled" if schedule_time else "Published"
+                await client.send_message(user_id, f"✅ **Facebook Content Transmitted!** Video ID: `{fb_result['id']}`. Status: `{status_text}` on page `{state.get('fb_page_name', 'selected page')}`.")
+                users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1}})
+                await log_to_channel(client, f"User `{user_id}` successfully uploaded to Facebook page `{state.get('fb_page_name', 'selected page')}`. Video ID: `{fb_result['id']}`. Status: `{status_text}`. File: `{os.path.basename(processed_file_path)}`.")
+            else:
+                await client.send_message(user_id, f"❌ **Facebook Transmission Failed.** Response: `{json.dumps(fb_result, indent=2)}`")
+                logger.error(f"Facebook upload failed for user {user_id} on page {state.get('fb_page_name', 'selected page')}. Result: {fb_result}")
+
+    except concurrent.futures.TimeoutError:
+        await client.send_message(user_id, "❌ **Operation Timed Out.** Content processing or transmission exceeded time limits. The data file might be too large or the network connection is unstable. Please retry with a smaller file or a more robust connection.")
+        logger.error(f"Upload/processing timeout for user {user_id}. Original file: {file_path}")
     except RuntimeError as re:
-        await status_message.edit_text(f"❌ **Upload Failed!** Processing error: `{re}`", reply_markup=main_menu_user)
-        logger.error(f"Upload failed for user {user_id} due to runtime error: {re}", exc_info=True)
+        await client.send_message(user_id, f"❌ **Processing Error:** `{re}`\n\n_**System Note:** Ensure FFmpeg is correctly installed and accessible in your system's PATH, and verify your video data file is not corrupted._")
+        logger.error(f"Processing/Upload Error for user {user_id}: {re}", exc_info=True)
     except requests.exceptions.RequestException as req_e:
-        await status_message.edit_text(f"❌ **Upload Failed!** Network or API error. Ensure internet connection or inspect the configured API parameters. `{req_e}`", reply_markup=main_menu_user)
+        await client.send_message(user_id, f"❌ **Network/API Error during Transmission:** `{req_e}`\n\n_**System Note:** Please verify your internet connection or inspect the configured Facebook API parameters._")
         logger.error(f"Network/API Error for user {user_id}: {req_e}", exc_info=True)
     except Exception as e:
-        await status_message.edit_text(f"❌ **Critical Transmission Failure.** An unexpected system error occurred: `{e}`", reply_markup=main_menu_user)
+        await client.send_message(user_id, f"❌ **Critical Transmission Failure.** An unexpected system error occurred: `{e}`")
         logger.error(f"Upload failed for user {user_id}: {e}", exc_info=True)
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
             logger.info(f"Cleaned up original file: {file_path}")
-        if processed_file_path and processed_file_path != file_path and os.path.exists(processed_file_path):
+        if processed_file_path != file_path and os.path.exists(processed_file_path):
             os.remove(processed_file_path)
             logger.info(f"Cleaned up processed file: {processed_file_path}")
-        user_states.pop(user_id, None) # Clear user state after upload attempt
-        await client.send_chat_action(user_id, enums.ChatAction.CANCEL) # Ensure action is cancelled
-
-
-@app.on_callback_query(filters.regex("^cancel_upload$"))
-async def cancel_upload_callback(client, callback_query):
-    """Cancels an ongoing upload process."""
-    user_id = callback_query.from_user.id
-    if user_states.get(user_id, {}).get("step") == AWAITING_UPLOAD_VIDEO:
         user_states.pop(user_id, None)
-        await callback_query.answer("Upload sequence terminated.")
-        await callback_query.edit_message_text("🛑 **Video Upload Cancelled.**", reply_markup=main_menu_user)
         await client.send_chat_action(user_id, enums.ChatAction.CANCEL)
-        logger.info(f"User {user_id} cancelled video upload.")
-    else:
-        await callback_query.answer("No active upload process to terminate.", show_alert=True)
 
 
-# --- Remaining (Placeholder) Settings Handlers ---
-# These are placeholders; full implementation for setting values (title, description, etc.)
-# would follow a similar pattern to admin_add_user_id_input, using user_states for text input.
+# === KEEP ALIVE SERVER ===
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-@app.on_callback_query(filters.regex("^(fb|yt|tiktok)_set_title$"))
-async def set_title_prompt(client, callback_query):
-    platform = callback_query.matches[0].group(1)
-    user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-    await callback_query.answer(f"Setting {platform} title...")
-    user_states[user_id] = {"step": f"awaiting_{platform}_title", "platform": platform}
-    await callback_query.edit_message_text(f"Please send the new default title for your {platform.upper()} uploads:",
-                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f'settings_{platform}')]]))
+def run_server():
+    httpd = HTTPServer(('0.0.0.0', 8080), Handler)
+    logger.info("Keep-alive HTTP server started on port 8080.")
+    httpd.serve_forever()
 
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step", "").endswith("_title")))
-async def handle_title_input(client, message):
-    user_id = message.from_user.id
-    current_state = user_states.pop(user_id, {})
-    platform = current_state.get("platform")
-    if not platform:
-        return # Should not happen if state is correctly managed
-    
-    new_title = message.text.strip()
-    update_user_data(user_id, {f"{platform}_settings.title": new_title})
-    await message.reply(f"✅ **{platform.upper()} Title Updated!**\n\nNew default title: `{new_title}`",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Settings", callback_data=f'settings_{platform}')]]))
-    logger.info(f"User {user_id} updated {platform} title to: {new_title}")
+threading.Thread(target=run_server, daemon=True).start()
 
-
-# --- Similarly implement handlers for: ---
-# - `(fb|yt|tiktok)_set_tag`
-# - `(fb|yt|tiktok)_set_description`
-# - `(fb|yt|tiktok)_set_schedule_time` (requires datetime parsing)
-# - `(fb|yt|tiktok)_set_privacy` (using `get_privacy_inline_menu` and handlers for public/private/unlisted)
-# - `(fb|yt|tiktok)_video_type` (using `_video_type_inline_menu` and handlers)
-# - `(fb|yt|tiktok)_check_account_info` / `_check_expiry_date` (fetch and display info from stored tokens)
-
-
-@app.on_callback_query(filters.regex("^(fb|yt|tiktok)_video_type_reels|video|shorts$"))
-async def handle_video_type_selection(client, callback_query):
-    user_id = callback_query.from_user.id
-    parts = callback_query.data.split('_')
-    platform = parts[0]
-    # Correctly parse video_type from callback data
-    if platform == "fb":
-        video_type_raw = parts[3] # e.g., 'fb_video_type_reels' -> 'reels'
-    elif platform == "yt" or platform == "tiktok":
-        video_type_raw = parts[2] # e.g., 'yt_video_type_shorts' -> 'shorts'
-    else:
-        await callback_query.answer("Invalid video type selection.", show_alert=True)
-        return
-
-    video_type_map = {
-        "reels": "Reels (Short Vertical Video)",
-        "video": "Video (Standard Horizontal/Square)",
-        "shorts": "Shorts (Short Vertical Video)",
-        "1_1": "1:1 Aspect Ratio (Square)", # For TikTok
-        "9_16": "9:16 Aspect Ratio (Vertical)" # For TikTok
-    }
-    selected_video_type = video_type_map.get(video_type_raw, "Video (Standard Horizontal/Square)")
-
-    update_user_data(user_id, {f"{platform}_settings.video_type": selected_video_type})
-    await callback_query.answer(f"{platform.upper()} Video Type set to {selected_video_type}", show_alert=False)
-    
-    # Use the correct inline menu for each platform
-    if platform == "fb":
-        reply_markup = facebook_video_type_inline_menu
-    elif platform == "yt":
-        reply_markup = youtube_video_type_inline_menu
-    elif platform == "tiktok":
-        reply_markup = tiktok_video_type_inline_menu
-    else:
-        reply_markup = None # Fallback if platform is unexpected
-
-
-    await callback_query.edit_message_text(f"✅ **{platform.upper()} Video Type Updated!**\n\nSet to: `{selected_video_type}`",
-                                           reply_markup=reply_markup)
-    logger.info(f"User {user_id} updated {platform} video type to: {selected_video_type}")
-
-
-@app.on_callback_query(filters.regex("^(fb|yt|tiktok)_privacy_(public|private|unlisted)$"))
-async def handle_privacy_selection(client, callback_query):
-    user_id = callback_query.from_user.id
-    parts = callback_query.data.split('_')
-    platform = parts[0]
-    privacy_status = parts[2] # public, private, unlisted
-
-    update_user_data(user_id, {f"{platform}_settings.privacy": privacy_status.capitalize()})
-    await callback_query.answer(f"{platform.upper()} Privacy set to {privacy_status}", show_alert=False)
-    await callback_query.edit_message_text(f"✅ **{platform.upper()} Privacy Updated!**\n\nSet to: `{privacy_status.capitalize()}`",
-                                           reply_markup=get_privacy_inline_menu(platform))
-    logger.info(f"User {user_id} updated {platform} privacy to: {privacy_status}")
-
-
-# --- Admin Upload Facebook (direct upload for admin, if needed) ---
-@app.on_callback_query(filters.regex("^admin_upload_fb$"))
-async def admin_upload_fb_prompt(client, callback_query):
-    user_id = callback_query.from_user.id
-    if not is_admin(user_id):
-        await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
-        return
-    
-    user_doc = get_user_data(user_id)
-    linked_pages = user_doc.get("facebook_linked_pages", [])
-
-    if not linked_pages:
-        await callback_query.answer("❌ Admin has no Facebook Pages linked! Please link pages via settings.", show_alert=True)
-        await callback_query.edit_message_text(
-            "❌ **No Facebook Pages Linked for Admin!**\n\n"
-            "To use admin upload, link your Facebook account and pages via `⚙️ Settings` -> `📘 Facebook Settings` -> `🗂️ Manage Linked Pages`.",
-            reply_markup=Admin_markup
-        )
-        return
-
-    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION_UPLOAD, "platform": "facebook", "admin_upload": True}
-    markup = get_facebook_page_selection_markup(user_id, for_upload=True) # Use the same markup
-    await callback_query.edit_message_text(
-        "📤 **Admin Facebook Video Upload Initiated!**\n\n"
-        "Please select the Facebook Page to upload the video to:",
-        reply_markup=markup
-    )
-    logger.info(f"Admin {user_id} started Facebook direct upload flow, awaiting page selection.")
-
-
-# === START THE BOT ===
+# === START BOT ===
 if __name__ == "__main__":
-    logger.info("Bot starting...")
+    if not os.path.exists("downloads"):
+        os.makedirs("downloads")
+        logger.info("Created 'downloads' directory.")
+
+    logger.info("Bot system initiating...")
     app.run()
-    logger.info("Bot stopped.")
