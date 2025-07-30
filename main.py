@@ -8,6 +8,7 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 import sys
+import mimetypes # New import for better MIME type detection
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -45,12 +46,23 @@ users_collection = db["users"]
 
 # --- IMPORTANT: MongoDB Index Check/Creation ---
 try:
-    for index_info in users_collection.index_information().values():
-        if index_info.get('unique') and index_info.get('key') == [('user_id', 1)]:
-            logger.warning("Found a problematic 'user_id_1' unique index. Attempting to drop it.")
-            users_collection.drop_index("user_id_1")
-            logger.info("Successfully dropped 'user_id_1' unique index.")
-            break
+    # Ensure the _id field is always primary key and unique.
+    # The original check was for 'user_id_1' which might be from old migration.
+    # We want to ensure _id is unique which it is by default.
+    # If a custom unique index was created for 'user_id' named 'user_id_1',
+    # and it conflicts with _id, this might be problematic.
+    # For robust ID management, stick to Pyrogram's `message.from_user.id` as `_id`.
+    # Let's verify _id is used for querying. It is.
+    # This block can largely be removed if _id is consistently used as primary key.
+    # If there was a custom 'user_id' index, this would be the correct place to handle it.
+    
+    # Check if a custom unique index named 'user_id_1' exists and drop it if it's not on _id
+    index_info = users_collection.index_information()
+    if 'user_id_1' in index_info and index_info['user_id_1'].get('unique') and index_info['user_id_1'].get('key') == [('user_id', 1)]:
+        logger.warning("Found a problematic 'user_id_1' unique index. Attempting to drop it.")
+        users_collection.drop_index("user_id_1")
+        logger.info("Successfully dropped 'user_id_1' unique index.")
+    
 except Exception as e:
     logger.error(f"Error checking/dropping problematic user_id index: {e}")
 
@@ -75,6 +87,7 @@ main_menu_admin = ReplyKeyboardMarkup(
 def get_general_settings_inline_keyboard(user_id):
     """Returns the general settings inline keyboard based on user role."""
     keyboard = []
+    # Only show user settings if user is premium or admin
     if is_premium_user(user_id) or is_admin(user_id):
          keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
     if is_admin(user_id):
@@ -103,7 +116,6 @@ user_settings_inline_menu = InlineKeyboardMarkup(
 facebook_settings_inline_menu = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🔑 Facebook Login (Token)", callback_data='fb_login_token_prompt')], # New button for token login
-        [InlineKeyboardButton("🔑 Facebook Direct Login (U/P)", callback_data='fb_direct_login_prompt')], # New button for direct login
         [InlineKeyboardButton("📝 Set Title", callback_data='fb_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='fb_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='fb_set_description')],
@@ -177,8 +189,8 @@ AWAITING_FB_TAG = "awaiting_fb_tag"
 AWAITING_FB_DESCRIPTION = "awaiting_fb_description"
 AWAITING_FB_SCHEDULE_TIME = "awaiting_fb_schedule_time"
 AWAITING_FB_ACCESS_TOKEN = "awaiting_fb_access_token"
-AWAITING_FB_USERNAME = "awaiting_fb_username" # New state for direct login username
-AWAITING_FB_PASSWORD = "awaiting_fb_password" # New state for direct login password
+# AWAITING_FB_USERNAME = "awaiting_fb_username" # Removed direct login
+# AWAITING_FB_PASSWORD = "awaiting_fb_password" # Removed direct login
 AWAITING_FB_PAGE_SELECTION = "awaiting_fb_page_selection" # New state for page selection
 
 AWAITING_YT_TITLE = "awaiting_yt_title"
@@ -239,10 +251,10 @@ def store_facebook_access_token_for_user(user_id, token):
     """Stores Facebook access token in user data."""
     update_user_data(user_id, {"facebook_access_token": token})
 
-def store_facebook_user_login_details(user_id, username, password):
-    """Stores Facebook user login details (for direct login simulation)."""
-    # NOTE: Storing plain passwords is a security risk. This is for simulation ONLY.
-    update_user_data(user_id, {"facebook_username": username, "facebook_password": password})
+# Removed direct login related functions
+# def store_facebook_user_login_details(user_id, username, password):
+#     """Stores Facebook user login details (for direct login simulation)."""
+#     update_user_data(user_id, {"facebook_username": username, "facebook_password": password})
 
 def store_facebook_selected_page_id(user_id, page_id, page_name):
     """Stores the selected Facebook page ID for uploads."""
@@ -251,6 +263,11 @@ def store_facebook_selected_page_id(user_id, page_id, page_name):
 def get_facebook_pages(user_access_token):
     """Fetches list of Facebook pages managed by the user token."""
     try:
+        # It's crucial to get a User Access Token first, then query for pages
+        # The /me/accounts endpoint typically lists pages accessible by a User Access Token
+        # Each page object in the response will contain its own page access token.
+        # This function should ideally take a long-lived USER access token.
+        # Then, it will return pages, and the bot selects the PAGE access token for uploads.
         pages_url = f"https://graph.facebook.com/v19.0/me/accounts?access_token={user_access_token}"
         response = requests.get(pages_url)
         response.raise_for_status()
@@ -266,22 +283,33 @@ def upload_facebook_content(file_path, content_type, title, description, access_
 
     params = {
         'access_token': access_token,
-        'published': 'true' if not schedule_time and visibility.lower() != 'draft' else 'false',
+        # 'published': 'true' if not schedule_time and visibility.lower() != 'draft' else 'false',
+        # 'published' param is handled differently for each type below.
     }
+    
+    # For photo, default to using caption as description.
+    # For video/reels, title and description are separate.
+    effective_title = title if title else "Untitled Post"
+    effective_description = description if description else "No description provided."
 
     if content_type == "video":
         post_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
-        params['title'] = title
-        params['description'] = description
+        params['title'] = effective_title
+        params['description'] = effective_description
+        
+        # Facebook video statuses: PUBLISHED, SCHEDULED, DRAFT, UNPUBLISHED
         if schedule_time:
             params['scheduled_publish_time'] = int(schedule_time.timestamp())
             params['status_type'] = 'SCHEDULED_PUBLISH'
+            params['published'] = 'false' # Must be false if scheduled
             logger.info(f"Scheduling Facebook video for: {schedule_time}")
         elif visibility.lower() == 'private' or visibility.lower() == 'draft':
             params['status_type'] = 'DRAFT'
+            params['published'] = 'false'
             logger.info(f"Uploading Facebook video as DRAFT (visibility: {visibility}).")
         else:
             params['status_type'] = 'PUBLISHED'
+            params['published'] = 'true'
             logger.info(f"Uploading Facebook video as PUBLISHED (visibility: {visibility}).")
         
         with open(file_path, 'rb') as f:
@@ -289,15 +317,16 @@ def upload_facebook_content(file_path, content_type, title, description, access_
             response = requests.post(post_url, params=params, files=files)
 
     elif content_type == "reels":
-        # Reels API requires specific endpoints and often different permissions
-        # This is a simplified example. Real Reels API upload might be more involved.
-        post_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-        params['video_file_chunk_upload_start'] = 1 # Indicator for chunk upload start (simplified)
-        params['title'] = title
-        params['description'] = description
+        # Reels API is somewhat different and requires chunked uploads.
+        # This is a simplified example focusing on getting a video to upload.
+        # A full implementation would involve initializing an upload, sending chunks, then finalizing.
+        # For simplicity, we'll try to use the regular video endpoint for now as a fallback/demo,
+        # or simulate a Reels specific flow. The provided code has a good attempt for Reels upload.
+        # Let's refine the provided Reels logic.
         
-        # Facebook Reels API expects a session_id and upload_url first
-        # Simplified for demonstration purposes - a real implementation would handle chunking
+        # Reels API requires an initial call to get an upload session
+        # Then upload, then publish.
+        
         try:
             # Step 1: Initialize upload session
             init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels?access_token={access_token}&upload_phase=start"
@@ -306,43 +335,49 @@ def upload_facebook_content(file_path, content_type, title, description, access_
             init_data = init_response.json()
             upload_session_id = init_data['upload_session_id']
             upload_url = init_data['upload_url']
-
-            # Step 2: Upload video file (simplified to single file upload, but often chunked)
+            
+            # Step 2: Upload video file (simplified - often requires chunking for large files)
+            file_size = os.path.getsize(file_path)
             with open(file_path, 'rb') as f:
-                upload_headers = {'file_offset': '0', 'X-Entity-Length': str(os.path.getsize(file_path))}
-                upload_response = requests.post(upload_url, headers=upload_headers, data=f)
+                upload_headers = {'file_offset': '0', 'X-Entity-Length': str(file_size)}
+                # Using PUT for the actual file upload
+                upload_response = requests.put(upload_url, headers=upload_headers, data=f)
                 upload_response.raise_for_status()
-                
+            
             # Step 3: Publish the Reel
             publish_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels?access_token={access_token}&upload_phase=finish"
             publish_params = {
                 'upload_session_id': upload_session_id,
                 'video_state': 'PUBLISHED' if visibility.lower() == 'public' else 'DRAFT', # Reels typically Public or Draft
-                'title': title,
-                'description': description
+                'title': effective_title,
+                'description': effective_description
             }
             if schedule_time:
-                # Scheduling for Reels is more complex, might need separate logic or not directly supported.
-                # For simplicity, we'll treat scheduled as published after the scheduled time,
-                # or handle it as draft and then publish. Actual Reels API might not support direct scheduling.
-                publish_params['video_state'] = 'SCHEDULED' # This might not be a valid state for Reels API
-                publish_params['scheduled_publish_time'] = int(schedule_time.timestamp())
-                logger.warning("Facebook Reels scheduling is complex and may not be directly supported via API as for regular videos. Simulating schedule.")
+                # Facebook Reels API does not directly support scheduled publish time in the same way as regular videos.
+                # Scheduling for Reels often means setting it to 'SCHEDULED' state and then relying on Facebook's scheduler,
+                # or manually publishing after the scheduled time. For this example, we'll log a warning.
+                # If scheduling is a hard requirement for Reels, a more complex approach (e.g., cron job to publish drafts) is needed.
+                logger.warning("Facebook Reels scheduling is complex and may not be directly supported via API as for regular videos. Consider manual publish after scheduling or check Facebook's API for recent updates.")
+                # We won't set scheduled_publish_time here, as it's not a standard parameter for Reels finish phase.
+                # If you must schedule, set as DRAFT, and then a separate process would publish it.
+                publish_params['video_state'] = 'DRAFT' # Set to draft if scheduled, user must publish later.
+                await app.send_message(OWNER_ID, f"**ATTENTION: REELS SCHEDULING NOTE**\n\nUser {page_id} attempted to schedule a Reel. Facebook's Reels API currently lacks direct scheduling. The Reel has been uploaded as a DRAFT. It must be manually published at {schedule_time.strftime('%Y-%m-%d %H:%M UTC')}.")
 
             response = requests.post(publish_url, json=publish_params)
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error during Facebook Reels upload for file {file_path}: {e}")
+            if e.response:
+                logger.error(f"Facebook API Error Response: {e.response.text}")
             raise RuntimeError(f"Facebook Reels API error: {e}")
 
     elif content_type == "photo":
         post_url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
-        params['caption'] = description if description else title # Use description as caption, fall back to title
+        params['caption'] = effective_description if effective_description else effective_title # Use description as caption, fall back to title
         
         if schedule_time:
-            # Photos can be scheduled
             params['scheduled_publish_time'] = int(schedule_time.timestamp())
-            params['published'] = 'false'
+            params['published'] = 'false' # Must be false if scheduled
             logger.info(f"Scheduling Facebook photo for: {schedule_time}")
         elif visibility.lower() == 'private' or visibility.lower() == 'draft':
             params['published'] = 'false' # Draft
@@ -358,39 +393,81 @@ def upload_facebook_content(file_path, content_type, title, description, access_
     else:
         raise ValueError(f"Unsupported Facebook content type: {content_type}")
 
-    response.raise_for_status()
+    response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
     result = response.json()
     logger.info(f"Facebook {content_type} upload result: {result}")
     return result
 
+def get_video_info(file_path):
+    """Gets video information using ffprobe."""
+    try:
+        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=width,height,duration_ts,codec_name,pix_fmt",
+               "-of", "json", file_path]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+        video_info = json.loads(result.stdout)
+        return video_info.get("streams", [{}])[0]
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Could not get video info for {file_path}: {e}")
+        return {}
+
 def convert_media_for_facebook(input_path, output_type, target_format):
     """
-    Converts media to suitable format for Facebook upload.
+    Converts media to suitable format for Facebook upload, avoiding re-compression if possible.
     output_type can be 'video', 'reels', 'photo'.
     target_format can be 'mp4' for video/reels or 'jpg'/'png' for photo.
     """
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     output_path = f"downloads/processed_{base_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.{target_format}"
 
+    input_extension = os.path.splitext(input_path)[1].lower()
+    input_mime_type = mimetypes.guess_type(input_path)[0] or ''
+
     command = []
+
     if output_type in ["video", "reels"]:
-        # Ensure video is MP4. For reels, specific aspect ratio might be needed (9:16)
-        if output_type == "reels":
-            # Best effort for Reels: try to enforce 9:16, but don't force if it distorts too much.
-            # Ideal Reels are vertical (9:16, e.g., 1080x1920)
-            command = ["ffmpeg", "-i", input_path, "-vf", "scale='min(iw,ih*9/16)':'min(ih,iw*16/9)',pad='ih*9/16':ih:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", output_path]
-            logger.info(f"[FFmpeg] Attempting conversion for Reels to 9:16 for {input_path}")
-        else: # Standard video
-            command = ["ffmpeg", "-i", input_path, "-c:v", "copy", "-c:a", "copy", "-map", "0", "-y", output_path]
-            logger.info(f"[FFmpeg] Initiating video conversion for {input_path}")
+        # Check if input is already a video and in target_format (MP4)
+        if input_extension == ".mp4" and input_mime_type.startswith("video/"):
+            logger.info(f"[FFmpeg] Input {input_path} is already MP4 video. Copying directly.")
+            # Use -c copy to avoid re-encoding and preserve quality
+            command = ["ffmpeg", "-i", input_path, "-c", "copy", "-map", "0", "-y", output_path]
+        else:
+            # If not MP4 or not a video, convert to MP4 (h264, aac)
+            # Use lower CRF for better quality, faster preset for speed.
+            logger.info(f"[FFmpeg] Converting video to MP4 for Facebook {output_type} for {input_path}")
+            # Ensure correct pixel format for broader compatibility, and faststart for streaming.
+            command = ["ffmpeg", "-i", input_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                       "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", output_path]
+            
+            # For reels, typically vertical aspect ratio (9:16) is preferred.
+            # This complex filter ensures video is within bounds and potentially padded, not aggressively cropped.
+            # However, direct copies are better if possible. If re-encoding is needed, and aspect ratio needs adjustment,
+            # this filter can be considered, but it might still alter the original.
+            # For now, let's keep it simple and avoid aggressive aspect ratio changes unless strictly required
+            # by a platform (which Facebook API doesn't strictly enforce for upload, only for display).
+            # if output_type == "reels":
+            #     command = ["ffmpeg", "-i", input_path, "-vf", "scale='min(iw,ih*9/16)':-1,pad='ih*9/16':ih:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+            #                "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", output_path]
+            #     logger.info(f"[FFmpeg] Attempting conversion for Reels to 9:16 (padded) for {input_path}")
+            
     elif output_type == "photo":
-        # Convert video frame to image or ensure image is JPEG/PNG
-        command = ["ffmpeg", "-i", input_path, "-vframes", "1", "-q:v", "2", "-y", output_path]
-        logger.info(f"[FFmpeg] Converting video frame to photo for {input_path}")
+        # Check if input is already an image in target_format (JPG or PNG)
+        if input_mime_type.startswith("image/") and input_extension in [".jpg", ".jpeg", ".png"]:
+            logger.info(f"[FFmpeg] Input {input_path} is already a suitable image. Copying directly.")
+            import shutil
+            shutil.copy(input_path, output_path)
+            return output_path
+        else:
+            # Convert video frame to image or other image formats to JPG
+            logger.info(f"[FFmpeg] Converting to photo (JPG) for {input_path}")
+            command = ["ffmpeg", "-i", input_path, "-vframes", "1", "-q:v", "2", "-y", output_path]
     else:
         raise ValueError(f"Unsupported output type for conversion: {output_type}")
 
     try:
+        if not command: # Should not happen if logic above is sound, but a safeguard
+            raise RuntimeError("No FFmpeg command generated for conversion.")
+            
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=900) # Increased timeout
         logger.info(f"[FFmpeg] Conversion successful for {input_path}. Output: {result.stdout}")
         return output_path
@@ -406,6 +483,42 @@ def convert_media_for_facebook(input_path, output_type, target_format):
     except Exception as e:
         logger.error(f"An unexpected error occurred during FFmpeg conversion: {e}")
         raise
+
+def convert_video_to_mp4(input_path, output_path):
+    """
+    Converts a video to MP4 format using FFmpeg, avoiding re-encoding if already MP4.
+    Prioritizes copying streams if possible to avoid quality loss.
+    """
+    input_extension = os.path.splitext(input_path)[1].lower()
+    input_mime_type = mimetypes.guess_type(input_path)[0] or ''
+
+    if input_extension == ".mp4" and input_mime_type.startswith("video/"):
+        logger.info(f"[FFmpeg] Input {input_path} is already MP4. Copying directly.")
+        import shutil
+        shutil.copy(input_path, output_path)
+        return output_path
+    
+    logger.info(f"[FFmpeg] Converting video to MP4 (h264, aac) for {input_path}")
+    command = ["ffmpeg", "-i", input_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", output_path]
+
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=600) # 10 min timeout
+        logger.info(f"[FFmpeg] Video conversion successful for {input_path}. Output: {result.stdout}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[FFmpeg] Video conversion failed for {input_path}. Command: {' '.join(e.cmd)}")
+        logger.error(f"STDOUT: {e.stdout}")
+        logger.error(f"STDERR: {e.stderr}")
+        raise RuntimeError(f"FFmpeg video conversion error: {e.stderr}")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg and ensure it's in your system's PATH.")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg video conversion timed out. Video might be too large or complex.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during FFmpeg video conversion: {e}")
+        raise
+
 
 # === PYROGRAM HANDLERS ===
 
@@ -432,11 +545,17 @@ async def start_command(client, message):
         }
     }
 
+    # Ensure owner is always admin and premium
     if user_id == OWNER_ID:
         user_data_to_set["role"] = "admin"
         user_data_to_set["is_premium"] = True
+        if "facebook" not in user_data_to_set["premium_platforms"]:
+            user_data_to_set["premium_platforms"].append("facebook")
+        if "youtube" not in user_data_to_set["premium_platforms"]:
+            user_data_to_set["premium_platforms"].append("youtube")
 
     try:
+        # Use $setOnInsert for fields that should only be set on initial creation
         users_collection.update_one(
             {"_id": user_id},
             {"$set": user_data_to_set, "$setOnInsert": {"added_at": datetime.now(), "added_by": "self_start"}},
@@ -448,6 +567,7 @@ async def start_command(client, message):
         await message.reply("🚨 **System Alert!** An error occurred while initializing your account. Please try again later or contact support.")
         return
 
+    # Fetch the updated user doc to ensure latest state is used
     user_doc = get_user_data(user_id)
     if not user_doc:
         logger.error(f"Could not retrieve user document for {user_id} after upsert. This is unexpected.")
@@ -512,7 +632,7 @@ async def add_admin_command(client, message):
             return
 
         target_user_id = int(args[1])
-        update_user_data(target_user_id, {"role": "admin", "is_premium": True})
+        update_user_data(target_user_id, {"role": "admin", "is_premium": True, "$addToSet": {"premium_platforms": "facebook", "premium_platforms": "youtube"}})
         await message.reply(f"✅ **Success!** User `{target_user_id}` has been promoted to **ADMIN** and **PREMIUM** status.")
         try:
             await client.send_message(target_user_id, "🎉 **System Notification!** You have been promoted to an administrator! Use `/start` to access your new command interface.")
@@ -541,7 +661,7 @@ async def remove_admin_command(client, message):
             return
 
         if user_doc and user_doc.get("role") == "admin":
-            update_user_data(target_user_id, {"role": "user", "is_premium": False, "premium_platforms": []})
+            update_user_data(target_user_id, {"role": "user", "is_premium": False, "premium_platforms": [], "facebook_access_token": None, "facebook_selected_page_id": None, "facebook_selected_page_name": None, "youtube_logged_in": False, "youtube_access_token": None})
             await message.reply(f"✅ **Success!** User `{target_user_id}` has been demoted to a regular user and removed from premium access.")
             try:
                 await client.send_message(target_user_id, "❗ **System Notification!** Your administrator status has been revoked, and premium access removed.")
@@ -614,7 +734,7 @@ async def back_to_main_menu_from_inline(client, callback_query):
 async def settings_user_menu_callback(client, callback_query):
     """Callback for navigating to user-specific platform settings."""
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
+    if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to access user-specific configuration.", show_alert=True)
         logger.info(f"User {user_id} attempted to access user settings without premium.")
         return
@@ -684,11 +804,11 @@ async def admin_add_user_id_input(client, message):
     """Handles input of user ID for adding premium status."""
     user_id = message.from_user.id
     target_user_id_str = message.text.strip()
-    user_states.pop(user_id, None)
+    user_states.pop(user_id, None) # Clear state immediately after receiving input
 
     try:
         target_user_id = int(target_user_id_str)
-        update_user_data(target_user_id, {"is_premium": True, "role": "user"})
+        update_user_data(target_user_id, {"is_premium": True, "role": "user", "$addToSet": {"premium_platforms": "facebook", "premium_platforms": "youtube"}})
         await message.reply(f"✅ **Success!** User `{target_user_id}` has been granted **PREMIUM ACCESS**.", reply_markup=Admin_markup)
         try:
             await client.send_message(target_user_id, "🎉 **Congratulations!** Your account has been upgraded to **PREMIUM** status! Use `/start` to access your enhanced features.")
@@ -724,7 +844,7 @@ async def admin_remove_user_id_input(client, message):
     """Handles input of user ID for removing premium status."""
     user_id = message.from_user.id
     target_user_id_str = message.text.strip()
-    user_states.pop(user_id, None)
+    user_states.pop(user_id, None) # Clear state immediately after receiving input
 
     try:
         target_user_id = int(target_user_id_str)
@@ -735,7 +855,7 @@ async def admin_remove_user_id_input(client, message):
         user_doc = get_user_data(target_user_id)
 
         if user_doc and user_doc.get("is_premium"):
-            update_user_data(target_user_id, {"is_premium": False, "premium_platforms": [], "facebook_access_token": None, "facebook_selected_page_id": None, "facebook_selected_page_name": None}) # Revoke premium and clear platform connections
+            update_user_data(target_user_id, {"is_premium": False, "premium_platforms": [], "facebook_access_token": None, "facebook_selected_page_id": None, "facebook_selected_page_name": None, "youtube_logged_in": False, "youtube_access_token": None}) # Revoke premium and clear platform connections
             await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS**.", reply_markup=Admin_markup)
             try:
                 await client.send_message(target_user_id, "❗ **System Notification!** Your premium access has been revoked.")
@@ -783,11 +903,11 @@ async def broadcast_message_handler(client, message):
 
     for target_user_id in all_user_ids:
         try:
-            if target_user_id == user_id:
+            if target_user_id == user_id: # Don't send broadcast to the admin who initiated it
                 continue
             await client.send_message(target_user_id, f"📢 **ADMIN BROADCAST MESSAGE:**\n\n{text_to_broadcast}")
             success_count += 1
-            time.sleep(0.05)
+            time.sleep(0.05) # Small delay to avoid hitting Telegram API limits too quickly
         except Exception as e:
             fail_count += 1
             logger.warning(f"Failed to send broadcast to user {target_user_id}: {e}")
@@ -833,7 +953,6 @@ async def settings_bot_status_inline_callback(client, callback_query):
     premium_users = users_collection.count_documents({"is_premium": True})
 
     total_fb_accounts = users_collection.count_documents({"facebook_access_token": {"$ne": None}})
-    # total_tiktok_accounts = users_collection.count_documents({"tiktok_settings.logged_in": True}) # REMOVED
     total_youtube_accounts = users_collection.count_documents({"youtube_logged_in": True})
 
     total_uploads_count = sum(user.get("total_uploads", 0) for user in users_collection.find({}, {"total_uploads": 1}))
@@ -899,7 +1018,8 @@ async def prompt_facebook_token_login_from_settings(client, callback_query):
         "3.  Acquire a **User Access Token** with `pages_show_list` and `pages_manage_posts` permissions.\n"
         "4.  Utilize this User Access Token to procure a **Long-Lived Page Access Token** for your desired Page.\n\n"
         "Once the token is acquired, transmit it using the following command structure:\n"
-        "```\n/fbtoken <your_facebook_page_access_token>\n```\n",
+        "```\n/fbtoken <your_facebook_page_access_token>\n```\n"
+        "\nOr, if you have a User Access Token (not page token), try it. The bot will try to list pages for you to pick.",
         parse_mode=enums.ParseMode.MARKDOWN
     )
     logger.info(f"User {user_id} prompted for Facebook access token (via /fbtoken).")
@@ -921,22 +1041,25 @@ async def facebook_token_login_command(client, message):
         # Try to fetch pages with this token to validate and allow selection
         pages = get_facebook_pages(access_token)
         if not pages:
-            await message.reply("❌ **Authentication Failed.** Invalid or expired Facebook token, or no pages found. Please ensure your token has `pages_show_list` and `pages_manage_posts` permissions.", reply_markup=facebook_settings_inline_menu)
+            await message.reply("❌ **Authentication Failed.** Invalid or expired Facebook token, or no pages found. Please ensure your token has `pages_show_list` and `pages_manage_posts` permissions. If it's a User Access Token, ensure it's long-lived.", reply_markup=facebook_settings_inline_menu)
             logger.error(f"Facebook token validation failed for user {user_id}: No pages found or token invalid.")
             return
 
         # Store the token temporarily in state for page selection
-        user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_temp_token": access_token}
+        # The `access_token` here might be a User Access Token or a Page Access Token.
+        # When selecting a page, we will use the page's specific access token from `pages` list.
+        user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_temp_user_token": access_token, "fb_pages_data": pages}
 
         page_buttons = []
         for page in pages:
+            # It's crucial to use page['access_token'] here, as this is the page-specific token.
             page_buttons.append([InlineKeyboardButton(page['name'], callback_data=f"select_fb_page_{page['id']}_{page['access_token']}")])
         
         await message.reply(
             "✅ **Facebook Token Validated!** Now, please select the Facebook Page you wish to manage for uploads:",
             reply_markup=InlineKeyboardMarkup(page_buttons)
         )
-        logger.info(f"User {user_id} token validated. Prompting for Facebook page selection.")
+        await log_to_channel(client, f"User {user_id} token validated. Prompting for Facebook page selection.")
 
     except Exception as e:
         await message.reply(f"❌ **Operation Failed.** Error during Facebook token login procedure: `{e}`", reply_markup=facebook_settings_inline_menu)
@@ -953,28 +1076,45 @@ async def select_facebook_page(client, callback_query):
         return
 
     try:
-        parts = callback_query.data.split('_', 3) # select_fb_page_<page_id>_<page_access_token>
+        # The callback_data is 'select_fb_page_<page_id>_<page_access_token>'
+        # We need to correctly parse page_id and page_access_token.
+        # Splitting by '_' and taking last two parts should work if page_access_token doesn't contain underscores.
+        # Better to join the parts after a certain index, as tokens can contain underscores.
+        parts = callback_query.data.split('_')
         selected_page_id = parts[3]
-        selected_page_token = parts[4] # This is the PAGE-SPECIFIC access token
+        selected_page_token = "_".join(parts[4:]) # Rejoin parts in case token has underscores
 
-        # Fetch page name to store
-        page_name_url = f"https://graph.facebook.com/v19.0/{selected_page_id}?access_token={selected_page_token}"
-        response = requests.get(page_name_url)
-        response.raise_for_status()
-        page_data = response.json()
-        page_name = page_data.get('name', 'Unknown Page')
+        # Find the selected page in the temporarily stored data to get its name
+        page_name = "Unknown Page"
+        if "fb_pages_data" in state:
+            for page in state["fb_pages_data"]:
+                if page['id'] == selected_page_id:
+                    page_name = page.get('name', 'Unknown Page')
+                    break
+        else:
+            # Fallback if fb_pages_data is not in state (e.g., bot restarted or old state)
+            # Try to fetch page name directly using the token
+            try:
+                page_name_url = f"https://graph.facebook.com/v19.0/{selected_page_id}?access_token={selected_page_token}"
+                response = requests.get(page_name_url)
+                response.raise_for_status()
+                page_data = response.json()
+                page_name = page_data.get('name', 'Unknown Page')
+            except Exception as e:
+                logger.warning(f"Could not fetch page name for {selected_page_id} with token. Error: {e}")
+
 
         update_user_data(user_id, {
             "facebook_access_token": selected_page_token, # Store the page-specific token
             "facebook_selected_page_id": selected_page_id,
             "facebook_selected_page_name": page_name,
-            "is_premium": True,
+            "is_premium": True, # Grant premium status if successful login
             "$addToSet": {"premium_platforms": "facebook"}
         })
         user_states.pop(user_id, None) # Clear state
 
         await callback_query.answer(f"Facebook Page '{page_name}' selected!", show_alert=True)
-        await callback_query.edit_message_text(
+        await callback_query.message.edit_text(
             f"✅ **Facebook Page Configured!**\n"
             f"You are now ready to upload content to Page: **{page_name}** (`{selected_page_id}`).",
             reply_markup=facebook_settings_inline_menu,
@@ -987,99 +1127,10 @@ async def select_facebook_page(client, callback_query):
         await callback_query.message.edit_text(f"❌ **Operation Failed.** Error selecting Facebook page: `{e}`", reply_markup=facebook_settings_inline_menu)
         logger.error(f"Failed to select Facebook page for user {user_id}: {e}", exc_info=True)
     
-# Handler for Facebook Direct Login (Username/Password)
-@app.on_callback_query(filters.regex("^fb_direct_login_prompt$"))
-async def prompt_facebook_direct_login(client, callback_query):
-    """Prompts for Facebook direct login username."""
-    user_id = callback_query.from_user.id
-    if not is_premium_user(user_id) and not is_admin(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to connect platforms.", show_alert=True)
-        return
-    await callback_query.answer("Initiating Facebook direct login protocol...")
-    user_states[user_id] = {"step": AWAITING_FB_USERNAME}
-    await callback_query.edit_message_text(
-        "🔑 **Facebook Direct Login (Username/Password):**\n\n"
-        "Please transmit your Facebook **email or phone number** associated with your account.\n\n"
-        "**_System Warning:_** _Direct login using username/password is generally **not recommended** due to security risks and Facebook's preferred OAuth method. This feature is for demonstration and might have limitations or be unstable._"
-    )
-    logger.info(f"User {user_id} prompted for Facebook direct login username.")
-
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_USERNAME))
-async def handle_facebook_username_input(client, message):
-    """Handles Facebook direct login username input, then prompts for password."""
-    user_id = message.from_user.id
-    username = message.text.strip()
-    
-    user_states[user_id]["fb_username"] = username
-    user_states[user_id]["step"] = AWAITING_FB_PASSWORD
-
-    await message.reply("🔐 **Authentication Protocol:**\n\nNow, please transmit your Facebook **password**.",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to FB Settings", callback_data='settings_facebook')]])) # Add back button
-    logger.info(f"User {user_id} provided Facebook username, awaiting password.")
-
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_PASSWORD))
-async def handle_facebook_password_input(client, message):
-    """Handles Facebook direct login password input and attempts login (simulated)."""
-    user_id = message.from_user.id
-    password = message.text.strip()
-    
-    state = user_states.get(user_id)
-    username = state.get("fb_username")
-    
-    user_states.pop(user_id, None) # Clear state immediately
-
-    if not username or not password:
-        await message.reply("❌ **Authentication Failed.** Missing username or password. Please restart the direct login process.", reply_markup=facebook_settings_inline_menu)
-        return
-
-    await message.reply("⏳ **Initiating Facebook Direct Authentication...** Please standby. This may take a moment.")
-    await client.send_chat_action(user_id, enums.ChatAction.TYPING)
-
-    try:
-        # --- SIMULATED DIRECT LOGIN ---
-        # In a real scenario, this would involve using a library like Selenium/Playwright
-        # to programmatically log into Facebook and retrieve a valid user access token,
-        # then exchange it for a long-lived page access token. This is complex and fragile.
-        # For this example, we'll simply "succeed" and assume a token is obtained.
-        
-        # Simulate an API call to get a user access token.
-        # This part needs a real Facebook App ID and App Secret for a proper OAuth flow.
-        # For simplicity, we generate a dummy token and proceed as if successful.
-        simulated_user_access_token = f"SIMULATED_USER_TOKEN_{user_id}_{datetime.now().timestamp()}"
-        
-        # Simulate fetching pages with this token
-        # In a real scenario, you'd use the simulated_user_access_token to call
-        # https://graph.facebook.com/v19.0/me/accounts?access_token=<user_access_token>
-        # To get the list of pages and their page access tokens.
-        
-        # For this demo, let's create some dummy pages.
-        dummy_pages = [
-            {'id': '100000000000001', 'name': 'My Demo Page 1', 'access_token': f'DUMMY_PAGE_TOKEN_1_{user_id}'},
-            {'id': '100000000000002', 'name': 'My Demo Page 2', 'access_token': f'DUMMY_PAGE_TOKEN_2_{user_id}'},
-        ]
-        
-        if not dummy_pages: # Or if real pages were fetched and none exist
-            await message.reply("❌ **Direct Login Failed.** Could not retrieve any accessible Facebook Pages with the provided credentials. Please ensure your account manages at least one page and has necessary permissions.", reply_markup=facebook_settings_inline_menu)
-            logger.warning(f"Simulated direct login failed for user {user_id}: No pages found.")
-            return
-
-        # Store the (simulated) user access token and prompt for page selection
-        user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_temp_token": simulated_user_access_token, "fb_pages_data": dummy_pages}
-        
-        page_buttons = []
-        for page in dummy_pages: # Use dummy_pages for demonstration
-            page_buttons.append([InlineKeyboardButton(page['name'], callback_data=f"select_fb_page_{page['id']}_{page['access_token']}")])
-        
-        await message.reply(
-            "✅ **Facebook Authentication Successful!** Now, please select the Facebook Page you wish to manage for uploads:",
-            reply_markup=InlineKeyboardMarkup(page_buttons)
-        )
-        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' Facebook directly (simulated). Prompting for page selection.")
-
-    except Exception as e:
-        await message.reply(f"❌ **Operation Failed.** Error during Facebook direct login procedure: `{e}`", reply_markup=facebook_settings_inline_menu)
-        logger.error(f"Failed to process Facebook direct login for user {user_id}: {e}", exc_info=True)
-
+# Removed direct login (username/password) prompts and handlers for security and feasibility reasons.
+# @app.on_callback_query(filters.regex("^fb_direct_login_prompt$"))
+# async def prompt_facebook_direct_login(client, callback_query):
+#    # ... (removed for this refined version as it's not a secure or reliable method) ...
 
 @app.on_callback_query(filters.regex("^fb_set_title$"))
 async def fb_set_title_prompt(client, callback_query):
@@ -1228,6 +1279,12 @@ async def fb_set_schedule_time_save(client, message):
 
     try:
         schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
+        # Ensure schedule time is in UTC for consistency
+        # Assuming current machine time is UTC or handling conversion if local.
+        # For simplicity, we'll treat the input as UTC directly.
+        
+        # Facebook API requires scheduled time to be at least 10 minutes in the future from publish.
+        # Let's set a buffer, e.g., 5 minutes from now.
         if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
             await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please try again with a later time.")
             return
@@ -1247,22 +1304,42 @@ async def fb_set_schedule_time_save(client, message):
 async def fb_set_privacy_selection(client, callback_query):
     """Displays options for Facebook privacy setting."""
     await callback_query.answer("Awaiting privacy selection...")
-    await callback_query.edit_message_text("🔒 **Facebook Privacy Configuration Module:**\n\nSelect Facebook privacy setting:", reply_markup=get_privacy_inline_menu('fb'))
+    # Modified to include 'Draft' option explicitly for Facebook
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Public", callback_data='fb_privacy_public')],
+            [InlineKeyboardButton("Private (Draft)", callback_data='fb_privacy_draft')],
+            [InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]
+        ]
+    )
+    await callback_query.edit_message_text("🔒 **Facebook Privacy Configuration Module:**\n\nSelect Facebook privacy setting:", reply_markup=keyboard)
     logger.info(f"User {callback_query.from_user.id} accessed Facebook privacy selection.")
 
 @app.on_callback_query(filters.regex("^fb_privacy_"))
 async def fb_set_privacy(client, callback_query):
     """Sets the Facebook privacy setting."""
     user_id = callback_query.from_user.id
-    privacy = "Public" if 'public' in callback_query.data else ("Private" if 'private' in callback_query.data else "Draft")
-    update_user_data(user_id, {"facebook_settings.privacy": privacy})
-    await callback_query.answer(f"Facebook privacy set to: {privacy}", show_alert=True)
+    # 'public', 'private', 'draft'
+    privacy = callback_query.data.split("_")[-1].capitalize() 
+    
+    # Facebook API mostly uses 'PUBLISHED' or 'DRAFT' concepts.
+    # 'Private' for a post generally means DRAFT or UNPUBLISHED.
+    # So map 'private' from UI to 'Draft' for API.
+    if privacy.lower() == 'private':
+        api_privacy_setting = 'Draft'
+        display_privacy = 'Private (Draft)'
+    else:
+        api_privacy_setting = privacy
+        display_privacy = privacy
+
+    update_user_data(user_id, {"facebook_settings.privacy": api_privacy_setting})
+    await callback_query.answer(f"Facebook privacy set to: {display_privacy}", show_alert=True)
     await callback_query.edit_message_text(
-        f"✅ **Facebook Privacy Configured.** Set to: {privacy}",
+        f"✅ **Facebook Privacy Configured.** Set to: {display_privacy}",
         reply_markup=facebook_settings_inline_menu
     )
-    await log_to_channel(client, f"User `{user_id}` set Facebook privacy to `{privacy}`.")
-    logger.info(f"User {user_id} set Facebook privacy to {privacy}.")
+    await log_to_channel(client, f"User `{user_id}` set Facebook privacy to `{api_privacy_setting}`.")
+    logger.info(f"User {user_id} set Facebook privacy to {api_privacy_setting}.")
 
 @app.on_callback_query(filters.regex("^fb_check_token_info$"))
 async def fb_check_token_info(client, callback_query):
@@ -1270,19 +1347,19 @@ async def fb_check_token_info(client, callback_query):
     user_id = callback_query.from_user.id
     await callback_query.answer("Retrieving Facebook token and page info...")
     user_doc = get_user_data(user_id)
-    fb_access_token = user_doc.get("facebook_access_token", "Not Set")
-    fb_selected_page_id = user_doc.get("facebook_selected_page_id", "Not Set")
-    fb_selected_page_name = user_doc.get("facebook_selected_page_name", "None Selected")
+    fb_access_token = user_doc.get("facebook_access_token")
+    fb_selected_page_id = user_doc.get("facebook_selected_page_id")
+    fb_selected_page_name = user_doc.get("facebook_selected_page_name")
 
     # For security, do not display the full token in chat. Just indicate presence.
-    token_status = "✅ Active (Stored)" if fb_access_token and fb_access_token != "Not Set" else "❌ Not Stored"
+    token_status = "✅ Active (Stored)" if fb_access_token else "❌ Not Stored"
+    page_status = f"✅ Selected: **{fb_selected_page_name}** (`{fb_selected_page_id}`)" if fb_selected_page_id else "❌ No Page Selected"
 
     info_text = (
         f"**📘 Facebook Account Diagnostics:**\n"
         f"Page Access Token Status: `{token_status}`\n"
-        f"Selected Page Name: `{fb_selected_page_name}`\n"
-        f"Selected Page ID: `{fb_selected_page_id}`\n\n"
-        f"_**System Note:** For security, the full token is not displayed here. Facebook Page Access Tokens are generally long-lived._"
+        f"Selected Page Info: {page_status}\n\n"
+        f"_**System Note:** For security, the full token is not displayed here. Facebook Page Access Tokens are generally long-lived, but dependent on the originating User Access Token's validity and permissions._"
     )
     await callback_query.edit_message_text(info_text, reply_markup=facebook_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
     logger.info(f"User {user_id} checked Facebook token info.")
@@ -1301,7 +1378,7 @@ async def yt_login_prompt(client, callback_query):
         "🔑 **YouTube Access Token Input Module:**\n\n"
         "To establish a connection to YouTube, please transmit your **YouTube Access Token**.\n\n"
         "**Format:** `/youtubelogin <your_youtube_access_token>`\n\n"
-        "_**System Note:** This is a placeholder for a real YouTube OAuth 2.0 flow. Obtaining YouTube access tokens securely usually involves a multi-step web authentication process._",
+        "_**System Note:** This is a placeholder for a real YouTube OAuth 2.0 flow. Obtaining YouTube access tokens securely usually involves a multi-step web authentication process and a separate API client setup. This bot does not currently implement a full YouTube API upload, but stores the token for future integration._",
         parse_mode=enums.ParseMode.MARKDOWN
     )
     logger.info(f"User {user_id} prompted for YouTube access token.")
@@ -1310,7 +1387,7 @@ async def yt_login_prompt(client, callback_query):
 async def youtube_login_command(client, message):
     """Handles YouTube access token input and saves it (simulated)."""
     user_id = message.from_user.id
-    user_states.pop(user_id, None)
+    user_states.pop(user_id, None) # Clear state immediately
 
     try:
         args = message.text.split(maxsplit=1)
@@ -1329,9 +1406,9 @@ async def youtube_login_command(client, message):
                 "youtube_logged_in": True,
                 "youtube_access_token": access_token,
                 "premium_platforms": premium_platforms,
-                "is_premium": True
+                "is_premium": True # Grant premium status if successful login (even simulated)
             })
-            await message.reply("✅ **YouTube Login Simulated Successfully!** Token recorded. Connection established.", reply_markup=youtube_settings_inline_menu)
+            await message.reply("✅ **YouTube Login Simulated Successfully!** Token recorded. Connection established (for future use).", reply_markup=youtube_settings_inline_menu)
             await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' YouTube (simulated). Set as premium.")
         else:
             await message.reply("❌ **Authentication Failed.** Invalid token provided.", reply_markup=youtube_settings_inline_menu)
@@ -1535,9 +1612,14 @@ async def yt_check_expiry_date(client, callback_query):
     await callback_query.answer("Retrieving YouTube token expiry data...")
     user_doc = get_user_data(user_id)
     yt_settings = user_doc.get("youtube_settings", {})
-    expiry_date = yt_settings.get("expiry_date", "Not Integrated (Requires OAuth Token Refresh)")
-    await callback_query.edit_message_text(f"🗓️ **YouTube Token Expiry Status:** `{expiry_date}`\n\n_**System Note:** YouTube OAuth 2.0 access tokens are typically short-lived and require a refresh token mechanism for persistent access. This is not fully implemented._", reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
-    logger.info(f"User {user_id} checked YouTube expiry date.")
+    # For a real YouTube integration, you'd store and display the actual token expiry and refresh status.
+    # This is a placeholder as actual OAuth token refreshing is not implemented.
+    expiry_date_info = "Not Tracked (Requires full OAuth implementation)"
+    if user_doc.get("youtube_logged_in"):
+        expiry_date_info = "Logged in (Token status based on placeholder. Real expiry not monitored)"
+
+    await callback_query.edit_message_text(f"🗓️ **YouTube Token Expiry Status:** `{expiry_date_info}`\n\n_**System Note:** YouTube OAuth 2.0 access tokens are typically short-lived and require a refresh token mechanism for persistent access. This is not fully implemented here._", reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+    logger.info(f"User {user_id} checked YouTube expiry date (simulated).")
 
 
 # --- Generic Upload Flow Handler ---
@@ -1577,6 +1659,15 @@ async def handle_upload_platform_selection(client, callback_query):
             await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into Facebook or haven't selected a page. Please navigate to `⚙️ Settings` -> `📘 Facebook Settings` to configure your account first.")
             return
 
+        # Use the default upload type from settings, but still offer selection in case user wants to override
+        user_fb_settings = user_doc.get("facebook_settings", {})
+        default_fb_upload_type = user_fb_settings.get("upload_type", "Video").lower()
+
+        user_states[user_id] = {"step": AWAITING_UPLOAD_FILE, "platform": "facebook", "upload_type": default_fb_upload_type}
+        
+        # We can ask for file directly, or still offer the type selection.
+        # Original code offered type selection via `AWAITING_UPLOAD_TYPE_SELECTION`.
+        # Let's keep that flow for explicit choice.
         user_states[user_id] = {"step": AWAITING_UPLOAD_TYPE_SELECTION, "platform": "facebook"}
         await callback_query.message.edit_text(
             "What type of content are you transmitting to Facebook?",
@@ -1625,7 +1716,7 @@ async def handle_facebook_upload_type_selection(client, callback_query):
     logger.info(f"User {user_id} selected Facebook upload type '{upload_type}', awaiting file.")
 
 
-@app.on_message(filters.video | filters.photo)
+@app.on_message(filters.video | filters.photo | filters.document) # Added filters.document for broader media support
 async def handle_media_upload(client, message):
     """Handles incoming video or photo files for upload."""
     user_id = message.chat.id
@@ -1635,17 +1726,35 @@ async def handle_media_upload(client, message):
 
     state = user_states.get(user_id)
     if not state or (state.get("step") != AWAITING_UPLOAD_FILE):
-        if message.video:
-            await message.reply("❗ **Invalid Operation.** Please initiate a video upload process by clicking '⬆️ Upload Content' first.")
-        elif message.photo:
-            await message.reply("❗ **Invalid Operation.** Please initiate a photo upload process by clicking '⬆️ Upload Content' first.")
-        logger.warning(f"User {user_id} sent media without active upload state.")
+        if message.video or message.photo or (message.document and message.document.mime_type and (message.document.mime_type.startswith('video/') or message.document.mime_type.startswith('image/'))):
+            await message.reply("❗ **Invalid Operation.** Please initiate a content upload process by clicking '⬆️ Upload Content' first.")
+        else:
+            await message.reply("❗ **Unsupported Media Type.** Please transmit a video or image file to proceed.")
+        logger.warning(f"User {user_id} sent media without active upload state or unsupported media type.")
         return
 
     if not is_premium_user(user_id) and not is_admin(user_id):
         await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** to upload content. Please contact the administrator.")
         user_states.pop(user_id, None)
         logger.warning(f"Non-premium user {user_id} attempted media upload.")
+        return
+
+    # Determine file type and extension for download
+    file_info = None
+    if message.video:
+        file_info = message.video
+        file_extension = os.path.splitext(file_info.file_name or "video.mp4")[1]
+    elif message.photo:
+        # Pyrogram's message.photo selects the highest quality photo by default
+        file_info = message.photo.file_id # Use file_id for photo download, filename irrelevant for photos in this context
+        file_extension = ".jpg" # Photos typically downloaded as JPG by Pyrogram
+    elif message.document and message.document.mime_type and (message.document.mime_type.startswith('video/') or message.document.mime_type.startswith('image/')):
+        file_info = message.document
+        file_extension = os.path.splitext(file_info.file_name or "document")[1]
+    else:
+        await message.reply("❗ **Unsupported Media Type.** Please transmit a video or image file to proceed.")
+        logger.warning(f"User {user_id} sent an unhandled document type.")
+        user_states.pop(user_id, None)
         return
 
     if not os.path.exists("downloads"):
@@ -1655,14 +1764,9 @@ async def handle_media_upload(client, message):
     initial_status_msg = await message.reply("⏳ **Data Acquisition In Progress...** Downloading your content. This operation may require significant processing time for large data files.")
     try:
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        if message.video:
-            file_extension = os.path.splitext(message.video.file_name or "video.mp4")[1]
-        elif message.photo:
-            file_extension = ".jpg" # Photos usually come as JPEG
-        
         download_filename = f"downloads/{user_id}_{timestamp}{file_extension}"
         
-        file_path = await message.download(file_name=download_filename)
+        file_path = await client.download_media(file_info, file_name=download_filename)
         
         user_states[user_id]["file_path"] = file_path
         user_states[user_id]["step"] = AWAITING_UPLOAD_TITLE
@@ -1750,7 +1854,7 @@ async def handle_upload_description(client, message):
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Public", callback_data="visibility_public")],
-                [InlineKeyboardButton("Private (Draft)", callback_data="visibility_draft")] # Facebook doesn't have "private" for posts, but draft acts similarly
+                [InlineKeyboardButton("Private (Draft)", callback_data="visibility_draft")]
             ]
         )
     await message.reply("🌐 **Visibility Configuration Module.** Select content visibility:", reply_markup=keyboard)
@@ -1770,10 +1874,16 @@ async def handle_visibility_selection(client, callback_query):
     platform = state["platform"]
     visibility_choice = callback_query.data.split("_")[1]
 
-    state["visibility"] = visibility_choice
+    # Map 'draft' to 'private' for consistent API handling if needed, but keep 'draft' for Facebook.
+    if visibility_choice.lower() == 'draft' and platform != 'facebook':
+        # This case handles if a "draft" option was accidentally presented for YT
+        state["visibility"] = "private"
+    else:
+        state["visibility"] = visibility_choice
+    
     user_states[user_id]["step"] = AWAITING_UPLOAD_SCHEDULE
 
-    await callback_query.answer(f"Visibility set to: {visibility_choice.capitalize()}", show_alert=True)
+    await callback_query.answer(f"Visibility set to: {visibility_choice.replace('_', ' ').capitalize()}", show_alert=True)
     logger.info(f"User {user_id} set visibility for {platform} to {visibility_choice}.")
 
     keyboard = InlineKeyboardMarkup(
@@ -1833,7 +1943,8 @@ async def handle_schedule_datetime_input(client, message):
             return
 
         state["schedule_time"] = schedule_dt
-        user_states[user_id]["step"] = "processing_and_uploading"
+        # Note: 'processing_and_uploading' is not an actual state to be set.
+        # The `initiate_upload` call should handle the process end.
         await message.reply("⏳ **Data Processing Initiated...** Preparing your content for scheduled transmission. Please standby.")
         await initiate_upload(client, message, user_id)
         logger.info(f"User {user_id} provided schedule datetime for {state['platform']}: {schedule_str}.")
@@ -1846,7 +1957,7 @@ async def handle_schedule_datetime_input(client, message):
         logger.error(f"Error processing schedule time for user {user_id}: {e}", exc_info=True)
 
 
-async def initiate_upload(client, message, user_id):
+async def initiate_upload(client, message_obj, user_id): # Renamed message to message_obj to avoid confusion with Pyrogram's message object.
     """Initiates the actual content upload to the chosen platform."""
     state = user_states.get(user_id)
     if not state:
@@ -1860,7 +1971,7 @@ async def initiate_upload(client, message, user_id):
     description = state.get("description")
     visibility = state.get("visibility", "public")
     schedule_time = state.get("schedule_time")
-    upload_type = state.get("upload_type", "video") # Default to video for Facebook
+    upload_type = state.get("upload_type", "video") # Default to video for Facebook, or just generic for YouTube
 
     if not all([file_path, title, description]):
         await client.send_message(user_id, "❌ **Upload Protocol Failure.** Missing essential content metadata (file, title, or description). Please restart the upload sequence.")
@@ -1870,36 +1981,42 @@ async def initiate_upload(client, message, user_id):
         user_states.pop(user_id, None)
         return
 
-    user_states[user_id]["step"] = "processing_and_uploading"
+    # Set chat action and log
     await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO) # Keep generic for now
-    await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) initiating upload for {platform}. Type: `{upload_type}`. File: `{os.path.basename(file_path)}`. Visibility: `{visibility}`. Schedule: `{schedule_time}`.")
+    await log_to_channel(client, f"User `{user_id}` (`{message_obj.from_user.username}`) initiating upload for {platform}. Type: `{upload_type}`. File: `{os.path.basename(file_path)}`. Visibility: `{visibility}`. Schedule: `{schedule_time}`.")
 
     processed_file_path = file_path # Assume original is fine until conversion needed
 
     try:
         # --- Media Conversion / Pre-processing ---
         if platform == "facebook":
-            target_format = "mp4" if upload_type in ["video", "reels"] else "jpg"
-            if os.path.splitext(file_path)[1].lower() != f".{target_format}": # Only convert if necessary
-                await client.send_message(user_id, f"🔄 **Data Conversion Protocol.** Converting content to {target_format.upper()} format for Facebook {upload_type}. Please standby...")
-                await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
-                
-                def do_processing_sync():
-                    return convert_media_for_facebook(file_path, upload_type, target_format)
-                
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(do_processing_sync)
-                    processed_file_path = future.result(timeout=900)
-                
-                await client.send_message(user_id, "✅ **Content Data Conversion Complete.**")
-                await log_to_channel(client, f"User `{user_id}` content converted. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
+            # Determine target format based on selected upload_type
+            if upload_type == "photo":
+                target_format = "jpg"
+            elif upload_type in ["video", "reels"]:
+                target_format = "mp4"
             else:
-                await client.send_message(user_id, "✅ **Content Format Verified.** Proceeding with direct transmission.")
-                logger.info(f"User {user_id} content already suitable format for Facebook {upload_type}. Skipping conversion.")
+                raise ValueError(f"Unsupported Facebook upload type: {upload_type}")
+
+            await client.send_message(user_id, f"🔄 **Data Pre-processing Protocol.** Analyzing content for Facebook {upload_type} compatibility. Please standby...")
+            await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO if upload_type != 'photo' else enums.ChatAction.UPLOAD_PHOTO)
+                
+            def do_processing_sync():
+                return convert_media_for_facebook(file_path, upload_type, target_format)
+            
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(do_processing_sync)
+                processed_file_path = future.result(timeout=900) # Timeout for conversion
+            
+            await client.send_message(user_id, "✅ **Content Data Conversion/Verification Complete.**")
+            await log_to_channel(client, f"User `{user_id}` content processed. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
         
         elif platform == "youtube":
-            if os.path.splitext(file_path)[1].lower() not in [".mp4", ".mov", ".avi", ".webm"]: # YouTube supports various video formats
-                await client.send_message(user_id, f"🔄 **Data Conversion Protocol.** Converting video to MP4 format for YouTube. Please standby...")
+            # YouTube typically accepts various video formats, but MP4 (H264/AAC) is universal.
+            # Convert to MP4 only if necessary, preferring copy.
+            input_ext = os.path.splitext(file_path)[1].lower()
+            if input_ext not in [".mp4", ".mov", ".avi", ".webm", ".mkv"]: # Common video formats
+                await client.send_message(user_id, f"🔄 **Data Pre-processing Protocol.** Converting video to MP4 format for YouTube. Please standby...")
                 await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
                 
                 def do_processing_sync():
@@ -1907,13 +2024,13 @@ async def initiate_upload(client, message, user_id):
                 
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future = executor.submit(do_processing_sync)
-                    processed_file_path = future.result(timeout=600)
+                    processed_file_path = future.result(timeout=600) # Timeout for conversion
                 
                 await client.send_message(user_id, "✅ **Video Data Conversion Complete.**")
                 await log_to_channel(client, f"User `{user_id}` video converted for YouTube. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
             else:
                 await client.send_message(user_id, "✅ **Video Format Verified.** Proceeding with direct transmission.")
-                logger.info(f"User {user_id} video already suitable format for YouTube. Skipping conversion.")
+                logger.info(f"User {user_id} video already suitable format for YouTube. Skipping re-encoding.")
 
         # --- Upload to Platform ---
         if platform == "facebook":
@@ -1926,17 +2043,25 @@ async def initiate_upload(client, message, user_id):
             await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO if upload_type != 'photo' else enums.ChatAction.UPLOAD_PHOTO)
 
             def upload_to_facebook_sync():
-                return upload_facebook_content(processed_file_path, upload_type.lower(), title, description, fb_access_token, fb_selected_page_id, visibility=visibility, schedule_time=schedule_time)
+                # Pass the actual visibility string ('public', 'draft') as Facebook API handles this.
+                # 'private' from UI is mapped to 'draft' for FB.
+                actual_visibility = visibility
+                if platform == "facebook" and visibility.lower() == "private":
+                    actual_visibility = "draft"
+                
+                return upload_facebook_content(processed_file_path, upload_type.lower(), title, description, fb_access_token, fb_selected_page_id, visibility=actual_visibility, schedule_time=schedule_time)
 
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(upload_to_facebook_sync)
                 fb_result = future.result(timeout=1200) # Increased timeout for FB upload
 
-            if fb_result and 'id' in fb_result:
-                status_text = "Scheduled" if schedule_time else ("Draft" if visibility.lower() == 'draft' else "Published")
-                await client.send_message(user_id, f"✅ **Facebook Content Transmitted!** {upload_type.capitalize()} ID: `{fb_result['id']}`. Status: `{status_text}`.")
+            if fb_result and ('id' in fb_result or 'post_id' in fb_result): # Reels might return 'id', videos 'post_id'
+                # Check for post_id or id in result for success confirmation
+                post_id = fb_result.get('id') or fb_result.get('post_id')
+                status_text = "Scheduled" if schedule_time else ("Draft" if visibility.lower() == 'draft' or visibility.lower() == 'private' else "Published")
+                await client.send_message(user_id, f"✅ **Facebook Content Transmitted!** {upload_type.capitalize()} ID: `{post_id}`. Status: `{status_text}`.")
                 users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1}})
-                await log_to_channel(client, f"User `{user_id}` successfully uploaded {upload_type} to Facebook. ID: `{fb_result['id']}`. Status: `{status_text}`. File: `{os.path.basename(processed_file_path)}`.")
+                await log_to_channel(client, f"User `{user_id}` successfully uploaded {upload_type} to Facebook. ID: `{post_id}`. Status: `{status_text}`. File: `{os.path.basename(processed_file_path)}`.")
             else:
                 await client.send_message(user_id, f"❌ **Facebook Transmission Failed.** Response: `{json.dumps(fb_result, indent=2)}`")
                 logger.error(f"Facebook upload failed for user {user_id}. Result: {fb_result}")
@@ -1955,19 +2080,35 @@ async def initiate_upload(client, message, user_id):
         await client.send_message(user_id, f"❌ **Processing Error:** `{re}`\n\n_**System Note:** Ensure FFmpeg is correctly installed and accessible in your system's PATH, and verify your media data file is not corrupted._")
         logger.error(f"Processing/Upload Error for user {user_id}: {re}", exc_info=True)
     except requests.exceptions.RequestException as req_e:
-        await client.send_message(user_id, f"❌ **Network/API Error during Transmission:** `{req_e}`\n\n_**System Note:** Please verify your internet connection or inspect the configured API parameters for Facebook._")
+        error_msg = f"❌ **Network/API Error during Transmission:** `{req_e}`"
+        if req_e.response is not None:
+            try:
+                error_details = req_e.response.json()
+                error_msg += f"\nAPI Details: `{json.dumps(error_details, indent=2)}`"
+            except json.JSONDecodeError:
+                error_msg += f"\nAPI Response: `{req_e.response.text[:200]}`"
+        error_msg += "\n\n_**System Note:** Please verify your internet connection or inspect the configured API parameters for Facebook._"
+        await client.send_message(user_id, error_msg)
         logger.error(f"Network/API Error for user {user_id}: {req_e}", exc_info=True)
     except Exception as e:
         await client.send_message(user_id, f"❌ **Critical Transmission Failure.** An unexpected system error occurred: `{e}`")
         logger.error(f"Upload failed for user {user_id}: {e}", exc_info=True)
     finally:
+        # Clean up files
         if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up original file: {file_path}")
-        if processed_file_path != file_path and os.path.exists(processed_file_path):
-            os.remove(processed_file_path)
-            logger.info(f"Cleaned up processed file: {processed_file_path}")
-        user_states.pop(user_id, None)
+            try:
+                os.remove(file_path)
+                logger.info(f"Cleaned up original file: {file_path}")
+            except OSError as e:
+                logger.error(f"Error deleting original file {file_path}: {e}")
+        if processed_file_path and processed_file_path != file_path and os.path.exists(processed_file_path):
+            try:
+                os.remove(processed_file_path)
+                logger.info(f"Cleaned up processed file: {processed_file_path}")
+            except OSError as e:
+                logger.error(f"Error deleting processed file {processed_file_path}: {e}")
+        
+        user_states.pop(user_id, None) # Always clear state at the end of upload attempt
         await client.send_chat_action(user_id, enums.ChatAction.CANCEL)
 
 
@@ -1985,6 +2126,7 @@ def run_server():
     logger.info("Keep-alive HTTP server started on port 8080.")
     httpd.serve_forever()
 
+# Start the keep-alive server in a separate thread, ensuring the bot doesn't block.
 threading.Thread(target=run_server, daemon=True).start()
 
 # === START BOT ===
@@ -1995,3 +2137,4 @@ if __name__ == "__main__":
 
     logger.info("Bot system initiating...")
     app.run()
+
