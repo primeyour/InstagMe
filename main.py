@@ -234,7 +234,6 @@ def get_user_data(user_id):
 def update_user_data(user_id, data):
     """Updates user data in MongoDB using _id for upsert. Handles potential errors."""
     try:
-        # Fix: Use $set for all updates to avoid replacement document errors.
         users_collection.update_one({"_id": user_id}, {"$set": data}, upsert=True)
         logger.info(f"User {user_id} data updated/upserted successfully.")
     except Exception as e:
@@ -605,7 +604,7 @@ async def add_admin_command(client, message):
             await client.send_message(target_user_id, "🎉 **System Notification!** You have been promoted to an administrator! Use `/start` to access your new command interface.")
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about admin promotion: {e}")
-        await log_to_channel(client, f"User `{target_user_id}` promoted to admin by `{message.from_user.id}` (`{message.from_user.username}`).")
+        await log_to_channel(client, f"User `{target_id}` promoted to admin by `{message.from_user.id}`.")
     except Exception as e:
         await message.reply(f"❌ **Error!** Failed to add administrator: `{e}`")
         logger.error(f"Failed to add admin for {message.from_user.id}: {e}")
@@ -784,7 +783,7 @@ async def admin_add_user_id_input(client, message):
             await client.send_message(target_user_id, "🎉 **Congratulations!** Your account has been upgraded to **PREMIUM** status! Use `/start` to access your enhanced features.")
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about premium upgrade: {e}")
-        await log_to_channel(client, f"User `{target_id}` promoted to premium by `{message.from_user.id}`.")
+        await log_to_channel(client, f"Admin `{user_id}` (`{message.from_user.username}`) upgraded user `{target_user_id}` to premium.")
     except ValueError:
         await message.reply("❌ **Input Error.** Invalid User ID detected. Please transmit a numeric ID.", reply_markup=Admin_markup)
         logger.warning(f"Admin {user_id} provided invalid user ID '{target_user_id_str}' for adding premium.")
@@ -1083,6 +1082,7 @@ async def select_facebook_page(client, callback_query):
                     page_name = page.get('name', page_name)
                     break
         
+        # Fix: Save the correct, page-specific token for uploads
         update_user_data(user_id, {
             "facebook_page_access_token": page_access_token,
             "facebook_selected_page_id": selected_page_id,
@@ -1464,6 +1464,10 @@ async def initiate_upload(client, message, user_id):
     user_states[user_id]["step"] = "processing_and_uploading"
     await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
     try:
+        user_doc = get_user_data(user_id)
+        compression_enabled = user_doc.get("compression_enabled", True)
+        processed_file_path = file_path
+
         if message.video:
             if compression_enabled:
                 await client.send_message(user_id, "🎞️ **Video Compression Protocol.** Compressing your video for optimal transmission. Please standby...")
@@ -1476,6 +1480,7 @@ async def initiate_upload(client, message, user_id):
                 await client.send_message(user_id, "✅ **Video Compression Complete.**")
             else:
                 await client.send_message(user_id, "✅ **Video Compression Skipped.** Uploading original video.")
+        
         if platform == "facebook":
             fb_access_token, fb_selected_page_id = get_facebook_tokens_for_user(user_id)
             if not fb_access_token or not fb_selected_page_id:
