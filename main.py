@@ -452,8 +452,8 @@ def compress_video_ffmpeg(input_path):
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg compression timed out. Video might be too large or complex for standard compression settings.")
     except Exception as e:
-    logger.error(f"An unexpected error occurred during FFmpeg compression: {e}")
-
+        logger.error(f"An unexpected error occurred during FFmpeg compression: {e}")
+        raise
 
 # === PYROGRAM HANDLERS ===
 
