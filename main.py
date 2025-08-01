@@ -105,7 +105,7 @@ user_settings_inline_menu = InlineKeyboardMarkup(
 facebook_settings_inline_menu = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🔑 Facebook API Login", callback_data='fb_api_login_prompt')],
-        [InlineKeyboardButton("📄 Set Active Page", callback_data='fb_set_active_page')], # New feature button
+        [InlineKeyboardButton("📄 Set Active Page", callback_data='fb_set_active_page')],
         [InlineKeyboardButton("📝 Set Title", callback_data='fb_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='fb_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='fb_set_description')],
@@ -1551,7 +1551,6 @@ async def initiate_upload(client, message, user_id):
                         return
                     access_token = new_token
             
-            # Placeholder for YouTube upload logic using the valid access_token
             await client.send_message(user_id, "🚧 **YouTube Upload Feature Under Development.**\n\n_**System Note:** The YouTube upload functionality requires the Google API client library for the actual upload process. Your token is valid, but the upload API call is not yet implemented._")
             await log_to_channel(client, f"User `{user_id}` attempted YouTube upload. File: `{os.path.basename(processed_file_path)}`. Token is valid.")
             users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1}})
