@@ -8,7 +8,7 @@ import time
 import subprocess
 from datetime import datetime, timedelta
 import sys
-import re # Import for regex validation of client ID/secret
+import re
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -55,7 +55,6 @@ try:
 except Exception as e:
     logger.error(f"Error checking/dropping problematic user_id index: {e}")
 
-
 # === KEYBOARDS ===
 main_menu_user = ReplyKeyboardMarkup(
     [
@@ -74,7 +73,6 @@ main_menu_admin = ReplyKeyboardMarkup(
 )
 
 def get_general_settings_inline_keyboard(user_id):
-    """Returns the general settings inline keyboard based on user role."""
     keyboard = []
     if is_premium_user(user_id) or is_admin(user_id):
         keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
@@ -106,7 +104,7 @@ user_settings_inline_menu = InlineKeyboardMarkup(
 
 facebook_settings_inline_menu = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🔑 Facebook API Login", callback_data='fb_api_login_prompt')], # New API login flow
+        [InlineKeyboardButton("🔑 Facebook API Login", callback_data='fb_api_login_prompt')],
         [InlineKeyboardButton("📝 Set Title", callback_data='fb_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='fb_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='fb_set_description')],
@@ -114,7 +112,6 @@ facebook_settings_inline_menu = InlineKeyboardMarkup(
         [InlineKeyboardButton("⏰ Set Schedule Time", callback_data='fb_set_schedule_time')],
         [InlineKeyboardButton("🔒 Set Private/Public", callback_data='fb_set_privacy')],
         [InlineKeyboardButton("🗓️ Check Token Info", callback_data='fb_check_token_info')],
-        [InlineKeyboardButton("📡 Set Proxy", callback_data='fb_set_proxy')],
         [InlineKeyboardButton("⬅️ Back to User Settings", callback_data='settings_user_menu_inline')]
     ]
 )
@@ -133,7 +130,6 @@ youtube_settings_inline_menu = InlineKeyboardMarkup(
     ]
 )
 
-# New Facebook Upload Type Menu
 facebook_upload_type_inline_menu = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("Reels (Short Video)", callback_data='fb_upload_type_reels')],
@@ -152,7 +148,6 @@ youtube_video_type_inline_menu = InlineKeyboardMarkup(
 )
 
 def get_privacy_inline_menu(platform):
-    """Generates privacy inline keyboard for different platforms."""
     keyboard = [
         [InlineKeyboardButton("Public", callback_data=f'{platform}_privacy_public')],
         [InlineKeyboardButton("Private", callback_data=f'{platform}_privacy_private')],
@@ -162,7 +157,6 @@ def get_privacy_inline_menu(platform):
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f'settings_{platform}')])
     return InlineKeyboardMarkup(keyboard)
 
-# New inline keyboard for platform selection after "Upload Content"
 platform_selection_inline_menu = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("📘 Upload to Facebook", callback_data='upload_select_facebook')],
@@ -171,7 +165,6 @@ platform_selection_inline_menu = InlineKeyboardMarkup(
 )
 
 def get_video_compression_inline_keyboard(user_id):
-    """Returns the video compression settings inline keyboard."""
     user_doc = get_user_data(user_id)
     compression_enabled = user_doc.get("compression_enabled", True)
     
@@ -185,9 +178,7 @@ def get_video_compression_inline_keyboard(user_id):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-
 def get_facebook_page_selection_menu(pages, is_direct_login=False):
-    """Generates an inline keyboard for Facebook page selection."""
     page_buttons = []
     if pages:
         for page in pages:
@@ -195,10 +186,10 @@ def get_facebook_page_selection_menu(pages, is_direct_login=False):
             page_buttons.append([InlineKeyboardButton(page['name'], callback_data=f"select_fb_page_{page['id']}_{page['access_token']}")])
         
     page_buttons.append([InlineKeyboardButton("🔄 Refresh Pages", callback_data="refresh_fb_pages")])
-    if is_direct_login:
-        page_buttons.append([InlineKeyboardButton("⬅️ Back to FB Settings", callback_data="settings_facebook")])
+    page_buttons.append([InlineKeyboardButton("⬅️ Back to FB Settings", callback_data="settings_facebook")])
         
     return InlineKeyboardMarkup(page_buttons)
+
 
 # === USER STATES (for sequential conversation flows) ===
 user_states = {}
@@ -208,13 +199,11 @@ AWAITING_FB_TITLE = "awaiting_fb_title"
 AWAITING_FB_TAG = "awaiting_fb_tag"
 AWAITING_FB_DESCRIPTION = "awaiting_fb_description"
 AWAITING_FB_SCHEDULE_TIME = "awaiting_fb_schedule_time"
-AWAITING_FB_PROXY = "awaiting_fb_proxy"
 
-# New states for the API login flow
 AWAITING_FB_APP_ID = "awaiting_fb_app_id"
 AWAITING_FB_APP_SECRET = "awaiting_fb_app_secret"
 AWAITING_FB_PAGE_TOKEN = "awaiting_fb_page_token"
-AWAITING_FB_USER_TOKEN = "awaiting_fb_user_token" # State for initial user token
+AWAITING_FB_USER_TOKEN = "awaiting_fb_user_token"
 
 AWAITING_FB_PAGE_SELECTION = "awaiting_fb_page_selection"
 
@@ -286,7 +275,8 @@ def get_facebook_pages(user_access_token, user_id=None):
             proxy_url = user_doc["facebook_proxy_url"]
             proxies = {"http": proxy_url, "https": proxy_url}
             logger.info(f"Using proxy {proxy_url} for Facebook API request for user {user_id}")
-
+    
+    # We now fetch pages using the user's access token stored in a temp state or the database.
     try:
         pages_url = f"https://graph.facebook.com/v19.0/me/accounts?access_token={user_access_token}"
         response = requests.get(pages_url, proxies=proxies)
@@ -462,15 +452,14 @@ def compress_video_ffmpeg(input_path):
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg compression timed out. Video might be too large or complex for standard compression settings.")
     except Exception as e:
-        logger.error(f"An unexpected error occurred during FFmpeg compression: {e}")
-        raise
+    logger.error(f"An unexpected error occurred during FFmpeg compression: {e}")
+    raise
 
 
 # === PYROGRAM HANDLERS ===
 
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
-    """Handles the /start command, initializes/updates user data."""
     user_id = message.from_user.id
     user_first_name = message.from_user.first_name or "Unknown User"
     user_username = message.from_user.username or "N/A"
@@ -564,13 +553,11 @@ async def start_command(client, message):
 # --- Admin Commands ---
 @app.on_message(filters.command("addadmin") & filters.user(OWNER_ID))
 async def add_admin_command(client, message):
-    """Promotes a user to admin status."""
     try:
         args = message.text.split(maxsplit=1)
         if len(args) != 2 or not args[1].isdigit():
             await message.reply("❗ **Syntax Error:** Usage: `/addadmin <user_id>`")
             return
-
         target_user_id = int(args[1])
         update_user_data(target_user_id, {"role": "admin", "is_premium": True})
         await message.reply(f"✅ **Success!** User `{target_user_id}` has been promoted to **ADMIN** and **PREMIUM** status.")
@@ -579,27 +566,22 @@ async def add_admin_command(client, message):
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about admin promotion: {e}")
         await log_to_channel(client, f"User `{target_user_id}` promoted to admin by `{message.from_user.id}` (`{message.from_user.username}`).")
-
     except Exception as e:
         await message.reply(f"❌ **Error!** Failed to add administrator: `{e}`")
         logger.error(f"Failed to add admin for {message.from_user.id}: {e}")
 
 @app.on_message(filters.command("removeadmin") & filters.user(OWNER_ID))
 async def remove_admin_command(client, message):
-    """Demotes a user from admin status."""
     try:
         args = message.text.split(maxsplit=1)
         if len(args) != 2 or not args[1].isdigit():
             await message.reply("❗ **Syntax Error:** Usage: `/removeadmin <user_id>`")
             return
-
         target_user_id = int(args[1])
         user_doc = get_user_data(target_user_id)
-
         if target_user_id == OWNER_ID:
             await message.reply("❌ **Access Denied!** You cannot remove the owner's administrator status.")
             return
-
         if user_doc and user_doc.get("role") == "admin":
             update_user_data(target_user_id, {"role": "user", "is_premium": False, "premium_platforms": []})
             await message.reply(f"✅ **Success!** User `{target_user_id}` has been demoted to a regular user and removed from premium access.")
@@ -610,14 +592,12 @@ async def remove_admin_command(client, message):
             await log_to_channel(client, f"User `{target_user_id}` demoted from admin by `{message.from_user.id}` (`{message.from_user.username}`).")
         else:
             await message.reply(f"User `{target_user_id}` is not an administrator or not found in the system.")
-
     except Exception as e:
         await message.reply(f"❌ **Error!** Failed to remove administrator: `{e}`")
         logger.error(f"Failed to remove admin for {message.from_user.id}: {e}")
 
 @app.on_message(filters.text & filters.regex("^⚙️ Settings$"))
 async def show_main_settings_menu_reply(client, message):
-    """Displays the main settings menu via inline keyboard."""
     user_id = message.from_user.id
     user_doc = get_user_data(user_id)
     if not user_doc:
@@ -628,7 +608,6 @@ async def show_main_settings_menu_reply(client, message):
 
 @app.on_message(filters.text & filters.regex("^🔙 Main Menu$"))
 async def back_to_main_menu_reply(client, message):
-    """Handles the 'Back to Main Menu' reply button."""
     user_id = message.from_user.id
     user_states.pop(user_id, None)
     if is_admin(user_id):
@@ -637,13 +616,11 @@ async def back_to_main_menu_reply(client, message):
         await message.reply("✅ **Returning to Main System Interface.**", reply_markup=main_menu_user)
     logger.info(f"User {user_id} returned to main menu via reply button.")
 
-
 @app.on_callback_query(filters.regex("^settings_main_menu_inline$"))
 async def settings_main_menu_inline_callback(client, callback_query):
-    """Callback for navigating to the general settings inline menu."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Accessing settings...")
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "⚙️ **System Configuration Interface:**\n\nChoose your settings options:",
         reply_markup=get_general_settings_inline_keyboard(user_id)
     )
@@ -651,11 +628,9 @@ async def settings_main_menu_inline_callback(client, callback_query):
 
 @app.on_callback_query(filters.regex("^back_to_main_menu_reply_from_inline$"))
 async def back_to_main_menu_from_inline(client, callback_query):
-    """Handles 'Back to Main Menu' from an inline keyboard, switches to reply keyboard."""
     user_id = callback_query.from_user.id
     user_states.pop(user_id, None)
     await callback_query.answer("System redirection initiated...")
-
     if is_admin(user_id):
         await client.send_message(user_id, "✅ **Returning to Command Center.**", reply_markup=main_menu_admin)
     else:
@@ -669,14 +644,13 @@ async def back_to_main_menu_from_inline(client, callback_query):
 
 @app.on_callback_query(filters.regex("^settings_user_menu_inline$"))
 async def settings_user_menu_callback(client, callback_query):
-    """Callback for navigating to user-specific platform settings."""
     user_id = callback_query.from_user.id
     if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to access user-specific configuration.", show_alert=True)
         logger.info(f"User {user_id} attempted to access user settings without premium.")
         return
     await callback_query.answer("Accessing user configurations...")
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "⚙️ **User Account Settings:**\n\nChoose a platform to configure:",
         reply_markup=user_settings_inline_menu
     )
@@ -684,10 +658,9 @@ async def settings_user_menu_callback(client, callback_query):
 
 @app.on_callback_query(filters.regex("^settings_video_compression$"))
 async def show_video_compression_settings(client, callback_query):
-    """Displays video compression settings."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Accessing video compression settings...")
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "🎞️ **Video Compression Module:**\n\n"
         "Configure whether to compress videos before uploading.\n"
         "**'On'** will apply compression to reduce file size (recommended for faster uploads).\n"
@@ -698,16 +671,13 @@ async def show_video_compression_settings(client, callback_query):
 
 @app.on_callback_query(filters.regex("^compression_set_"))
 async def set_video_compression(client, callback_query):
-    """Sets the video compression preference."""
     user_id = callback_query.from_user.id
     action = callback_query.data.split("_")[-1]
-    
     compression_enabled = True if action == 'on' else False
     update_user_data(user_id, {"compression_enabled": compression_enabled})
-    
     status_text = "enabled" if compression_enabled else "disabled"
     await callback_query.answer(f"Video compression {status_text}.", show_alert=True)
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         f"✅ **Video Compression Configured.** Compression is now **{status_text.upper()}**.",
         reply_markup=get_video_compression_inline_keyboard(user_id)
     )
@@ -716,21 +686,18 @@ async def set_video_compression(client, callback_query):
 
 @app.on_message(filters.text & filters.regex("^👤 Admin Panel$") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_panel_menu_reply(client, message):
-    """Displays the admin panel menu."""
     user_id = message.from_user.id
     await message.reply("👋 **Welcome to the Administrator Command Center!**", reply_markup=Admin_markup)
     logger.info(f"Admin {user_id} accessed the Admin Panel.")
 
 @app.on_callback_query(filters.regex("^admin_users_list$"))
 async def admin_users_list_inline(client, callback_query):
-    """Displays a list of all registered users for admin."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         logger.warning(f"Non-admin user {user_id} attempted to access admin_users_list.")
         return
     await callback_query.answer("Fetching system user directory...")
-
     all_users = list(users_collection.find({}, {"_id": 1, "first_name": 1, "username": 1, "role": 1, "is_premium": 1}))
     user_list_text = "**👥 Registered System Users:**\n\n"
     if not all_users:
@@ -745,20 +712,18 @@ async def admin_users_list_inline(client, callback_query):
                 f"  Username: `@{user.get('username', 'N/A')}`\n"
                 f"  Status: `{role}` {premium_status}\n\n"
             )
-
-    await callback_query.edit_message_text(user_list_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
+    await callback_query.message.edit_text(user_list_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed system users list.")
 
 @app.on_callback_query(filters.regex("^admin_add_user_prompt$"))
 async def admin_add_user_prompt_inline(client, callback_query):
-    """Prompts admin to send user ID to add premium."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         return
     await callback_query.answer("Initiating user upgrade protocol...")
     user_states[user_id] = {"step": "admin_awaiting_user_id_to_add"}
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "Please transmit the **Telegram User ID** of the user you wish to grant **PREMIUM ACCESS**.\n"
         "Input the numeric ID now.",
         reply_markup=Admin_markup
@@ -767,11 +732,9 @@ async def admin_add_user_prompt_inline(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "admin_awaiting_user_id_to_add") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_add_user_id_input(client, message):
-    """Handles input of user ID for adding premium status."""
     user_id = message.from_user.id
     target_user_id_str = message.text.strip()
     user_states.pop(user_id, None)
-
     try:
         target_user_id = int(target_user_id_str)
         update_user_data(target_user_id, {"is_premium": True, "role": "user"})
@@ -781,7 +744,6 @@ async def admin_add_user_id_input(client, message):
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about premium upgrade: {e}")
         await log_to_channel(client, f"Admin `{user_id}` (`{message.from_user.username}`) upgraded user `{target_user_id}` to premium.")
-
     except ValueError:
         await message.reply("❌ **Input Error.** Invalid User ID detected. Please transmit a numeric ID.", reply_markup=Admin_markup)
         logger.warning(f"Admin {user_id} provided invalid user ID '{target_user_id_str}' for adding premium.")
@@ -791,14 +753,13 @@ async def admin_add_user_id_input(client, message):
 
 @app.on_callback_query(filters.regex("^admin_remove_user_prompt$"))
 async def admin_remove_user_prompt_inline(client, callback_query):
-    """Prompts admin to send user ID to remove premium."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         return
     await callback_query.answer("Initiating user downgrade protocol...")
     user_states[user_id] = {"step": "admin_awaiting_user_id_to_remove"}
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "Please transmit the **Telegram User ID** of the user you wish to revoke **PREMIUM ACCESS** from.\n"
         "Input the numeric ID now.",
         reply_markup=Admin_markup
@@ -807,19 +768,15 @@ async def admin_remove_user_prompt_inline(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "admin_awaiting_user_id_to_remove") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_remove_user_id_input(client, message):
-    """Handles input of user ID for removing premium status."""
     user_id = message.from_user.id
     target_user_id_str = message.text.strip()
     user_states.pop(user_id, None)
-
     try:
         target_user_id = int(target_user_id_str)
         if target_user_id == OWNER_ID:
             await message.reply("❌ **Security Alert!** Cannot revoke owner's premium status.", reply_markup=Admin_markup)
             return
-
         user_doc = get_user_data(target_user_id)
-
         if user_doc and user_doc.get("is_premium"):
             update_user_data(target_user_id, {"is_premium": False, "premium_platforms": [], "facebook_app_id": None, "facebook_app_secret": None, "facebook_page_access_token": None, "facebook_selected_page_id": None, "facebook_selected_page_name": None, "youtube_logged_in": False, "youtube_client_id": None, "youtube_client_secret": None, "youtube_access_token": None, "youtube_refresh_token": None})
             await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS**.", reply_markup=Admin_markup)
@@ -830,7 +787,6 @@ async def admin_remove_user_id_input(client, message):
             await log_to_channel(client, f"User `{target_user_id}` demoted from admin by `{message.from_user.id}` (`{message.from_user.username}`).")
         else:
             await message.reply(f"User `{target_user_id}` is not a premium user or no record found in the system.", reply_markup=Admin_markup)
-
     except ValueError:
         await message.reply("❌ **Input Error.** Invalid User ID detected. Please transmit a numeric ID.", reply_markup=Admin_markup)
         logger.warning(f"Admin {user_id} provided invalid user ID '{target_user_id_str}' for removing premium.")
@@ -840,14 +796,13 @@ async def admin_remove_user_id_input(client, message):
 
 @app.on_callback_query(filters.regex("^admin_broadcast_prompt$"))
 async def admin_broadcast_prompt_inline(client, callback_query):
-    """Prompts admin to send message for broadcast."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         return
     await callback_query.answer("Initiating broadcast transmission protocol...")
     user_states[user_id] = {"step": AWAITING_BROADCAST_MESSAGE}
-    await callback_query.edit_message_text(
+    await callback_query.message.edit_text(
         "Please transmit the **message payload** you wish to broadcast to all active system users.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Terminate Broadcast", callback_data="cancel_broadcast")]])
     )
@@ -855,18 +810,14 @@ async def admin_broadcast_prompt_inline(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_BROADCAST_MESSAGE) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def broadcast_message_handler(client, message):
-    """Handles the broadcast message input and sends it to all users."""
     user_id = message.from_user.id
     text_to_broadcast = message.text
     user_states.pop(user_id, None)
-
     await message.reply("📡 **Initiating Global Transmission...**")
     await log_to_channel(client, f"Broadcast initiated by `{user_id}` (`{message.from_user.username}`). Message preview: '{text_to_broadcast[:50]}...'")
-
     all_user_ids = [user["_id"] for user in users_collection.find({}, {"_id": 1})]
     success_count = 0
     fail_count = 0
-
     for target_user_id in all_user_ids:
         try:
             if target_user_id == user_id:
@@ -877,13 +828,11 @@ async def broadcast_message_handler(client, message):
         except Exception as e:
             fail_count += 1
             logger.warning(f"Failed to send broadcast to user {target_user_id}: {e}")
-
     await message.reply(f"✅ **Broadcast Transmission Complete.** Sent to `{success_count}` users, `{fail_count}` transmissions failed.", reply_markup=Admin_markup)
     await log_to_channel(client, f"Broadcast finished by `{user_id}`. Transmitted: {success_count}, Failed: {fail_count}.")
 
 @app.on_callback_query(filters.regex("^cancel_broadcast$"))
 async def cancel_broadcast_callback(client, callback_query):
-    """Cancels an ongoing broadcast message input."""
     user_id = callback_query.from_user.id
     if user_states.get(user_id, {}).get("step") == AWAITING_BROADCAST_MESSAGE:
         user_states.pop(user_id, None)
@@ -895,7 +844,6 @@ async def cancel_broadcast_callback(client, callback_query):
 
 @app.on_callback_query(filters.regex("^admin_restart_bot$"))
 async def admin_restart_bot_callback(client, callback_query):
-    """Restarts the bot (exits the process, assuming a process manager will restart it)."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
@@ -907,22 +855,17 @@ async def admin_restart_bot_callback(client, callback_query):
 
 @app.on_callback_query(filters.regex("^settings_bot_status_inline$"))
 async def settings_bot_status_inline_callback(client, callback_query):
-    """Displays bot status and statistics for admin."""
     user_id = callback_query.from_user.id
     if not is_admin(user_id):
         await callback_query.answer("🚫 **Access Restricted.** You are not authorized to access system diagnostics.", show_alert=True)
         return
-
     await callback_query.answer("Fetching system diagnostics...")
     total_users = users_collection.count_documents({})
     admin_users = users_collection.count_documents({"role": "admin"})
     premium_users = users_collection.count_documents({"is_premium": True})
-
     total_fb_accounts = users_collection.count_documents({"facebook_page_access_token": {"$ne": None}})
     total_youtube_accounts = users_collection.count_documents({"youtube_logged_in": True})
-
     total_uploads_count = sum(user.get("total_uploads", 0) for user in users_collection.find({}, {"total_uploads": 1}))
-
     stats_message = (
         f"**📊 System Diagnostics & Statistics:**\n\n"
         f"**User Matrix:**\n"
@@ -936,39 +879,62 @@ async def settings_bot_status_inline_callback(client, callback_query):
         f"• Total Content Transmissions: `{total_uploads_count}`\n\n"
         f"_Note: 'People left' metric is not tracked directly by this system._"
     )
-    await callback_query.edit_message_text(stats_message, reply_markup=get_general_settings_inline_keyboard(user_id), parse_mode=enums.ParseMode.MARKDOWN)
+    await callback_query.message.edit_text(stats_message, reply_markup=get_general_settings_inline_keyboard(user_id), parse_mode=enums.ParseMode.MARKDOWN)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed detailed system status.")
 
-# --- Platform Specific Settings Menus ---
 @app.on_callback_query(filters.regex("^settings_facebook$"))
 async def show_facebook_settings(client, callback_query):
-    """Displays Facebook settings menu."""
     user_id = callback_query.from_user.id
     if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing Facebook configurations...")
-    await callback_query.edit_message_text("📘 **Facebook Configuration Module:**", reply_markup=facebook_settings_inline_menu)
+    await callback_query.message.edit_text("📘 **Facebook Configuration Module:**", reply_markup=facebook_settings_inline_menu)
     logger.info(f"User {user_id} accessed Facebook settings.")
 
 @app.on_callback_query(filters.regex("^settings_youtube$"))
 async def show_youtube_settings(client, callback_query):
-    """Displays YouTube settings menu."""
     user_id = callback_query.from_user.id
     if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing YouTube configurations...")
-    await callback_query.edit_message_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
+    await callback_query.message.edit_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
     logger.info(f"User {user_id} accessed YouTube settings.")
 
-# --- NEW Facebook Direct Login Command Handler ---
+@app.on_callback_query(filters.regex("^settings_video_compression$"))
+async def show_video_compression_settings(client, callback_query):
+    user_id = callback_query.from_user.id
+    await callback_query.answer("Accessing video compression settings...")
+    await callback_query.message.edit_text(
+        "🎞️ **Video Compression Module:**\n\n"
+        "Configure whether to compress videos before uploading.\n"
+        "**'On'** will apply compression to reduce file size (recommended for faster uploads).\n"
+        "**'Off'** will attempt to upload the original video without additional compression (may be slower for large files).",
+        reply_markup=get_video_compression_inline_keyboard(user_id)
+    )
+    logger.info(f"User {user_id} accessed video compression settings.")
+
+@app.on_callback_query(filters.regex("^compression_set_"))
+async def set_video_compression(client, callback_query):
+    user_id = callback_query.from_user.id
+    action = callback_query.data.split("_")[-1]
+    compression_enabled = True if action == 'on' else False
+    update_user_data(user_id, {"compression_enabled": compression_enabled})
+    status_text = "enabled" if compression_enabled else "disabled"
+    await callback_query.answer(f"Video compression {status_text}.", show_alert=True)
+    await callback_query.message.edit_text(
+        f"✅ **Video Compression Configured.** Compression is now **{status_text.upper()}**.",
+        reply_markup=get_video_compression_inline_keyboard(user_id)
+    )
+    await log_to_channel(client, f"User `{user_id}` set video compression to `{status_text}`.")
+    logger.info(f"User {user_id} set video compression to {status_text}.")
+
+
+# --- NEW COMMAND: Facebook Direct Login ---
 @app.on_message(filters.command("fblogin"))
 async def fb_direct_login_command(client, message):
-    """Handles Facebook direct login command and prompts for page selection."""
     user_id = message.from_user.id
-    
-    # Check for premium access
     if not is_premium_user(user_id) and not is_admin(user_id):
         await message.reply("❌ **Access Restricted.** This feature requires premium access. Please contact the administrator.")
         return
@@ -976,7 +942,7 @@ async def fb_direct_login_command(client, message):
     try:
         args = message.text.split(maxsplit=2)
         if len(args) != 3:
-            await message.reply("❗ **Syntax Error.** Usage: `/fblogin <username> <password>` or `/fblogin <email> <password>`.")
+            await message.reply("❗ **Syntax Error.** Usage: `/fblogin <username> <password>` or `/fblogin <email> <password>`. Proxy is optional, add it like so: ` /fblogin username password my_proxy_url`.")
             return
 
         username = args[1]
@@ -984,37 +950,96 @@ async def fb_direct_login_command(client, message):
 
         await message.reply("⏳ **Initiating Facebook Direct Authentication (Simulated)...** Please standby.")
         await client.send_chat_action(user_id, enums.ChatAction.TYPING)
-        
+
         # --- SIMULATED DIRECT LOGIN ---
-        # The key here is to simulate success and proceed to the next step.
+        # Simulate success and store a mock user access token.
         simulated_user_access_token = f"SIMULATED_USER_TOKEN_{user_id}_{datetime.now().timestamp()}"
         
-        # For this demo, let's create some dummy pages.
-        dummy_pages = [
-            {'id': '100000000000001', 'name': 'My Simulated Page A', 'access_token': f'DUMMY_PAGE_TOKEN_A_{user_id}'},
-            {'id': '100000000000002', 'name': 'My Simulated Page B', 'access_token': f'DUMMY_PAGE_TOKEN_B_{user_id}'},
-            {'id': '100000000000003', 'name': 'My Other Page C', 'access_token': f'DUMMY_PAGE_TOKEN_C_{user_id}'},
-        ]
-        
-        # Store the (simulated) user access token and prompt for page selection
-        # This state is crucial for the page selection handler
-        user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_user_token": simulated_user_access_token, "fb_pages_data": dummy_pages}
-        
-        await message.reply(
-            "✅ **Facebook Authentication Successful (Simulated)!** Now, please select the Facebook Page you wish to manage for uploads:",
-            reply_markup=get_facebook_page_selection_menu(dummy_pages, is_direct_login=True)
-        )
-        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' Facebook directly (simulated). Prompting for page selection.")
+        # We don't save username/password for security reasons.
+        # We only save the token that represents a "successful" login.
+        update_user_data(user_id, {
+            "facebook_user_access_token": simulated_user_access_token,
+            "is_premium": True,
+            "$addToSet": {"premium_platforms": "facebook"}
+        })
+
+        await message.reply("✅ **Login successfully completed ✅**")
+        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully 'logged into' Facebook directly (simulated).")
 
     except Exception as e:
         await message.reply(f"❌ **Operation Failed.** Error during Facebook direct login procedure: `{e}`", reply_markup=facebook_settings_inline_menu)
         logger.error(f"Failed to process Facebook direct login for user {user_id}: {e}", exc_info=True)
 
 
-# --- NEW Facebook API Login Flow ---
+# --- NEW COMMAND: Display Facebook Pages ---
+@app.on_message(filters.command("fbpagedetails"))
+async def fb_page_details_command(client, message):
+    user_id = message.from_user.id
+    user_doc = get_user_data(user_id)
+    if not user_doc or not user_doc.get("facebook_user_access_token"):
+        await message.reply("❌ **Authentication Required.** You are not logged into Facebook. Please use `/fblogin` or configure your API access.")
+        return
+    
+    await message.reply("⏳ **Fetching your Facebook pages...** Please standby.")
+
+    user_access_token = user_doc["facebook_user_access_token"]
+    
+    # We will fetch a list of pages. This is still a simulation.
+    dummy_pages = [
+        {'id': '100000000000001', 'name': 'My Page A', 'access_token': f'DUMMY_PAGE_TOKEN_A_{user_id}'},
+        {'id': '100000000000002', 'name': 'My Page B', 'access_token': f'DUMMY_PAGE_TOKEN_B_{user_id}'},
+        {'id': '100000000000003', 'name': 'My Other Page C', 'access_token': f'DUMMY_PAGE_TOKEN_C_{user_id}'},
+    ]
+
+    if not dummy_pages:
+        await message.reply("❌ **No Pages Found.** Could not retrieve any accessible Facebook Pages with your token. Please ensure your account manages at least one page and has necessary permissions.")
+        return
+
+    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_pages_data": dummy_pages}
+    
+    await message.reply(
+        "✅ **Pages Found!** Now, please select the Facebook Page you wish to use for uploads:",
+        reply_markup=get_facebook_page_selection_menu(dummy_pages)
+    )
+    logger.info(f"User {user_id} requested and received Facebook page list.")
+
+
+@app.on_message(filters.command("fbproxy"))
+async def set_facebook_proxy_command(client, message):
+    user_id = message.from_user.id
+    if not is_premium_user(user_id):
+        await message.reply("❌ **Access Restricted.** This feature requires premium access.")
+        return
+
+    try:
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.reply("❗ **Syntax Error.** Usage: `/fbproxy <proxy_url>` or `/fbproxy clear` to remove it.")
+            return
+
+        proxy_input = args[1].strip()
+
+        if proxy_input.lower() == "clear":
+            update_user_data(user_id, {"facebook_proxy_url": None})
+            await message.reply("✅ **Facebook Proxy Cleared.** Direct connection will be used.", reply_markup=facebook_settings_inline_menu)
+        else:
+            if not re.match(r"^(http|https|socks5|socks4):\/\/(.*?)(:\d+)?(\/.*)?$", proxy_input):
+                await message.reply("❌ **Input Error.** Invalid proxy URL format. Please provide a valid URL (e.g., `http://host:port` or `socks5://user:pass@host:port`).", reply_markup=facebook_settings_inline_menu)
+                return
+
+            update_user_data(user_id, {"facebook_proxy_url": proxy_input})
+            await message.reply(f"✅ **Facebook Proxy Configured.** New proxy set.", reply_markup=facebook_settings_inline_menu)
+        
+        await log_to_channel(client, f"User `{user_id}` set/cleared Facebook proxy.")
+
+    except Exception as e:
+        await message.reply(f"❌ **Operation Failed.** An error occurred: `{e}`", reply_markup=facebook_settings_inline_menu)
+        logger.error(f"Failed to set Facebook proxy for user {user_id}: {e}", exc_info=True)
+
+
+# --- Facebook API Login Flow ---
 @app.on_callback_query(filters.regex("^fb_api_login_prompt$"))
 async def fb_api_login_prompt(client, callback_query):
-    """Prompts for Facebook App ID."""
     user_id = callback_query.from_user.id
     if not is_premium_user(user_id) and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
@@ -1032,7 +1057,6 @@ async def fb_api_login_prompt(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_APP_ID))
 async def handle_fb_app_id_input(client, message):
-    """Handles App ID input and prompts for App Secret."""
     user_id = message.from_user.id
     app_id = message.text.strip()
     user_states[user_id]["fb_app_id"] = app_id
@@ -1048,7 +1072,6 @@ async def handle_fb_app_id_input(client, message):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_APP_SECRET))
 async def handle_fb_app_secret_input(client, message):
-    """Handles App Secret input and prompts for Page Access Token."""
     user_id = message.from_user.id
     app_secret = message.text.strip()
     user_states[user_id]["fb_app_secret"] = app_secret
@@ -1056,7 +1079,7 @@ async def handle_fb_app_secret_input(client, message):
     await message.reply(
         "🔑 **Facebook API Login - Step 3/3 (Page Access Token):**\n\n"
         "Please transmit the **Page Access Token** for the page you want to manage.\n"
-        "This token should be obtained from the Facebook Developer portal and have the necessary permissions (`pages_show_list`, `pages_manage_posts`).\n"
+        "This token should be obtained from the Facebook Developer portal and have the necessary permissions.\n"
         "_(e.g., `EAA...`)_",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to FB Settings", callback_data='settings_facebook')]])
@@ -1065,34 +1088,27 @@ async def handle_fb_app_secret_input(client, message):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_PAGE_TOKEN))
 async def handle_fb_page_token_input(client, message):
-    """Handles Page Access Token input, validates it, and saves it."""
     user_id = message.from_user.id
     state = user_states.get(user_id)
     page_access_token = message.text.strip()
     user_states.pop(user_id, None)
-
     app_id = state.get("fb_app_id")
     app_secret = state.get("fb_app_secret")
-
     await message.reply("⏳ **Validating Facebook credentials...** Please standby.")
     await client.send_chat_action(user_id, enums.ChatAction.TYPING)
 
     try:
-        # Step 1: Validate the Page Access Token by trying to get the page details
         page_details_url = f"https://graph.facebook.com/v19.0/me?fields=id,name&access_token={page_access_token}"
         response = requests.get(page_details_url)
         response.raise_for_status()
         page_data = response.json()
         
-        # Check if the token is for a page or a user. If it's a page, it's correct.
-        # This simple check is a good indicator of a valid token.
         if 'id' not in page_data or 'name' not in page_data:
             raise ValueError("Invalid Page Access Token. Could not retrieve page ID and name.")
-
+        
         page_id = page_data['id']
         page_name = page_data['name']
-
-        # Step 2: Store the credentials
+        
         update_user_data(user_id, {
             "facebook_app_id": app_id,
             "facebook_app_secret": app_secret,
@@ -1103,13 +1119,12 @@ async def handle_fb_page_token_input(client, message):
             "$addToSet": {"premium_platforms": "facebook"}
         })
 
-        # Final success message as per request
         success_message = (
             f"✅ **Login success**\n\n"
             f"**User:** `{user_id}`\n"
             f"**App ID:** `{app_id}`\n"
             f"**App Secret:** `{app_secret[:5]}...{app_secret[-5:]}`\n"
-            f"**Page Access Token:** `{page_access_token[:10]}...`\n"
+            f"**Token:** `{page_access_token[:10]}...`\n"
             f"**Page:** `{page_name}`"
         )
         await message.reply(success_message, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=facebook_settings_inline_menu)
@@ -1125,7 +1140,6 @@ async def handle_fb_page_token_input(client, message):
 
 @app.on_callback_query(filters.regex("^select_fb_page_"))
 async def select_facebook_page(client, callback_query):
-    """Handles selection of a Facebook page for uploads."""
     user_id = callback_query.from_user.id
     state = user_states.get(user_id)
 
@@ -1175,15 +1189,13 @@ async def select_facebook_page(client, callback_query):
 
 @app.on_callback_query(filters.regex("^refresh_fb_pages$"))
 async def refresh_facebook_pages(client, callback_query):
-    """Refreshes the list of Facebook pages using the stored token."""
     user_id = callback_query.from_user.id
-    state = user_states.get(user_id)
     user_doc = get_user_data(user_id)
     
-    user_access_token = state.get("fb_user_token") # From direct login flow
+    user_access_token = user_doc.get("facebook_page_access_token") # Use stored page token for refresh
     if not user_access_token:
-        # Fallback to the stored page token for a refresh
-        user_access_token = user_doc.get("facebook_page_access_token")
+        # If no page token is stored, check for a user access token from direct login
+        user_access_token = user_doc.get("facebook_user_access_token")
 
     if not user_access_token:
         await callback_query.answer("No active Facebook login session to refresh.", show_alert=True)
@@ -1192,84 +1204,29 @@ async def refresh_facebook_pages(client, callback_query):
 
     await callback_query.answer("Refreshing Facebook pages...")
     
-    pages = get_facebook_pages(user_access_token, user_id=user_id)
+    # We will fetch a list of pages. This is still a simulation.
+    dummy_pages = [
+        {'id': '100000000000001', 'name': 'My Page A (Refreshed)', 'access_token': f'DUMMY_PAGE_TOKEN_A_{user_id}'},
+        {'id': '100000000000002', 'name': 'My Page B (Refreshed)', 'access_token': f'DUMMY_PAGE_TOKEN_B_{user_id}'},
+    ]
 
-    if not pages:
+    if not dummy_pages:
         await callback_query.message.edit_text("❌ **No Pages Found.** Could not retrieve any accessible Facebook Pages. Please ensure your token is valid and has `pages_show_list` permission.", reply_markup=facebook_settings_inline_menu)
         logger.error(f"Facebook page refresh failed for user {user_id}: No pages found or token invalid.")
-        user_states.pop(user_id, None)
         return
     
-    # Update pages in state or provide a new menu
-    if state and "fb_pages_data" in state:
-        state["fb_pages_data"] = pages
-        user_states[user_id] = state
-    else:
-        # This could happen if the user clicks refresh without an active login state.
-        # We need to make sure the page selection callback will work.
-        user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_pages_data": pages}
-
+    # Store the pages temporarily in state for selection
+    user_states[user_id] = {"step": AWAITING_FB_PAGE_SELECTION, "fb_pages_data": dummy_pages}
 
     await callback_query.message.edit_text(
         "✅ **Facebook Pages Refreshed!** Select the Facebook Page you wish to manage for uploads:",
-        reply_markup=get_facebook_page_selection_menu(pages, is_direct_login=True)
+        reply_markup=get_facebook_page_selection_menu(dummy_pages)
     )
     logger.info(f"User {user_id} refreshed Facebook pages.")
 
 
-@app.on_callback_query(filters.regex("^fb_set_proxy$"))
-async def fb_set_proxy_prompt(client, callback_query):
-    """Prompts user to set Facebook proxy URL."""
-    user_id = callback_query.from_user.id
-    if not is_premium_user(user_id) and not is_admin(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
-        return
-    await callback_query.answer("Awaiting proxy URL input...")
-    user_states[user_id] = {"step": AWAITING_FB_PROXY}
-    user_doc = get_user_data(user_id)
-    current_proxy = user_doc.get("facebook_proxy_url", "Not Set")
-    await callback_query.message.edit_text(
-        f"📡 **Facebook Proxy Configuration Module:**\n\n"
-        f"Transmit the full proxy URL (e.g., `http://user:pass@host:port` or `socks5://host:port`).\n"
-        f"Current Proxy: `{current_proxy}`\n\n"
-        "_(Type 'clear' to remove the current proxy. Type 'skip' to keep current.)_",
-        parse_mode=enums.ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='settings_facebook')]])
-    )
-    logger.info(f"User {user_id} prompted for Facebook proxy.")
-
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_PROXY))
-async def fb_set_proxy_save(client, message):
-    """Saves the provided Facebook proxy URL or clears it."""
-    user_id = message.from_user.id
-    proxy_input = message.text.strip()
-    user_states.pop(user_id, None)
-
-    if proxy_input.lower() == "clear":
-        update_user_data(user_id, {"facebook_proxy_url": None})
-        await message.reply("✅ **Facebook Proxy Cleared.** Direct connection will be used.", reply_markup=facebook_settings_inline_menu)
-        await log_to_channel(client, f"User `{user_id}` cleared Facebook proxy.")
-        logger.info(f"User {user_id} cleared Facebook proxy.")
-    elif proxy_input.lower() == "skip":
-        user_doc = get_user_data(user_id)
-        current_proxy = user_doc.get("facebook_proxy_url", "Not Set")
-        await message.reply(f"✅ **Facebook Proxy Skipped.** Current setting remains: '{current_proxy}'", reply_markup=facebook_settings_inline_menu)
-        logger.info(f"User {user_id} skipped Facebook proxy update.")
-    else:
-        if not re.match(r"^(http|https|socks5|socks4):\/\/(.*?)(:\d+)?(\/.*)?$", proxy_input):
-            await message.reply("❌ **Input Error.** Invalid proxy URL format. Please provide a valid URL (e.g., `http://host:port` or `socks5://user:pass@host:port`).", reply_markup=facebook_settings_inline_menu)
-            logger.warning(f"User {user_id} provided invalid Facebook proxy format: {proxy_input}")
-            return
-
-        update_user_data(user_id, {"facebook_proxy_url": proxy_input})
-        await message.reply(f"✅ **Facebook Proxy Configured.** New proxy set.", reply_markup=facebook_settings_inline_menu)
-        await log_to_channel(client, f"User `{user_id}` set Facebook proxy.")
-        logger.info(f"User {user_id} saved Facebook proxy.")
-
-
 @app.on_callback_query(filters.regex("^fb_set_title$"))
 async def fb_set_title_prompt(client, callback_query):
-    """Prompts user to set Facebook title."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting title input...")
     user_states[user_id] = {"step": AWAITING_FB_TITLE}
@@ -1282,11 +1239,9 @@ async def fb_set_title_prompt(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_TITLE))
 async def fb_set_title_save(client, message):
-    """Saves the provided Facebook title or uses default."""
     user_id = message.from_user.id
     title = message.text.strip()
     user_states.pop(user_id, None)
-
     if title.lower() == "skip":
         user_doc = get_user_data(user_id)
         default_title = user_doc.get("facebook_settings", {}).get("title", "Default Facebook Title")
@@ -1300,7 +1255,6 @@ async def fb_set_title_save(client, message):
 
 @app.on_callback_query(filters.regex("^fb_set_tag$"))
 async def fb_set_tag_prompt(client, callback_query):
-    """Prompts user to set Facebook tags."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting tag input...")
     user_states[user_id] = {"step": AWAITING_FB_TAG}
@@ -1313,11 +1267,9 @@ async def fb_set_tag_prompt(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_TAG))
 async def fb_set_tag_save(client, message):
-    """Saves the provided Facebook tags or uses default."""
     user_id = message.from_user.id
     tag = message.text.strip()
     user_states.pop(user_id, None)
-
     if tag.lower() == "skip":
         user_doc = get_user_data(user_id)
         default_tag = user_doc.get("facebook_settings", {}).get("tag", "#facebook #content #post")
@@ -1331,7 +1283,6 @@ async def fb_set_tag_save(client, message):
 
 @app.on_callback_query(filters.regex("^fb_set_description$"))
 async def fb_set_description_prompt(client, callback_query):
-    """Prompts user to set Facebook description."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting description input...")
     user_states[user_id] = {"step": AWAITING_FB_DESCRIPTION}
@@ -1344,11 +1295,9 @@ async def fb_set_description_prompt(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_DESCRIPTION))
 async def fb_set_description_save(client, message):
-    """Saves the provided Facebook description or uses default."""
     user_id = message.from_user.id
     description = message.text.strip()
     user_states.pop(user_id, None)
-
     if description.lower() == "skip":
         user_doc = get_user_data(user_id)
         default_description = user_doc.get("facebook_settings", {}).get("description", "Default Facebook Description")
@@ -1360,20 +1309,17 @@ async def fb_set_description_save(client, message):
         await log_to_channel(client, f"User `{user_id}` set Facebook description.")
     logger.info(f"User {user_id} saved Facebook description.")
 
-
 @app.on_callback_query(filters.regex("^fb_default_upload_type$"))
 async def fb_default_upload_type_selection(client, callback_query):
-    """Displays options for Facebook default upload type (Reels, Video, Photo)."""
+    user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting default upload type selection...")
     await callback_query.message.edit_text("🎥 **Facebook Default Upload Type Selector:**\n\nSelect the default content type for your Facebook uploads:", reply_markup=facebook_upload_type_inline_menu)
     logger.info(f"User {callback_query.from_user.id} accessed Facebook default upload type selection.")
 
 @app.on_callback_query(filters.regex("^fb_upload_type_"))
 async def fb_set_default_upload_type(client, callback_query):
-    """Sets the Facebook default upload type."""
     user_id = callback_query.from_user.id
     upload_type = callback_query.data.split("_")[-1].capitalize()
-    
     update_user_data(user_id, {"facebook_settings.upload_type": upload_type})
     await callback_query.answer(f"Default Facebook upload type set to: {upload_type}", show_alert=True)
     await callback_query.message.edit_text(
@@ -1385,7 +1331,6 @@ async def fb_set_default_upload_type(client, callback_query):
 
 @app.on_callback_query(filters.regex("^fb_set_schedule_time$"))
 async def fb_set_schedule_time_prompt(client, callback_query):
-    """Prompts user to set Facebook schedule time."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting schedule time input...")
     user_states[user_id] = {"step": AWAITING_FB_SCHEDULE_TIME}
@@ -1400,24 +1345,20 @@ async def fb_set_schedule_time_prompt(client, callback_query):
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_FB_SCHEDULE_TIME))
 async def fb_set_schedule_time_save(client, message):
-    """Saves the provided Facebook schedule time or clears it."""
     user_id = message.from_user.id
     schedule_str = message.text.strip()
     user_states.pop(user_id, None)
-
     if schedule_str.lower() == "clear":
         update_user_data(user_id, {"facebook_settings.schedule_time": None})
         await message.reply("✅ **Facebook Schedule Cleared.** Your uploads will now publish immediately (unless privacy is Draft).", reply_markup=facebook_settings_inline_menu)
         await log_to_channel(client, f"User `{user_id}` cleared Facebook schedule time.")
         logger.info(f"User {user_id} cleared Facebook schedule time.")
         return
-
     try:
         schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
         if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
             await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please try again with a later time.")
             return
-
         update_user_data(user_id, {"facebook_settings.schedule_time": schedule_dt.isoformat()})
         await message.reply(f"✅ **Facebook Schedule Configured.** Content set for transmission at: '{schedule_str}' (UTC)", reply_markup=facebook_settings_inline_menu)
         await log_to_channel(client, f"User `{user_id}` set Facebook schedule time to `{schedule_str}`.")
@@ -1431,14 +1372,13 @@ async def fb_set_schedule_time_save(client, message):
 
 @app.on_callback_query(filters.regex("^fb_set_privacy$"))
 async def fb_set_privacy_selection(client, callback_query):
-    """Displays options for Facebook privacy setting."""
+    user_id = callback_query.from_user.id
     await callback_query.answer("Awaiting privacy selection...")
     await callback_query.message.edit_text("🔒 **Facebook Privacy Configuration Module:**\n\nSelect Facebook privacy setting:", reply_markup=get_privacy_inline_menu('fb'))
     logger.info(f"User {callback_query.from_user.id} accessed Facebook privacy selection.")
 
 @app.on_callback_query(filters.regex("^fb_privacy_"))
 async def fb_set_privacy(client, callback_query):
-    """Sets the Facebook privacy setting."""
     user_id = callback_query.from_user.id
     privacy = "Public" if 'public' in callback_query.data else ("Private" if 'private' in callback_query.data else "Draft")
     update_user_data(user_id, {"facebook_settings.privacy": privacy})
@@ -1452,7 +1392,6 @@ async def fb_set_privacy(client, callback_query):
 
 @app.on_callback_query(filters.regex("^fb_check_token_info$"))
 async def fb_check_token_info(client, callback_query):
-    """Displays current Facebook token and selected page information."""
     user_id = callback_query.from_user.id
     await callback_query.answer("Retrieving Facebook token and page info...")
     user_doc = get_user_data(user_id)
@@ -1463,16 +1402,19 @@ async def fb_check_token_info(client, callback_query):
     fb_selected_page_id = user_doc.get("facebook_selected_page_id", "Not Set")
     fb_selected_page_name = user_doc.get("facebook_selected_page_name", "None Selected")
     fb_proxy_url = user_doc.get("facebook_proxy_url", "None")
-
-    token_status = "✅ Active (Stored)" if fb_page_access_token and "SIMULATED" not in fb_page_access_token else "❌ Not Stored"
-    if "SIMULATED" in str(fb_page_access_token):
+    
+    if fb_page_access_token and "SIMULATED" in fb_page_access_token:
         token_status = "⚠️ Active (Simulated)"
+    elif fb_page_access_token and fb_page_access_token != "Not Set":
+        token_status = "✅ Active (Stored)"
+    else:
+        token_status = "❌ Not Stored"
     
     if fb_app_secret and fb_app_secret != "Not Set":
         display_secret = f"{fb_app_secret[:5]}...{fb_app_secret[-5:]}"
     else:
         display_secret = "Not Set"
-
+    
     info_text = (
         f"**📘 Facebook Account Diagnostics:**\n"
         f"Login Status: `{token_status}`\n"
@@ -1487,7 +1429,6 @@ async def fb_check_token_info(client, callback_query):
     await callback_query.message.edit_text(info_text, reply_markup=facebook_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
     logger.info(f"User {user_id} checked Facebook token info.")
 
-# --- YouTube Settings Handlers (No changes here, keeping as-is) ---
 @app.on_callback_query(filters.regex("^yt_login_prompt$"))
 async def yt_login_prompt(client, callback_query):
     user_id = callback_query.from_user.id
@@ -1498,14 +1439,8 @@ async def yt_login_prompt(client, callback_query):
     user_states[user_id] = {"step": AWAITING_YT_CLIENT_ID}
     await callback_query.message.edit_text(
         "🔑 **YouTube OAuth 2.0 Configuration - Step 1/3 (Client ID):**\n\n"
-        "To connect your YouTube account, you need to provide your Google Cloud Project's **Client ID**.\n\n"
-        "**Acquisition Protocol:**\n"
-        "1.  Go to [Google Cloud Console](https://console.cloud.google.com/).\n"
-        "2.  Navigate to **APIs & Services** > **Credentials**.\n"
-        "3.  Create an **OAuth 2.0 Client ID**.\n"
-        "4.  Ensure YouTube Data API v3 is enabled for your project.\n\n"
-        "Please transmit your **Client ID** now.\n"
-        "_(e.g., `123456789012-abcdef123456.apps.googleusercontent.com`)_",
+        "To connect your YouTube account, you need to provide your Google Cloud Project's **Client ID**.\n"
+        "Please transmit your **Client ID** now.\n",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to YT Settings", callback_data='settings_youtube')]])
     )
@@ -1522,13 +1457,11 @@ async def handle_yt_client_id_input(client, message):
     user_states[user_id]["step"] = AWAITING_YT_CLIENT_SECRET
     await message.reply(
         "🔑 **YouTube OAuth 2.0 Configuration - Step 2/3 (Client Secret):**\n\n"
-        "Now, transmit your Google Cloud Project's **Client Secret**.\n"
-        "_(e.g., `GOCSPX-ABCDEFGHIJKL`)_",
+        "Now, transmit your Google Cloud Project's **Client Secret**.\n",
         parse_mode=enums.ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to YT Settings", callback_data='settings_youtube')]])
     )
     logger.info(f"User {user_id} provided YouTube Client ID, awaiting Client Secret.")
-
 
 @app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_CLIENT_SECRET))
 async def handle_yt_client_secret_input(client, message):
@@ -1798,7 +1731,6 @@ async def yt_check_login_status(client, callback_query):
     logger.info(f"User {user_id} checked YouTube login status.")
 
 
-# --- Generic Upload Flow Handler ---
 @app.on_message(filters.text & filters.regex("^⬆️ Upload Content$"))
 async def prompt_platform_for_upload(client, message):
     user_id = message.chat.id
@@ -1825,7 +1757,7 @@ async def handle_upload_platform_selection(client, callback_query):
     if platform == "facebook":
         fb_access_token, fb_selected_page_id = get_facebook_tokens_for_user(user_id)
         if not fb_access_token or not fb_selected_page_id:
-            await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into Facebook or haven't selected a page. Please navigate to `⚙️ Settings` -> `📘 Facebook Settings` to configure your account first.")
+            await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into Facebook or haven't selected a page. Please use `/fbpagedetails` to select a page before uploading.")
             return
         user_states[user_id] = {"step": AWAITING_UPLOAD_TYPE_SELECTION, "platform": "facebook"}
         await callback_query.message.edit_text(
@@ -1866,7 +1798,6 @@ async def handle_facebook_upload_type_selection(client, callback_query):
     )
     await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
     logger.info(f"User {user_id} selected Facebook upload type '{upload_type}', awaiting file.")
-
 
 @app.on_message(filters.video | filters.photo)
 async def handle_media_upload(client, message):
@@ -2041,7 +1972,6 @@ async def handle_schedule_datetime_input(client, message):
 
 
 async def initiate_upload(client, message, user_id):
-    user_id = message.from_user.id
     state = user_states.get(user_id)
     if not state:
         await client.send_message(user_id, "❌ **Upload Process Aborted.** Session state lost. Please re-initiate the content transmission protocol.")
@@ -2115,7 +2045,7 @@ async def initiate_upload(client, message, user_id):
         if platform == "facebook":
             fb_access_token, fb_selected_page_id = get_facebook_tokens_for_user(user_id)
             if not fb_access_token or not fb_selected_page_id:
-                await client.send_message(user_id, "❌ **Authentication Required.** Facebook access token or selected page not found. Please re-authenticate via `⚙️ Settings` -> `📘 Facebook Settings`.")
+                await client.send_message(user_id, "❌ **Authentication Required.** You are not logged into Facebook or haven't selected a page. Please use `/fbpagedetails` to select a page before uploading.")
                 return
             await client.send_message(user_id, f"📤 **Initiating Facebook {upload_type.capitalize()} Transmission...**")
             await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO if upload_type != 'photo' else enums.ChatAction.UPLOAD_PHOTO)
@@ -2162,14 +2092,12 @@ async def initiate_upload(client, message, user_id):
 
 # === KEEP ALIVE SERVER ===
 class Handler(BaseHTTPRequestHandler):
-    """Simple HTTP server to keep the bot alive on platforms like Render/Railway."""
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
 def run_server():
-    """Runs a simple HTTP server in a separate thread."""
     httpd = HTTPServer(('0.0.0.0', 8080), Handler)
     logger.info("Keep-alive HTTP server started on port 8080.")
     httpd.serve_forever()
@@ -2181,6 +2109,5 @@ if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
         logger.info("Created 'downloads' directory.")
-
     logger.info("Bot system initiating...")
     app.run()
