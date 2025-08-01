@@ -189,6 +189,7 @@ def get_facebook_page_selection_menu(pages, is_direct_login=False):
         
     return InlineKeyboardMarkup(page_buttons)
 
+
 # === USER STATES (for sequential conversation flows) ===
 user_states = {}
 
@@ -455,7 +456,6 @@ def compress_video_ffmpeg(input_path):
 async def refresh_youtube_token(user_id):
     """
     Refreshes the YouTube access token using the refresh token.
-    This is a real API call using `requests`.
     """
     user_doc = get_user_data(user_id)
     refresh_token = user_doc.get("youtube_refresh_token")
@@ -478,7 +478,6 @@ async def refresh_youtube_token(user_id):
         response.raise_for_status()
         tokens = response.json()
 
-        # Update the user's data with the new access token and expiry
         new_access_token = tokens["access_token"]
         expires_in = tokens["expires_in"]
         new_expiry_date = datetime.utcnow() + timedelta(seconds=expires_in)
@@ -723,6 +722,7 @@ async def set_video_compression(client, callback_query):
     await log_to_channel(client, f"User `{user_id}` set video compression to `{status_text}`.")
     logger.info(f"User {user_id} set video compression to {status_text}.")
 
+# --- Admin Handlers ---
 @app.on_message(filters.text & filters.regex("^👤 Admin Panel$") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_panel_menu_reply(client, message):
     user_id = message.from_user.id
@@ -996,13 +996,9 @@ async def fblogin_real(client, message):
         response.raise_for_status()
         data = response.json()
         
-        # We check if the token is a Page Access Token by seeing if it's for the 'me' endpoint
-        # which represents the current authenticated user/page. A more robust check would be
-        # to get a list of pages, but this simple check is enough for login.
         if "id" not in data:
-            raise ValueError("Invalid token. Could not get a valid ID.")
+            raise ValueError("Invalid token. Could not get a valid ID from the /me endpoint.")
 
-        # Store the provided token. We will validate its permissions and fetch pages later.
         update_user_data(user_id, {
             "facebook_page_access_token": page_access_token,
             "is_premium": True,
@@ -1010,6 +1006,7 @@ async def fblogin_real(client, message):
         })
 
         await message.reply("✅ **Login successfully completed ✅**\n\nNow use `/fbpagedetails` to view and select your pages.")
+        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully authenticated with a Facebook Page Access Token.")
 
     except requests.exceptions.RequestException as e:
         await message.reply(f"❌ **Failed to authenticate:** `Invalid token, or network error. Please check your token and try again.` Error: `{e}`", parse_mode=enums.ParseMode.MARKDOWN)
@@ -1021,7 +1018,6 @@ async def show_facebook_pages(client, message):
     user_id = message.from_user.id
     user_doc = get_user_data(user_id)
     
-    # Check if a token exists in the database
     token = user_doc.get("facebook_page_access_token")
     if not token:
         await message.reply("❌ **Authentication Required.** You are not logged into Facebook. Please use `/fblogin <token>` first.")
@@ -1071,9 +1067,8 @@ async def select_facebook_page(client, callback_query):
                     page_name = page.get('name', page_name)
                     break
         
-        # We save the selected page's info and its specific access token
         update_user_data(user_id, {
-            "facebook_page_access_token": page_access_token, # Update with the page-specific token
+            "facebook_page_access_token": page_access_token,
             "facebook_selected_page_id": selected_page_id,
             "facebook_selected_page_name": page_name,
         })
@@ -1092,7 +1087,6 @@ async def select_facebook_page(client, callback_query):
         await callback_query.answer("❌ Error selecting page. Please try again.", show_alert=True)
         await callback_query.message.edit_text(f"❌ **Operation Failed.** Error selecting Facebook page: `{e}`", reply_markup=facebook_settings_inline_menu)
         logger.error(f"Failed to select Facebook page for user {user_id}: {e}", exc_info=True)
-
 
 # --- YouTube Login and Upload ---
 
@@ -1184,9 +1178,10 @@ async def get_yt_auth_code(client, message):
         })
 
         await message.reply("✅ YouTube login successful! You can now upload videos.")
+        await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) successfully logged into YouTube via OAuth.")
     except Exception as e:
         await message.reply(f"❌ Failed to complete login: `{e}`", parse_mode=enums.ParseMode.MARKDOWN)
-
+        logger.error(f"Failed to get YouTube access token for user {user_id}: {e}", exc_info=True)
 
 # --- Common Upload Flow ---
 
@@ -1229,8 +1224,8 @@ async def handle_upload_platform_selection(client, callback_query):
         )
         logger.info(f"User {user_id} selected Facebook for upload, prompted for content type.")
     elif platform == "youtube":
-        if not user_doc.get("youtube_logged_in") or not user_doc.get("youtube_client_id") or not user_doc.get("youtube_client_secret"):
-            await callback_query.message.edit_text("❌ **Authentication Required.** You are not fully logged into YouTube (missing credentials). Please navigate to `⚙️ Settings` -> `▶️ YouTube Settings` to configure your account first.")
+        if not user_doc.get("youtube_logged_in"):
+            await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into YouTube. Please configure your account via `⚙️ Settings` -> `▶️ YouTube Settings`.")
             return
         user_states[user_id] = {"step": AWAITING_UPLOAD_FILE, "platform": "youtube"}
         await callback_query.message.edit_text(
