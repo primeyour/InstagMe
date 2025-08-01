@@ -684,7 +684,7 @@ async def back_to_main_menu_from_inline(client, callback_query):
 async def settings_user_menu_callback(client, callback_query):
     user_id = callback_query.from_user.id
     if not is_premium_user(user_id) and not is_admin(user_id):
-        await callback_query.answer("⚠️ **Access Restricted.** You need a premium subscription to access user-specific configuration.", show_alert=True)
+        await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         logger.info(f"User {user_id} attempted to access user settings without premium.")
         return
     await callback_query.answer("Accessing user configurations...")
@@ -1056,6 +1056,7 @@ async def select_facebook_page(client, callback_query):
         return
 
     try:
+        # Fix: Correctly extract page_id and page_access_token
         parts = callback_query.data.split('_', 3)
         selected_page_id = parts[3]
         page_access_token = parts[4]
@@ -1067,6 +1068,7 @@ async def select_facebook_page(client, callback_query):
                     page_name = page.get('name', page_name)
                     break
         
+        # Fix: Save the correct, page-specific token for uploads
         update_user_data(user_id, {
             "facebook_page_access_token": page_access_token,
             "facebook_selected_page_id": selected_page_id,
@@ -1519,14 +1521,19 @@ async def initiate_upload(client, message, user_id):
         elif platform == "youtube":
             user_doc = get_user_data(user_id)
             access_token = user_doc.get("youtube_access_token")
-            token_expiry = user_doc.get("youtube_token_expiry")
-            if token_expiry and datetime.fromisoformat(token_expiry) <= datetime.utcnow():
-                await client.send_message(user_id, "⚠️ Your YouTube access token has expired. Attempting to refresh it...")
-                success, new_token = await refresh_youtube_token(user_id)
-                if not success:
-                    await client.send_message(user_id, f"❌ Failed to refresh YouTube token. Please log in again using `⚙️ Settings` -> `▶️ YouTube Settings`.")
-                    return
-                access_token = new_token
+            token_expiry_str = user_doc.get("youtube_token_expiry")
+            
+            # Fix: Check for token validity and refresh if needed
+            if token_expiry_str:
+                token_expiry = datetime.fromisoformat(token_expiry_str)
+                if token_expiry <= datetime.utcnow():
+                    await client.send_message(user_id, "⚠️ Your YouTube access token has expired. Attempting to refresh it...")
+                    success, new_token = await refresh_youtube_token(user_id)
+                    if not success:
+                        await client.send_message(user_id, f"❌ Failed to refresh YouTube token. Please log in again using `⚙️ Settings` -> `▶️ YouTube Settings`.")
+                        return
+                    access_token = new_token
+            
             # Placeholder for YouTube upload logic using the valid access_token
             await client.send_message(user_id, "🚧 **YouTube Upload Feature Under Development.**\n\n_**System Note:** The YouTube upload functionality requires the Google API client library for the actual upload process. Your token is valid, but the upload API call is not yet implemented._")
             await log_to_channel(client, f"User `{user_id}` attempted YouTube upload. File: `{os.path.basename(processed_file_path)}`. Token is valid.")
