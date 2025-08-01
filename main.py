@@ -105,6 +105,7 @@ user_settings_inline_menu = InlineKeyboardMarkup(
 facebook_settings_inline_menu = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🔑 Facebook API Login", callback_data='fb_api_login_prompt')],
+        [InlineKeyboardButton("📄 Set Active Page", callback_data='fb_set_active_page')], # New feature button
         [InlineKeyboardButton("📝 Set Title", callback_data='fb_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='fb_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='fb_set_description')],
@@ -178,7 +179,7 @@ def get_video_compression_inline_keyboard(user_id):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_facebook_page_selection_menu(pages, is_direct_login=False):
+def get_facebook_page_selection_menu(pages):
     page_buttons = []
     if pages:
         for page in pages:
@@ -931,6 +932,20 @@ async def show_facebook_settings(client, callback_query):
     await callback_query.message.edit_text("📘 **Facebook Configuration Module:**", reply_markup=facebook_settings_inline_menu)
     logger.info(f"User {user_id} accessed Facebook settings.")
 
+# New handler for "Set Active Page" button
+@app.on_callback_query(filters.regex("^fb_set_active_page$"))
+async def fb_set_active_page_prompt(client, callback_query):
+    user_id = callback_query.from_user.id
+    user_doc = get_user_data(user_id)
+    token = user_doc.get("facebook_page_access_token")
+    if not token:
+        await callback_query.answer("❌ You are not logged in. Please use the `/fb` command to log in first.", show_alert=True)
+        return
+    
+    await callback_query.answer("Fetching pages...")
+    await show_facebook_pages(client, callback_query.message)
+
+
 @app.on_callback_query(filters.regex("^settings_youtube$"))
 async def show_youtube_settings(client, callback_query):
     user_id = callback_query.from_user.id
@@ -971,7 +986,7 @@ async def set_video_compression(client, callback_query):
 
 # --- Facebook Login and Page Selection ---
 
-@app.on_message(filters.command("fblogin"))
+@app.on_message(filters.command("fb"))
 async def fblogin_real(client, message):
     user_id = message.from_user.id
     args = message.text.split(maxsplit=1)
@@ -982,7 +997,7 @@ async def fblogin_real(client, message):
 
     if len(args) < 2:
         await message.reply(
-            "❗ **Usage:** `/fblogin <your_page_access_token>`\n\n"
+            "❗ **Usage:** `/fb <your_page_access_token>`\n\n"
             "This token must be a **Page Access Token** with `pages_manage_posts` permission. "
             "Get it from the Facebook Graph API Explorer: `https://developers.facebook.com/tools/explorer/`",
             parse_mode=enums.ParseMode.MARKDOWN)
@@ -1020,7 +1035,7 @@ async def show_facebook_pages(client, message):
     
     token = user_doc.get("facebook_page_access_token")
     if not token:
-        await message.reply("❌ **Authentication Required.** You are not logged into Facebook. Please use `/fblogin <token>` first.")
+        await message.reply("❌ **Authentication Required.** You are not logged into Facebook. Please use `/fb <token>` first.")
         return
 
     try:
@@ -1056,7 +1071,6 @@ async def select_facebook_page(client, callback_query):
         return
 
     try:
-        # Fix: Correctly extract page_id and page_access_token
         parts = callback_query.data.split('_', 3)
         selected_page_id = parts[3]
         page_access_token = parts[4]
@@ -1068,7 +1082,6 @@ async def select_facebook_page(client, callback_query):
                     page_name = page.get('name', page_name)
                     break
         
-        # Fix: Save the correct, page-specific token for uploads
         update_user_data(user_id, {
             "facebook_page_access_token": page_access_token,
             "facebook_selected_page_id": selected_page_id,
@@ -1226,6 +1239,7 @@ async def handle_upload_platform_selection(client, callback_query):
         )
         logger.info(f"User {user_id} selected Facebook for upload, prompted for content type.")
     elif platform == "youtube":
+        user_doc = get_user_data(user_id)
         if not user_doc.get("youtube_logged_in"):
             await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into YouTube. Please configure your account via `⚙️ Settings` -> `▶️ YouTube Settings`.")
             return
@@ -1523,7 +1537,10 @@ async def initiate_upload(client, message, user_id):
             access_token = user_doc.get("youtube_access_token")
             token_expiry_str = user_doc.get("youtube_token_expiry")
             
-            # Fix: Check for token validity and refresh if needed
+            if not access_token or not user_doc.get("youtube_logged_in"):
+                await client.send_message(user_id, "❌ **Authentication Required.** You are not logged into YouTube. Please configure your account via `⚙️ Settings` -> `▶️ YouTube Settings`.")
+                return
+            
             if token_expiry_str:
                 token_expiry = datetime.fromisoformat(token_expiry_str)
                 if token_expiry <= datetime.utcnow():
