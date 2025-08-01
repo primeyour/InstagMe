@@ -6,7 +6,7 @@ import logging
 import json
 import time
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sys
 import re
 
@@ -28,7 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # === MongoDB Configuration ===
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://cristi7jjr:tRjSVaoSNQfeZ0Ik@cluster0.kowid.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-DB_NAME = "YtBot"
+DB_NAME = "YtFbBot"
 
 # === Admin and Log Channel Configuration ===
 OWNER_ID = int(os.getenv("OWNER_ID", "7577977996"))
@@ -234,6 +234,7 @@ def get_user_data(user_id):
 def update_user_data(user_id, data):
     """Updates user data in MongoDB using _id for upsert. Handles potential errors."""
     try:
+        # Fix: Use $set for all updates to avoid replacement document errors.
         users_collection.update_one({"_id": user_id}, {"$set": data}, upsert=True)
         logger.info(f"User {user_id} data updated/upserted successfully.")
     except Exception as e:
@@ -394,7 +395,7 @@ def convert_media_for_facebook(input_path, output_type, target_format):
     Converts media to suitable format for Facebook upload.
     """
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = f"downloads/processed_{base_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.{target_format}"
+    output_path = f"downloads/processed_{base_name}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.{target_format}"
 
     command = []
     if output_type in ["video", "reels"]:
@@ -432,7 +433,7 @@ def compress_video_ffmpeg(input_path):
     Compresses a video using FFmpeg.
     """
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = f"downloads/{base_name}_compressed_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp4"
+    output_path = f"downloads/{base_name}_compressed_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.mp4"
     
     command = ["ffmpeg", "-i", input_path, "-c:v", "libx264", "-crf", "28", "-preset", "medium", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-y", output_path]
     logger.info(f"[FFmpeg] Initiating video compression for {input_path}")
@@ -481,7 +482,7 @@ async def refresh_youtube_token(user_id):
 
         new_access_token = tokens["access_token"]
         expires_in = tokens["expires_in"]
-        new_expiry_date = datetime.utcnow() + timedelta(seconds=expires_in)
+        new_expiry_date = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
         
         update_user_data(user_id, {
             "youtube_access_token": new_access_token,
@@ -506,7 +507,7 @@ async def start_command(client, message):
     user_data_to_set = {
         "first_name": user_first_name,
         "username": user_username,
-        "last_active": datetime.now(),
+        "last_active": datetime.now(timezone.utc),
         "is_premium": False,
         "role": "user",
         "premium_platforms": [],
@@ -527,7 +528,7 @@ async def start_command(client, message):
     try:
         users_collection.update_one(
             {"_id": user_id},
-            {"$set": user_data_to_set, "$setOnInsert": {"added_at": datetime.now(), "added_by": "self_start"}},
+            {"$set": user_data_to_set, "$setOnInsert": {"added_at": datetime.now(timezone.utc), "added_by": "self_start"}},
             upsert=True
         )
         logger.info(f"User {user_id} account initialized/updated successfully.")
@@ -783,7 +784,7 @@ async def admin_add_user_id_input(client, message):
             await client.send_message(target_user_id, "🎉 **Congratulations!** Your account has been upgraded to **PREMIUM** status! Use `/start` to access your enhanced features.")
         except Exception as e:
             logger.warning(f"Could not notify user {target_user_id} about premium upgrade: {e}")
-        await log_to_channel(client, f"Admin `{user_id}` (`{message.from_user.username}`) upgraded user `{target_user_id}` to premium.")
+        await log_to_channel(client, f"User `{target_id}` promoted to premium by `{message.from_user.id}`.")
     except ValueError:
         await message.reply("❌ **Input Error.** Invalid User ID detected. Please transmit a numeric ID.", reply_markup=Admin_markup)
         logger.warning(f"Admin {user_id} provided invalid user ID '{target_user_id_str}' for adding premium.")
@@ -1187,7 +1188,7 @@ async def get_yt_auth_code(client, message):
             "youtube_client_secret": client_secret,
             "youtube_access_token": tokens["access_token"],
             "youtube_refresh_token": tokens.get("refresh_token"),
-            "youtube_token_expiry": (datetime.utcnow() + timedelta(seconds=tokens["expires_in"])).isoformat(),
+            "youtube_token_expiry": (datetime.now(timezone.utc) + timedelta(seconds=tokens["expires_in"])).isoformat(),
             "is_premium": True,
             "$addToSet": {"premium_platforms": "youtube"}
         })
@@ -1293,7 +1294,7 @@ async def handle_media_upload(client, message):
         logger.info("Created 'downloads' directory for media processing.")
     initial_status_msg = await message.reply("⏳ **Data Acquisition In Progress...** Downloading your content. This operation may require significant processing time for large data files.")
     try:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         if message.video:
             file_extension = os.path.splitext(message.video.file_name or "video.mp4")[1]
         elif message.photo:
@@ -1424,8 +1425,8 @@ async def handle_schedule_datetime_input(client, message):
         return
     schedule_str = message.text.strip()
     try:
-        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M")
-        if schedule_dt <= datetime.utcnow() + timedelta(minutes=5):
+        schedule_dt = datetime.strptime(schedule_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        if schedule_dt <= datetime.now(timezone.utc) + timedelta(minutes=5):
             await message.reply("❌ **Time Constraint Violation.** Schedule time must be at least 5 minutes in the future. Please try again with a later time.")
             return
         state["schedule_time"] = schedule_dt
@@ -1462,10 +1463,6 @@ async def initiate_upload(client, message, user_id):
         return
     user_states[user_id]["step"] = "processing_and_uploading"
     await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
-    await log_to_channel(client, f"User `{user_id}` (`{message.from_user.username}`) initiating upload for {platform}. Type: `{upload_type}`. File: `{os.path.basename(file_path)}`. Visibility: `{visibility}`. Schedule: `{schedule_time}`.")
-    processed_file_path = file_path
-    user_doc = get_user_data(user_id)
-    compression_enabled = user_doc.get("compression_enabled", True)
     try:
         if message.video:
             if compression_enabled:
@@ -1477,40 +1474,8 @@ async def initiate_upload(client, message, user_id):
                     future = executor.submit(do_compression_sync)
                     processed_file_path = future.result(timeout=1200)
                 await client.send_message(user_id, "✅ **Video Compression Complete.**")
-                await log_to_channel(client, f"User `{user_id}` video compressed. Original: `{os.path.basename(file_path)}`, Compressed: `{os.path.basename(processed_file_path)}`.")
             else:
                 await client.send_message(user_id, "✅ **Video Compression Skipped.** Uploading original video.")
-                logger.info(f"User {user_id} chose to skip video compression.")
-        if platform == "facebook":
-            target_format = "mp4" if upload_type in ["video", "reels"] else "jpg"
-            current_file_ext = os.path.splitext(processed_file_path)[1].lower()
-            if (target_format == "mp4" and current_file_ext != ".mp4") or (target_format == "jpg" and current_file_ext not in [".jpg", ".jpeg", ".png"]):
-                await client.send_message(user_id, f"🔄 **Data Conversion Protocol.** Converting content to {target_format.upper()} format for Facebook {upload_type}. Please standby...")
-                await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
-                def do_conversion_sync():
-                    return convert_media_for_facebook(processed_file_path, upload_type, target_format)
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(do_conversion_sync)
-                    processed_file_path = future.result(timeout=900)
-                await client.send_message(user_id, "✅ **Content Data Conversion Complete.**")
-                await log_to_channel(client, f"User `{user_id}` content converted. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
-            else:
-                await client.send_message(user_id, "✅ **Content Format Verified.** Proceeding with direct transmission to Facebook.")
-                logger.info(f"User {user_id} content already suitable format for Facebook {upload_type}. Skipping additional conversion.")
-        elif platform == "youtube":
-            if os.path.splitext(processed_file_path)[1].lower() not in [".mp4", ".mov", ".avi", ".webm"]:
-                await client.send_message(user_id, f"🔄 **Data Conversion Protocol.** Converting video to MP4 format for YouTube. Please standby...")
-                await client.send_chat_action(user_id, enums.ChatAction.UPLOAD_VIDEO)
-                def do_conversion_sync_yt():
-                    return convert_media_for_facebook(processed_file_path, "video", "mp4")
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(do_conversion_sync_yt)
-                    processed_file_path = future.result(timeout=600)
-                await client.send_message(user_id, "✅ **Video Data Conversion Complete.**")
-                await log_to_channel(client, f"User `{user_id}` video converted for YouTube. Original: `{os.path.basename(file_path)}`, Processed: `{os.path.basename(processed_file_path)}`.")
-            else:
-                await client.send_message(user_id, "✅ **Video Format Verified.** Proceeding with direct transmission to YouTube.")
-                logger.info(f"User {user_id} video already suitable format for YouTube. Skipping additional conversion.")
         if platform == "facebook":
             fb_access_token, fb_selected_page_id = get_facebook_tokens_for_user(user_id)
             if not fb_access_token or not fb_selected_page_id:
@@ -1543,7 +1508,7 @@ async def initiate_upload(client, message, user_id):
             
             if token_expiry_str:
                 token_expiry = datetime.fromisoformat(token_expiry_str)
-                if token_expiry <= datetime.utcnow():
+                if token_expiry <= datetime.now(timezone.utc):
                     await client.send_message(user_id, "⚠️ Your YouTube access token has expired. Attempting to refresh it...")
                     success, new_token = await refresh_youtube_token(user_id)
                     if not success:
