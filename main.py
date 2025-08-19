@@ -1187,7 +1187,7 @@ async def yt_check_expiry_date(client, callback_query):
     yt_data = user_doc.get("youtube", {})
     
     if not yt_data.get("logged_in"):
-        wait callback_query.message.edit_text("❌ **No YouTube Account Linked.**", reply_markup=youtube_settings_inline_menu)
+        await callback_query.message.edit_text("❌ **No YouTube Account Linked.**", reply_markup=youtube_settings_inline_menu)
         return
         
     creds = get_youtube_credentials(user_id)
@@ -1205,6 +1205,7 @@ async def yt_check_expiry_date(client, callback_query):
     info_text = f"🗓️ **YouTube Token Expiry Status:**\n{status_text}\n\n_**Note:** Tokens are refreshed automatically._"
     
     await callback_query.message.edit_text(info_text, reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+
 
 
 # --- NEW conversational Facebook Login Flow (OAuth) ---
