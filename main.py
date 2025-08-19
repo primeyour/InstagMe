@@ -6,7 +6,7 @@ import logging
 import json
 import time
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sys
 import base64
 from urllib.parse import urlencode, parse_qs
@@ -49,11 +49,8 @@ CHANNEL_PHOTO_URL = "https://i.postimg.cc/SXDxJ92z/x.jpg"
 
 # ⚠️ CRITICAL CONFIGURATION ⚠️
 # The REDIRECT_URI MUST be your public server URL, not 127.0.0.1.
-# Example: If your app is hosted at "https://my-bot.koyeb.app",
-# then REDIRECT_URI should be "https://my-bot.koyeb.app/oauth2callback"
-# You MUST also add this full URL to your Google Cloud Console credentials.
-# Failure to do so will cause the YouTube login to fail in production.
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/oauth2callback")
+# Example: https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/oauth2callback
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://127.0.0.1:8080/oauth2callback")
 GOOGLE_API_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/userinfo.email"
@@ -268,7 +265,7 @@ def get_user_plan_and_expiry(user_id):
         return None, None, None
 
     expiry_date = datetime.fromisoformat(expiry_date_str)
-    if expiry_date < datetime.utcnow():
+    if expiry_date < datetime.now(timezone.utc).replace(tzinfo=None): # Use timezone-aware comparison
         # Premium expired, downgrade user
         update_user_data(user_id, {"is_premium": False, "plan_tier": "free", "premium_expiry": None})
         return "free", None, None
@@ -288,8 +285,8 @@ def has_upload_quota(user_id):
     last_upload_date = user_doc.get("last_upload_date")
 
     # Reset daily count if the day has changed
-    if last_upload_date and last_upload_date.date() < datetime.utcnow().date():
-        users_collection.update_one({"_id": user_id}, {"$set": {"uploads_today": 0, "last_upload_date": datetime.utcnow()}})
+    if last_upload_date and last_upload_date.date() < datetime.now(timezone.utc).date():
+        users_collection.update_one({"_id": user_id}, {"$set": {"uploads_today": 0, "last_upload_date": datetime.now(timezone.utc)}})
         uploads_today = 0
     
     quota = PREMIUM_PLANS.get(plan_tier, {}).get("upload_quota", 0)
@@ -561,60 +558,61 @@ def apply_template(template, user_data, job_data):
 
 async def download_progress_callback(current, total, *args):
     """Sends progress updates during file download."""
-    # Unpack args to get the message object
     client, message = args
-    progress_percentage = int((current / total) * 100)
-    
-    # Avoid spamming Telegram APIs by editing the message only every 5%
-    if progress_percentage % 5 == 0:
-        try:
-            progress_str = f"⬇️ Downloading: {progress_percentage}%"
+    try:
+        # Avoid spamming Telegram APIs by tracking last percentage
+        last_percentage = message.meta.get("last_percentage", 0)
+        percentage = int((current / total) * 100)
+        if percentage > last_percentage:
+            progress_str = f"⬇️ Downloading: {percentage}%"
             await message.edit(progress_str)
-        except Exception as e:
-            # This can fail if the message is too old or no changes are detected
-            logger.debug(f"Failed to update download progress message: {e}")
+            message.meta["last_percentage"] = percentage
+    except Exception as e:
+        logger.debug(f"Failed to update download progress message: {e}")
 
 # === PYROGRAM HANDLERS ===
+# FIXED: The entire start_command is rewritten to avoid the MongoDB path conflict error.
 @app.on_message(filters.command("start"))
 async def start_command(client, message):
     user_id = message.from_user.id
     user_first_name = message.from_user.first_name or "Unknown User"
     user_username = message.from_user.username or "N/A"
 
-    user_data_to_set = {
+    # Start with a single dictionary for default user data
+    user_data = {
         "first_name": user_first_name,
         "username": user_username,
-        "last_active": datetime.now(),
-    }
-
-    # Use $setOnInsert to initialize fields only for new users
-    initial_user_data = {
+        "last_active": datetime.now(timezone.utc),
         "is_premium": False,
         "role": "user",
         "plan_tier": "free",
         "total_uploads": 0,
         "uploads_today": 0,
-        "last_upload_date": datetime.utcnow(),
+        "last_upload_date": datetime.now(timezone.utc),
         "premium_expiry": None,
         "facebook_settings": {
             "title": "Default Facebook Title", "tag": "#facebook #video #reels", "description": "Default Facebook Description", "upload_type": "Video", "schedule_time": None, "privacy": "Public"
         },
         "youtube_settings": {
             "title": "Default YouTube Title", "tag": "#youtube #video #shorts", "description": "Default YouTube Description", "video_type": "Video (Standard Horizontal/Square)", "schedule_time": None, "privacy": "Public"
-        },
-        "added_at": datetime.now()
+        }
     }
-    
-    if user_id == OWNER_ID:
-        user_data_to_set["role"] = "admin"
-        user_data_to_set["is_premium"] = True
-        user_data_to_set["plan_tier"] = "lifetime"
-        user_data_to_set["premium_expiry"] = (datetime.utcnow() + timedelta(days=365*10)).isoformat()
 
+    # If the user is the owner, override the default values
+    if user_id == OWNER_ID:
+        user_data["role"] = "admin"
+        user_data["is_premium"] = True
+        user_data["plan_tier"] = "lifetime"
+        user_data["premium_expiry"] = (datetime.now(timezone.utc) + timedelta(days=365*10)).isoformat()
+    
+    # Prepare the query: $set will handle all fields, $setOnInsert only for the creation time.
     try:
         users_collection.update_one(
             {"_id": user_id},
-            {"$set": user_data_to_set, "$setOnInsert": initial_user_data},
+            {
+                "$set": user_data,
+                "$setOnInsert": {"added_at": datetime.now(timezone.utc)}
+            },
             upsert=True
         )
         logger.info(f"User {user_id} account initialized/updated successfully.")
@@ -623,9 +621,10 @@ async def start_command(client, message):
         await message.reply("🚨 **System Alert!** An error occurred while initializing your account. Please try again later or contact support.")
         return
 
+    # Continue with the rest of the original logic
     user_doc = get_user_data(user_id)
     if not user_doc:
-        logger.error(f"Could not retrieve user document for {user_id} after upsert. This is unexpected.")
+        logger.error(f"Could not retrieve user document for {user_id} after upsert.")
         await message.reply("❌ **Error!** Failed to retrieve your account data after setup. Please try `/start` again.")
         return
 
@@ -668,7 +667,8 @@ async def start_command(client, message):
             return
 
     await message.reply(welcome_msg, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
-    logger.info(f"Start command completed for user {user_id}. Showing {'admin' if is_admin(user_id) else 'premium' if is_premium_user(user_id) else 'regular'} menu.")
+    logger.info(f"Start command completed for user {user_id}.")
+
 
 @app.on_message(filters.command("addpremium") & filters.user(OWNER_ID))
 async def add_premium_command(client, message):
@@ -680,7 +680,7 @@ async def add_premium_command(client, message):
 
         target_user_id = int(args[1])
         days = int(args[2])
-        expiry_date = datetime.utcnow() + timedelta(days=days)
+        expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
 
         user_data_to_set = {
             "is_premium": True,
@@ -858,14 +858,14 @@ async def admin_add_user_prompt_inline(client, callback_query):
     )
     logger.info(f"Admin {user_id} prompted to add premium user.")
 
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_ADD_USER) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_ADD_USER) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_add_user_id_input(client, message):
     user_id = message.from_user.id
     try:
         target_user_id_str, days_str = message.text.strip().split()
         target_user_id = int(target_user_id_str)
         days = int(days_str)
-        expiry_date = datetime.utcnow() + timedelta(days=days)
+        expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
         plan_tier = f"{days}day" if days in [2, 5, 8, 20, 30] else ("2mo" if days == 60 else ("6mo" if days == 180 else "1year"))
 
         user_data_to_set = {
@@ -902,7 +902,7 @@ async def admin_remove_user_prompt_inline(client, callback_query):
     )
     logger.info(f"Admin {user_id} prompted to remove premium user.")
 
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_REMOVE_USER) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_REMOVE_USER) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_remove_user_id_input(client, message):
     user_id = message.from_user.id
     target_user_id_str = message.text.strip()
@@ -947,7 +947,7 @@ async def admin_broadcast_prompt_inline(client, callback_query):
     )
     logger.info(f"Admin {user_id} prompted for broadcast message.")
 
-@app.on_message(filters.text & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_BROADCAST_MESSAGE) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_BROADCAST_MESSAGE) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def broadcast_message_handler(client, message):
     user_id = message.from_user.id
     text_to_broadcast = message.text
@@ -1033,6 +1033,16 @@ async def settings_bot_status_inline_callback(client, callback_query):
     await callback_query.edit_message_text(stats_message, reply_markup=get_general_settings_inline_keyboard(user_id), parse_mode=enums.ParseMode.MARKDOWN)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed detailed system status.")
 
+# --- All other functions (Facebook, YouTube settings, etc.) remain the same ---
+# ... (The rest of the code from the previous turn) ...
+# To save space, only the changed functions are shown here. 
+# You should paste the rest of your unchanged code below this point.
+# The following is a placeholder for the rest of the functions from the previous provided code.
+# The complete code is very long, so I am including only the changed parts.
+
+# [PASTE THE REST OF YOUR UNCHANGED CODE HERE, STARTING FROM `show_facebook_settings` all the way to the end]
+# The functions below this comment are the same as the last version I sent.
+
 @app.on_callback_query(filters.regex("^settings_facebook$"))
 async def show_facebook_settings(client, callback_query):
     user_id = callback_query.from_user.id
@@ -1053,7 +1063,7 @@ async def show_youtube_settings(client, callback_query):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing YouTube configurations...")
-    await callback_query.edit_message_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
+    await callback_query.message.edit_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
     logger.info(f"User {user_id} accessed YouTube settings.")
 
 # --- NEW YouTube Login Flow (OAuth 2.0) ---
@@ -1109,19 +1119,17 @@ async def yt_get_client_secret(client, message):
         
         auth_url, state = flow.authorization_url(access_type='offline', include_granted_scopes='true')
         
-        # Storing necessary info for the next step
         user_states[user_id].update({
             "client_secret": client_secret,
             "state": state,
             "step": AWAITING_YT_AUTH_CODE,
-            "flow_config": temp_creds_json # Store the config directly
+            "flow_config": temp_creds_json
         })
         
         await message.reply(
             f"**Step 3:** Please click the link below to grant access to your YouTube channel:\n\n"
             f"[**Click here to authenticate with Google**]({auth_url})\n\n"
-            "After you have granted access, you will be redirected. The page might show an error, but that's okay. "
-            "Just **copy the full URL from your browser's address bar** and paste it here.",
+            "After you grant access, **copy the full URL from your browser's address bar** and paste it here.",
             parse_mode=enums.ParseMode.MARKDOWN,
             disable_web_page_preview=True
         )
@@ -1144,7 +1152,6 @@ async def yt_get_auth_code(client, message):
         flow = Flow.from_client_config(temp_creds_json, scopes=GOOGLE_API_SCOPES, state=state_data["state"])
         flow.redirect_uri = REDIRECT_URI
         
-        # Use the full URL to fetch the token
         flow.fetch_token(authorization_response=redirect_response_url)
         
         creds = flow.credentials
@@ -1161,14 +1168,13 @@ async def yt_get_auth_code(client, message):
         update_user_data(user_id, {"youtube": youtube_data})
         
         await message.reply(
-            f"✅ **YouTube Login Successful!**\n"
-            f"Your account is now linked. You can configure upload settings or use the upload feature.",
+            f"✅ **YouTube Login Successful!**",
             reply_markup=youtube_settings_inline_menu
         )
         await log_to_channel(client, f"User `{user_id}` successfully linked YouTube.")
         
     except Exception as e:
-        await message.reply(f"❌ **Authentication Failed.** An error occurred: `{e}`. Please ensure you copied the full URL and that your `REDIRECT_URI` is set correctly in the bot and Google Console.", reply_markup=youtube_settings_inline_menu)
+        await message.reply(f"❌ **Authentication Failed.** An error occurred: `{e}`. Please ensure you copied the full URL and that your `REDIRECT_URI` is set correctly.", reply_markup=youtube_settings_inline_menu)
         logger.error(f"YouTube auth code exchange failed for user {user_id}: {e}")
     finally:
         user_states.pop(user_id, None)
@@ -1181,27 +1187,25 @@ async def yt_check_expiry_date(client, callback_query):
     yt_data = user_doc.get("youtube", {})
     
     if not yt_data.get("logged_in"):
-        await callback_query.message.edit_text("❌ **No YouTube Account Linked.** Please log in first.", reply_markup=youtube_settings_inline_menu)
+        wait callback_query.message.edit_text("❌ **No YouTube Account Linked.**", reply_markup=youtube_settings_inline_menu)
         return
         
-    expiry_date_str = yt_data.get("token_expiry", "N/A")
     creds = get_youtube_credentials(user_id)
     
     status_text = ""
     if creds:
-        # After get_youtube_credentials, the token might have been refreshed.
-        # So we get the expiry from the credentials object itself.
         expiry_date = creds.expiry
-        if expiry_date > datetime.utcnow():
+        if expiry_date > datetime.now(timezone.utc):
             status_text = f"✅ Valid until: `{expiry_date.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
         else:
             status_text = "❌ Expired and refresh failed. Please log in again."
     else:
         status_text = "❌ Not Logged In or invalid credentials."
         
-    info_text = f"🗓️ **YouTube Token Expiry Status:**\n{status_text}\n\n_**System Note:** Access tokens are automatically refreshed in the background when needed._"
+    info_text = f"🗓️ **YouTube Token Expiry Status:**\n{status_text}\n\n_**Note:** Tokens are refreshed automatically._"
     
     await callback_query.message.edit_text(info_text, reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+
 
 # --- NEW conversational Facebook Login Flow (OAuth) ---
 @app.on_callback_query(filters.regex("^fb_oauth_login_prompt$"))
