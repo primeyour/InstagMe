@@ -12,6 +12,10 @@ import base64
 from urllib.parse import urlencode, parse_qs
 import random
 import asyncio
+from functools import wraps
+import re
+import psutil
+from uuid import uuid4
 
 # Import for Google OAuth and YouTube API
 import requests
@@ -46,11 +50,12 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002779117737"))
 ADMIN_TOM_USERNAME = "CjjTom"
 CHANNEL_LINK = "https://t.me/KeralaCaptain"
 CHANNEL_PHOTO_URL = "https://i.postimg.cc/SXDxJ92z/x.jpg"
+PAYMENT_QR_CODE = "https://i.postimg.cc/SXDxJ92z/x.jpg"
 
 # ⚠️ CRITICAL CONFIGURATION ⚠️
 # The REDIRECT_URI MUST be your public server URL, not 127.0.0.1.
 # Example: https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/oauth2callback
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://127.0.0.1:8080/oauth2callback")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/oauth2callback")
 GOOGLE_API_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/userinfo.email"
@@ -66,6 +71,7 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client[DB_NAME]
 users_collection = db["users"]
 jobs_collection = db["jobs"]
+settings_collection = db["settings"]
 
 # --- IMPORTANT: MongoDB Index Check/Creation ---
 try:
@@ -78,39 +84,60 @@ try:
 except Exception as e:
     logger.error(f"Error checking/dropping problematic user_id index: {e}")
 
+
 # === PREMIUM PLANS & QUOTAS ===
 PREMIUM_PLANS = {
     "free": {"duration_days": 1, "upload_quota": 1},
-    "2day": {"duration_days": 2, "upload_quota": 20, "price": 10},
-    "5day": {"duration_days": 5, "upload_quota": 50, "price": 30},
-    "8day": {"duration_days": 8, "upload_quota": 80, "price": 50},
-    "20day": {"duration_days": 20, "upload_quota": 200, "price": 70},
-    "30day": {"duration_days": 30, "upload_quota": 300, "price": 100},
-    "2mo": {"duration_days": 60, "upload_quota": 600, "price": 150},
-    "6mo": {"duration_days": 180, "upload_quota": 1800, "price": 300},
-    "1year": {"duration_days": 365, "upload_quota": 3650, "price": "Negotiable"},
+    "trial": {"duration_days": 0.25, "upload_quota": 10},
+    "3_days": {"duration_days": 3, "upload_quota": 30, "price": "100 INR"},
+    "7_days": {"duration_days": 7, "upload_quota": 70, "price": "200 INR"},
+    "15_days": {"duration_days": 15, "upload_quota": 150, "price": "350 INR"},
+    "1_month": {"duration_days": 30, "upload_quota": 300, "price": "600 INR"},
+    "2_months": {"duration_days": 60, "upload_quota": 600, "price": "1000 INR"},
+    "6_months": {"duration_days": 180, "upload_quota": 1800, "price": "2500 INR"},
+    "1_year": {"duration_days": 365, "upload_quota": 3650, "price": "4500 INR"},
     "lifetime": {"duration_days": 36500, "upload_quota": 99999, "price": "Negotiable"}
 }
 
-# === KEYBOARDS ===
-main_menu_user = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("⬆️ Upload Content")],
-        [KeyboardButton("⚙️ Settings")]
-    ],
-    resize_keyboard=True
-)
 
-main_menu_admin = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("⬆️ Upload Content")],
-        [KeyboardButton("⚙️ Settings"), KeyboardButton("👤 Admin Panel")]
-    ],
-    resize_keyboard=True
-)
+# === CONCURRENCY & SETTINGS ===
+upload_semaphore = None
+
+def initialize_global_settings():
+    """Initializes global bot settings in the database if they don't exist."""
+    if not settings_collection.find_one({"_id": "global_config"}):
+        settings_collection.insert_one({
+            "_id": "global_config",
+            "concurrent_uploads": 5,
+            "payment_qr_code": "https://i.postimg.cc/SXDxJ92z/x.jpg",
+            "payment_info": f"To proceed with the payment, please contact the administrator: @{ADMIN_TOM_USERNAME}"
+        })
+        logger.info("Initialized global bot settings in the database.")
+
+def load_upload_semaphore():
+    global upload_semaphore
+    settings = settings_collection.find_one({"_id": "global_config"})
+    limit = settings.get("concurrent_uploads", 5) if settings else 5
+    upload_semaphore = threading.Semaphore(limit)
+    logger.info(f"Upload semaphore initialized with a limit of {limit}.")
+
+# === KEYBOARDS ===
+def get_main_menu(user_id):
+    user_doc = get_user_data(user_id)
+    keyboard = []
+    if user_doc and is_premium_user(user_id, 'youtube'):
+        keyboard.append([KeyboardButton(to_bold_sans("▶️ Upload to YouTube"))])
+    if user_doc and is_premium_user(user_id, 'facebook'):
+        keyboard.append([KeyboardButton(to_bold_sans("📘 Upload to Facebook"))])
+    
+    keyboard.append([KeyboardButton(to_bold_sans("⭐ Premium Plans")), KeyboardButton(to_bold_sans("⚙️ Settings"))])
+    
+    if is_admin(user_id):
+        keyboard.append([KeyboardButton(to_bold_sans("👤 Admin Panel"))])
+
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_general_settings_inline_keyboard(user_id):
-    """Returns the general settings inline keyboard based on user role."""
     keyboard = []
     if is_premium_user(user_id) or is_admin(user_id):
         keyboard.append([InlineKeyboardButton("User Settings", callback_data='settings_user_menu_inline')])
@@ -120,14 +147,17 @@ def get_general_settings_inline_keyboard(user_id):
     keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main_menu_reply_from_inline')])
     return InlineKeyboardMarkup(keyboard)
 
+# REFINED - Added "Get User Info" button
 Admin_markup = InlineKeyboardMarkup([
     [InlineKeyboardButton("👥 Users List", callback_data="admin_users_list")],
-    [InlineKeyboardButton("➕ Add Premium User", callback_data="admin_add_user_prompt")],
-    [InlineKeyboardButton("➖ Remove Premium User", callback_data="admin_remove_user_prompt")],
-    [InlineKeyboardButton("📢 Broadcast Message", callback_data="admin_broadcast_prompt")],
+    [InlineKeyboardButton("🕵️ Get User Info", callback_data="admin_get_user_info_prompt")], # NEW
+    [InlineKeyboardButton("➕ Add Premium", callback_data="admin_add_user_prompt")],
+    [InlineKeyboardButton("➖ Remove Premium", callback_data="admin_remove_user_prompt")],
+    [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_prompt")],
+    [InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_bot_settings")],
+    [InlineKeyboardButton("💳 Payment Settings", callback_data="admin_payment_settings")],
     [InlineKeyboardButton("🔄 Restart Bot", callback_data='admin_restart_bot')],
-    [InlineKeyboardButton("📊 Bot Stats", callback_data='settings_bot_status_inline')],
-    [InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_main_menu_inline")]
+    [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="back_to_main_menu_reply_from_inline")]
 ])
 
 user_settings_inline_menu = InlineKeyboardMarkup(
@@ -141,29 +171,26 @@ user_settings_inline_menu = InlineKeyboardMarkup(
 
 facebook_settings_inline_menu = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🔑 Facebook Login (OAuth)", callback_data='fb_oauth_login_prompt')],
-        [InlineKeyboardButton("🗓️ Check Status", callback_data='fb_stats_status')],
-        [InlineKeyboardButton("🔄 Refresh Pages List", callback_data='fb_refresh_pages_list')],
+        [InlineKeyboardButton("🔑 Manage Accounts", callback_data='fb_manage_accounts')],
         [InlineKeyboardButton("📝 Set Title", callback_data='fb_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='fb_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='fb_set_description')],
         [InlineKeyboardButton("🎥 Default Upload Type", callback_data='fb_default_upload_type')],
         [InlineKeyboardButton("⏰ Set Schedule Time", callback_data='fb_set_schedule_time')],
-        [InlineKeyboardButton("🔒 Set Private/Public", callback_data='fb_set_privacy')],
+        [InlineKeyboardButton("🔒 Set Privacy", callback_data='fb_set_privacy')],
         [InlineKeyboardButton("⬅️ Back to User Settings", callback_data='settings_user_menu_inline')]
     ]
 )
 
 youtube_settings_inline_menu = InlineKeyboardMarkup(
     [
-        [InlineKeyboardButton("🔑 YouTube Login", callback_data='yt_login_prompt')],
+        [InlineKeyboardButton("🔑 Manage Accounts", callback_data='yt_manage_accounts')],
         [InlineKeyboardButton("📝 Set Title", callback_data='yt_set_title')],
         [InlineKeyboardButton("🏷️ Set Tag", callback_data='yt_set_tag')],
         [InlineKeyboardButton("📄 Set Description", callback_data='yt_set_description')],
         [InlineKeyboardButton("🎥 Video Type (Shorts/Video)", callback_data='yt_video_type')],
         [InlineKeyboardButton("⏰ Set Schedule Time", callback_data='yt_set_schedule_time')],
         [InlineKeyboardButton("🔒 Set Private/Public", callback_data='yt_set_privacy')],
-        [InlineKeyboardButton("🗓️ Check Expiry Date", callback_data='yt_check_expiry_date')],
         [InlineKeyboardButton("⬅️ Back to User Settings", callback_data='settings_user_menu_inline')]
     ]
 )
@@ -186,7 +213,6 @@ youtube_video_type_inline_menu = InlineKeyboardMarkup(
 )
 
 def get_privacy_inline_menu(platform):
-    """Generates privacy inline keyboard for different platforms."""
     keyboard = [
         [InlineKeyboardButton("Public", callback_data=f'{platform}_privacy_public')],
         [InlineKeyboardButton("Private", callback_data=f'{platform}_privacy_private')],
@@ -196,12 +222,21 @@ def get_privacy_inline_menu(platform):
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data=f'settings_{platform}')])
     return InlineKeyboardMarkup(keyboard)
 
-platform_selection_inline_menu = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("📘 Upload to Facebook", callback_data='upload_select_facebook')],
-        [InlineKeyboardButton("▶️ Upload to YouTube", callback_data='upload_select_youtube')]
+def get_premium_plan_keyboard():
+    keyboard = []
+    for plan, details in PREMIUM_PLANS.items():
+        if plan in ["free", "trial"]: continue
+        keyboard.append([InlineKeyboardButton(f"👑 {plan.replace('_', ' ').capitalize()} - {details.get('price')}", callback_data=f"select_plan_{plan}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='back_to_main_menu_reply_from_inline')])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_platform_selection_keyboard(action):
+    keyboard = [
+        [InlineKeyboardButton("📘 Facebook", callback_data=f"{action}_platform_facebook")],
+        [InlineKeyboardButton("▶️ YouTube", callback_data=f"{action}_platform_youtube")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="settings_my_plan")]
     ]
-)
+    return InlineKeyboardMarkup(keyboard)
 
 # === USER STATES (for sequential conversation flows) ===
 user_states = {}
@@ -215,6 +250,7 @@ AWAITING_UPLOAD_SCHEDULE_DATETIME = "awaiting_upload_schedule_datetime"
 AWAITING_UPLOAD_TYPE_SELECTION = "awaiting_upload_type_selection"
 AWAITING_UPLOAD_TAGS = "awaiting_upload_tags"
 AWAITING_UPLOAD_THUMBNAIL = "awaiting_upload_thumbnail"
+AWAITING_CUSTOM_THUMBNAIL = "awaiting_custom_thumbnail"
 
 AWAITING_FB_TITLE = "awaiting_fb_title"
 AWAITING_FB_TAG = "awaiting_fb_tag"
@@ -222,6 +258,8 @@ AWAITING_FB_DESCRIPTION = "awaiting_fb_description"
 AWAITING_FB_SCHEDULE_TIME = "awaiting_fb_schedule_time"
 AWAITING_FB_OAUTH_TOKEN = "awaiting_fb_oauth_token"
 AWAITING_FB_PAGE_SELECTION = "awaiting_fb_page_selection"
+AWAITING_FB_LOCATION = "awaiting_fb_location"
+AWAITING_FB_TAG_PEOPLE = "awaiting_fb_tag_people"
 
 AWAITING_YT_TITLE = "awaiting_yt_title"
 AWAITING_YT_TAG = "awaiting_yt_tag"
@@ -230,12 +268,40 @@ AWAITING_YT_SCHEDULE_TIME = "awaiting_yt_schedule_time"
 AWAITING_YT_CLIENT_ID = "awaiting_yt_client_id"
 AWAITING_YT_CLIENT_SECRET = "awaiting_yt_client_secret"
 AWAITING_YT_AUTH_CODE = "awaiting_yt_auth_code"
+AWAITING_YT_LOCATION = "awaiting_yt_location"
 
 AWAITING_BROADCAST_MESSAGE = "awaiting_broadcast_message"
 AWAITING_ADD_USER = "admin_awaiting_user_id_to_add"
 AWAITING_REMOVE_USER = "admin_awaiting_user_id_to_remove"
+AWAITING_ADD_PREMIUM = "awaiting_add_premium_details"
+AWAITING_NEW_CONCURRENT_UPLOADS = "awaiting_new_concurrent_uploads"
+AWAITING_NEW_PAYMENT_QR = "awaiting_new_payment_qr"
+AWAITING_NEW_PAYMENT_INFO = "awaiting_new_payment_info"
+AWAITING_USER_ID_FOR_INSPECTION = "awaiting_user_id_for_inspection" # NEW
+
+# === CONCURRENCY LOCKS ===
+user_locks = {}
+upload_semaphore = None
+
+def with_user_lock(func):
+    @wraps(func)
+    async def wrapper(client, message, *args, **kwargs):
+        user_id = message.from_user.id
+        if user_id in user_locks:
+            await message.reply("⚠️ **Please wait.** Another operation is already in progress. Please finish the current task or send `🔙 Main Menu` to cancel.")
+            return
+        user_locks[user_id] = True
+        try:
+            return await func(client, message, *args, **kwargs)
+        finally:
+            del user_locks[user_id]
+    return wrapper
 
 # === HELPERS ===
+def to_bold_sans(text):
+    """Converts text to bold sans-serif Unicode characters."""
+    return "".join(chr(0x1D5D4 + ord(c)) if 'a' <= c <= 'z' else chr(0x1D5D4 + ord(c) - 32) if 'A' <= c <= 'Z' else c for c in text)
+
 def get_user_data(user_id):
     """Retrieves user data from MongoDB using _id. Returns None if not found."""
     return users_collection.find_one({"_id": user_id})
@@ -253,40 +319,76 @@ def is_admin(user_id):
     user_doc = get_user_data(user_id)
     return user_doc and user_doc.get("role") == "admin"
 
-def get_user_plan_and_expiry(user_id):
-    """Retrieves user's premium plan and expiry, checking if it's still active."""
+def set_premium_plan(user_id, platform, plan_tier):
+    """Grants a premium plan to a user for a specific platform."""
     user_doc = get_user_data(user_id)
-    if not user_doc or not user_doc.get("is_premium", False):
-        return None, None, None
+    current_expiry_str = user_doc.get("premium", {}).get(platform, {}).get("until")
+    current_expiry = datetime.fromisoformat(current_expiry_str).replace(tzinfo=None) if current_expiry_str else datetime.utcnow().replace(tzinfo=None)
+    
+    plan_info = PREMIUM_PLANS.get(plan_tier)
+    if not plan_info:
+        logger.error(f"Invalid plan tier '{plan_tier}' for user {user_id}.")
+        return False
+    
+    new_expiry = current_expiry + timedelta(days=plan_info['duration_days'])
+    
+    premium_data = {
+        f"premium.{platform}.type": plan_tier,
+        f"premium.{platform}.until": new_expiry.isoformat(),
+        f"premium.{platform}.status": "active"
+    }
+    
+    update_user_data(user_id, premium_data)
+    logger.info(f"User {user_id} granted premium '{plan_tier}' for {platform}.")
+    return True
 
-    plan = user_doc.get("plan_tier")
-    expiry_date_str = user_doc.get("premium_expiry")
-    if not plan or not expiry_date_str:
-        return None, None, None
+def get_user_plan_and_expiry(user_id, platform=None):
+    """
+    Retrieves user's premium plan and expiry, checking if it's still active.
+    If no platform is specified, checks for ANY active premium plan.
+    """
+    user_doc = get_user_data(user_id)
+    if not user_doc:
+        return "free", None, 0
+    
+    premium_data = user_doc.get("premium", {})
+    
+    if not platform:
+        for p_name, p_data in premium_data.items():
+            if p_data.get("status") == "active":
+                expiry_date = datetime.fromisoformat(p_data["until"])
+                if expiry_date.replace(tzinfo=None) > datetime.utcnow().replace(tzinfo=None):
+                    return p_data["type"], expiry_date.replace(tzinfo=None), None 
+        return "free", None, 0
 
-    expiry_date = datetime.fromisoformat(expiry_date_str)
-    if expiry_date < datetime.now(timezone.utc).replace(tzinfo=None): # Use timezone-aware comparison
-        # Premium expired, downgrade user
-        update_user_data(user_id, {"is_premium": False, "plan_tier": "free", "premium_expiry": None})
-        return "free", None, None
+    platform_data = premium_data.get(platform, {})
+    if platform_data.get("status") != "active":
+        return "free", None, 0
 
-    return plan, expiry_date, user_doc.get("daily_uploads", 0)
+    expiry_date = datetime.fromisoformat(platform_data["until"])
+    
+    if expiry_date.replace(tzinfo=None) < datetime.utcnow().replace(tzinfo=None):
+        update_user_data(user_id, {f"premium.{platform}": {"status": "expired"}})
+        return "free", None, 0
 
-def is_premium_user(user_id):
-    """Checks if a user has an active premium plan."""
-    plan, expiry, _ = get_user_plan_and_expiry(user_id)
-    return plan is not None and plan != "free"
+    return platform_data["type"], expiry_date.replace(tzinfo=None), user_doc.get("uploads_today", 0)
 
-def has_upload_quota(user_id):
+def is_premium_user(user_id, platform=None):
+    """Checks if a user has an active premium plan for a specific platform or any platform."""
+    plan, _, _ = get_user_plan_and_expiry(user_id, platform)
+    return plan not in ["free", "trial"]
+
+def has_upload_quota(user_id, platform):
     """Checks if a user has remaining upload quota for the day."""
     user_doc = get_user_data(user_id)
-    plan_tier = user_doc.get("plan_tier", "free")
-    uploads_today = user_doc.get("uploads_today", 0)
-    last_upload_date = user_doc.get("last_upload_date")
+    if not user_doc: return False
+    
+    plan_tier, _, _ = get_user_plan_and_expiry(user_id, platform)
+    uploads_today = user_doc.get("uploads_today", {}).get(platform, 0)
+    last_upload_date = user_doc.get("last_upload_date", {}).get(platform)
 
-    # Reset daily count if the day has changed
-    if last_upload_date and last_upload_date.date() < datetime.now(timezone.utc).date():
-        users_collection.update_one({"_id": user_id}, {"$set": {"uploads_today": 0, "last_upload_date": datetime.now(timezone.utc)}})
+    if last_upload_date and last_upload_date.date() < datetime.utcnow().date():
+        users_collection.update_one({"_id": user_id}, {"$set": {f"uploads_today.{platform}": 0, f"last_upload_date.{platform}": datetime.utcnow()}})
         uploads_today = 0
     
     quota = PREMIUM_PLANS.get(plan_tier, {}).get("upload_quota", 0)
@@ -326,34 +428,38 @@ def get_facebook_pages_from_token(user_access_token):
         return []
 
 def get_youtube_credentials(user_id):
-    """
-    Retrieves and refreshes YouTube credentials from MongoDB.
-    Returns a Credentials object or None.
-    """
+    """(REVISED) Retrieves and refreshes credentials for the ACTIVE YouTube account."""
     user_doc = get_user_data(user_id)
-    yt_data = user_doc.get("youtube", {}) if user_doc else {}
+    if not user_doc: return None
 
-    if not yt_data.get('logged_in') or not yt_data.get('refresh_token'):
-        return None
+    active_account_id = user_doc.get("youtube_active_account_id")
+    if not active_account_id: return None
 
+    yt_account = next((acc for acc in user_doc.get("youtube_accounts", []) if acc.get("account_id") == active_account_id), None)
+    if not yt_account or not yt_account.get('refresh_token'): return None
+    
     try:
         creds = Credentials(
-            token=yt_data.get('access_token'),
-            refresh_token=yt_data.get('refresh_token'),
+            token=yt_account.get('access_token'),
+            refresh_token=yt_account.get('refresh_token'),
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=yt_data.get('client_id'),
-            client_secret=yt_data.get('client_secret'),
+            client_id=yt_account.get('client_id'),
+            client_secret=yt_account.get('client_secret'),
             scopes=GOOGLE_API_SCOPES
         )
 
         if creds.expired and creds.refresh_token:
             creds.refresh(requests.Request())
-            update_user_data(user_id, {
-                "youtube.access_token": creds.token,
-                "youtube.token_expiry": creds.expiry.isoformat()
-            })
-            logger.info(f"Refreshed YouTube token for user {user_id}.")
-
+            users_collection.update_one(
+                {"_id": user_id, "youtube_accounts.account_id": active_account_id},
+                {
+                    "$set": {
+                        "youtube_accounts.$.access_token": creds.token,
+                        "youtube_accounts.$.token_expiry": creds.expiry.isoformat()
+                    }
+                }
+            )
+            logger.info(f"Refreshed YouTube token for user {user_id}, account {active_account_id}.")
         return creds
     except Exception as e:
         logger.error(f"Failed to refresh/get YouTube credentials for user {user_id}: {e}")
@@ -400,7 +506,6 @@ def process_audio(input_path, output_path, audio_streams):
     """
     command = ["ffmpeg", "-y", "-i", input_path]
     
-    # Simple logic: prefer 'mal' or 'eng', otherwise use the first stream
     mal_stream = next((s for s in audio_streams if s.get('tags', {}).get('language') == 'mal'), None)
     eng_stream = next((s for s in audio_streams if s.get('tags', {}).get('language') == 'eng'), None)
     
@@ -434,7 +539,32 @@ def process_audio(input_path, output_path, audio_streams):
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg audio processing timed out.")
 
-def upload_facebook_content(file_path, content_type, title, description, access_token, page_id, visibility="PUBLISHED", schedule_time=None):
+def process_video_for_upload(input_path):
+    """Processes video to a web-optimized MP4 format using FFmpeg."""
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = f"downloads/processed_{base_name}_{uuid4().hex[:6]}.mp4"
+    
+    command = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    
+    try:
+        logger.info(f"Starting video processing for: {input_path}")
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=900)
+        logger.info(f"Successfully processed video. Output: {output_path}")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[FFmpeg] Processing failed for {input_path}. STDERR: {e.stderr}")
+        raise RuntimeError(f"FFmpeg processing error: {e.stderr}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during FFmpeg processing: {e}")
+        raise e
+
+def upload_facebook_content(file_path, content_type, title, description, access_token, page_id, visibility="PUBLISHED", schedule_time=None, tags=[], location=None):
     """Uploads content to Facebook Page using Graph API."""
     if not all([file_path, content_type, access_token, page_id]):
         raise ValueError("Missing required parameters for Facebook content upload.")
@@ -558,174 +688,88 @@ def apply_template(template, user_data, job_data):
 
 async def download_progress_callback(current, total, *args):
     """Sends progress updates during file download."""
-    client, message = args
+    client, message, start_time = args
     try:
-        # Avoid spamming Telegram APIs by tracking last percentage
-        last_percentage = message.meta.get("last_percentage", 0)
+        last_percentage = getattr(message, "last_known_progress", 0)
         percentage = int((current / total) * 100)
         if percentage > last_percentage:
-            progress_str = f"⬇️ Downloading: {percentage}%"
-            await message.edit(progress_str)
-            message.meta["last_percentage"] = percentage
+            time_elapsed = time.time() - start_time
+            if time_elapsed > 0:
+                speed = current / time_elapsed
+                eta_seconds = (total - current) / speed
+                eta_minutes = int(eta_seconds / 60)
+                eta_seconds = int(eta_seconds % 60)
+                speed_kbps = speed / 1024
+                
+                progress_str = f"⬇️ **Downloading...**\n`{percentage}%` | `{current/1024/1024:.2f}` MB of `{total/1024/1024:.2f}` MB\n"
+                progress_str += f"`{speed_kbps:.2f}` KB/s | ETA: `{eta_minutes}`m `{eta_seconds}`s"
+                
+                await message.edit(progress_str)
+                setattr(message, "last_known_progress", percentage)
     except Exception as e:
         logger.debug(f"Failed to update download progress message: {e}")
 
+async def upload_progress_callback(status_msg, progress):
+    """Asynchronously edits a message to show upload progress."""
+    try:
+        percentage = int(progress.progress() * 100)
+        current_progress = getattr(status_msg, "last_known_progress", 0)
+        if percentage > current_progress:
+            await status_msg.edit_text(f"📤 **Uploading to YouTube...** `{percentage}%`")
+            setattr(status_msg, "last_known_progress", percentage)
+    except Exception as e:
+        logger.debug(f"Could not update upload progress message: {e}")
+
 # === PYROGRAM HANDLERS ===
-# FIXED: The entire start_command is rewritten to avoid the MongoDB path conflict error.
 @app.on_message(filters.command("start"))
+@with_user_lock
 async def start_command(client, message):
     user_id = message.from_user.id
-    user_first_name = message.from_user.first_name or "Unknown User"
+    user_first_name = message.from_user.first_name or "User"
     user_username = message.from_user.username or "N/A"
+    existing_user_doc = get_user_data(user_id)
 
-    # Start with a single dictionary for default user data
-    user_data = {
-        "first_name": user_first_name,
-        "username": user_username,
-        "last_active": datetime.now(timezone.utc),
-        "is_premium": False,
-        "role": "user",
-        "plan_tier": "free",
-        "total_uploads": 0,
-        "uploads_today": 0,
-        "last_upload_date": datetime.now(timezone.utc),
-        "premium_expiry": None,
-        "facebook_settings": {
-            "title": "Default Facebook Title", "tag": "#facebook #video #reels", "description": "Default Facebook Description", "upload_type": "Video", "schedule_time": None, "privacy": "Public"
-        },
-        "youtube_settings": {
-            "title": "Default YouTube Title", "tag": "#youtube #video #shorts", "description": "Default YouTube Description", "video_type": "Video (Standard Horizontal/Square)", "schedule_time": None, "privacy": "Public"
+    if not existing_user_doc:
+        user_data = {
+            "_id": user_id, "first_name": user_first_name, "username": user_username,
+            "last_active": datetime.utcnow(), "role": "user", "premium": {}, "uploads_today": {},
+            "last_upload_date": {}, "facebook_pages": [], "youtube_accounts": [],
+            "facebook_selected_page_id": None, "youtube_active_account_id": None,
+            "facebook_settings": {"title": "Default Title", "tag": "#video", "description": "Uploaded via Bot"},
+            "youtube_settings": {"title": "Default Title", "tag": "video", "description": "Uploaded via Bot"},
+            "added_at": datetime.utcnow()
         }
-    }
-
-    # If the user is the owner, override the default values
-    if user_id == OWNER_ID:
-        user_data["role"] = "admin"
-        user_data["is_premium"] = True
-        user_data["plan_tier"] = "lifetime"
-        user_data["premium_expiry"] = (datetime.now(timezone.utc) + timedelta(days=365*10)).isoformat()
-    
-    # Prepare the query: $set will handle all fields, $setOnInsert only for the creation time.
-    try:
-        users_collection.update_one(
-            {"_id": user_id},
-            {
-                "$set": user_data,
-                "$setOnInsert": {"added_at": datetime.now(timezone.utc)}
-            },
-            upsert=True
-        )
-        logger.info(f"User {user_id} account initialized/updated successfully.")
-    except Exception as e:
-        logger.error(f"Error during user data update/upsert for user {user_id}: {e}")
-        await message.reply("🚨 **System Alert!** An error occurred while initializing your account. Please try again later or contact support.")
-        return
-
-    # Continue with the rest of the original logic
-    user_doc = get_user_data(user_id)
-    if not user_doc:
-        logger.error(f"Could not retrieve user document for {user_id} after upsert.")
-        await message.reply("❌ **Error!** Failed to retrieve your account data after setup. Please try `/start` again.")
-        return
-
-    plan_tier = user_doc.get("plan_tier", "free").capitalize()
-    await log_to_channel(client, f"User `{user_id}` (`{user_username}` - `{user_first_name}`) performed `/start`. Role: `{user_doc.get('role')}`, Plan: `{plan_tier}`.")
+        user_data["premium"]["facebook"] = {"type": "trial", "until": (datetime.utcnow() + timedelta(days=PREMIUM_PLANS["trial"]["duration_days"])).isoformat(), "status": "active"}
+        user_data["premium"]["youtube"] = {"type": "trial", "until": (datetime.utcnow() + timedelta(days=PREMIUM_PLANS["trial"]["duration_days"])).isoformat(), "status": "active"}
+        if user_id == OWNER_ID:
+            user_data["role"] = "admin"
+            user_data["premium"]["facebook"] = {"type": "lifetime", "until": (datetime.utcnow() + timedelta(days=365*10)).isoformat(), "status": "active"}
+            user_data["premium"]["youtube"] = {"type": "lifetime", "until": (datetime.utcnow() + timedelta(days=365*10)).isoformat(), "status": "active"}
+        users_collection.insert_one(user_data)
+        logger.info(f"New user {user_id} created.")
+    else:
+        update_user_data(user_id, {"first_name": user_first_name, "username": user_username, "last_active": datetime.utcnow()})
+        logger.info(f"User {user_id} updated their info.")
 
     if is_admin(user_id):
-        welcome_msg = (
-            f"🤖 **Welcome to the Upload Bot, Administrator {user_first_name}!**\n\n"
-            "🛠 You have **full system access and privileges**.\n"
-            "Ready to command the digital frontier!"
-        )
-        reply_markup = main_menu_admin
+        welcome_msg = f"🤖 **Welcome back, Administrator {user_first_name}!**\n\nYou have full system access."
     else:
         welcome_msg = (
             f"👋 **Greetings, {user_first_name}!**\n\n"
-            "This bot is your gateway to **efforless video uploads** directly from Telegram.\n\n"
-            "• **Unlock Full Premium Features for:**\n"
-            "  • **YouTube (Shorts & Videos)**\n"
-            "  • **Facebook (Reels, Videos & Photos)**\n\n"
-            "• **Enjoy Unlimited Content Uploads & Advanced Options!**\n"
-            "• **Automatic/Customizable Captions, Titles, & Hashtags**\n"
-            "• **Flexible Content Type Selection (Reel, Post, Short, etc.)**\n\n"
-            f"👤 Contact **[ADMIN TOM](https://t.me/{ADMIN_TOM_USERNAME})** **To Upgrade Your Access**.\n"
-            "🔐 **Your Data Is Fully ✅Encrypted**\n\n"
+            "This bot helps you upload videos effortlessly.\n"
+            f"Contact **@{ADMIN_TOM_USERNAME}** to upgrade your access.\n\n"
             f"🆔 Your System User ID: `{user_id}`"
         )
-        reply_markup = main_menu_user
-        if not is_premium_user(user_id):
-            join_channel_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅Join Our Digital Hub✅", url=CHANNEL_LINK)]
-            ])
-            await client.send_photo(
-                chat_id=message.chat.id,
-                photo=CHANNEL_PHOTO_URL,
-                caption=welcome_msg,
-                reply_markup=join_channel_markup,
-                parse_mode=enums.ParseMode.MARKDOWN
-            )
-            return
-
-    await message.reply(welcome_msg, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
-    logger.info(f"Start command completed for user {user_id}.")
-
-
-@app.on_message(filters.command("addpremium") & filters.user(OWNER_ID))
-async def add_premium_command(client, message):
-    try:
-        args = message.text.split(maxsplit=2)
-        if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
-            await message.reply("❗ **Syntax Error:** Usage: `/addpremium <user_id> <days>`")
-            return
-
-        target_user_id = int(args[1])
-        days = int(args[2])
-        expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
-
-        user_data_to_set = {
-            "is_premium": True,
-            "plan_tier": f"{days}day",
-            "premium_expiry": expiry_date.isoformat()
-        }
-
-        update_user_data(target_user_id, user_data_to_set)
-        await message.reply(f"✅ **Success!** User `{target_user_id}` has been granted **PREMIUM** status for **{days} days**.")
-        try:
-            await client.send_message(target_user_id, f"🎉 **System Notification!** Your premium access has been extended by **{days} days**! Use `/start` to access your enhanced features.")
-        except Exception as e:
-            logger.warning(f"Could not notify user {target_user_id} about premium extension: {e}")
-        await log_to_channel(client, f"Admin `{message.from_user.id}` granted premium for `{days}` days to user `{target_user_id}`.")
-
-    except Exception as e:
-        await message.reply(f"❌ **Error!** Failed to add premium user: `{e}`")
-
-@app.on_message(filters.command("removepremium") & filters.user(OWNER_ID))
-async def remove_premium_command(client, message):
-    try:
-        args = message.text.split(maxsplit=1)
-        if len(args) != 2 or not args[1].isdigit():
-            await message.reply("❗ **Syntax Error:** Usage: `/removepremium <user_id>`")
-            return
-
-        target_user_id = int(args[1])
-        if target_user_id == OWNER_ID:
-            await message.reply("❌ **Access Denied!** You cannot remove the owner's premium status.")
-            return
-
-        user_doc = get_user_data(target_user_id)
-        if user_doc and user_doc.get("is_premium"):
-            update_user_data(target_user_id, {"is_premium": False, "plan_tier": "free", "premium_expiry": None})
-            await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS**.")
-            try:
-                await client.send_message(target_user_id, "❗ **System Notification!** Your premium access has been revoked.")
-            except Exception as e:
-                logger.warning(f"Could not notify user {target_user_id} about premium revocation: {e}")
-            await log_to_channel(client, f"Admin `{message.from_user.id}` revoked premium from user `{target_user_id}`.")
-        else:
-            await message.reply(f"User `{target_user_id}` is not a premium user or no record found in the system.")
-
-    except Exception as e:
-        await message.reply(f"❌ **Error!** Failed to remove premium user: `{e}`")
+    
+    reply_markup = get_main_menu(user_id)
+    if not is_premium_user(user_id):
+        await client.send_photo(
+            chat_id=message.chat.id, photo=CHANNEL_PHOTO_URL, caption=welcome_msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Join Our Channel ✅", url=CHANNEL_LINK)]]),
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    else:
+        await message.reply(welcome_msg, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
 
 @app.on_message(filters.text & filters.regex("^⚙️ Settings$"))
 async def show_main_settings_menu_reply(client, message):
@@ -741,11 +785,61 @@ async def show_main_settings_menu_reply(client, message):
 async def back_to_main_menu_reply(client, message):
     user_id = message.from_user.id
     user_states.pop(user_id, None)
-    if is_admin(user_id):
-        await message.reply("✅ **Returning to Command Center.**", reply_markup=main_menu_admin)
-    else:
-        await message.reply("✅ **Returning to Main System Interface.**", reply_markup=main_menu_user)
+    await message.reply("✅ **Returning to Main System Interface.**", reply_markup=get_main_menu(user_id))
     logger.info(f"User {user_id} returned to main menu via reply button.")
+
+@app.on_message(filters.text & filters.regex("^⭐ Premium Plans$"))
+async def premium_plans_reply(client, message):
+    await message.reply(
+        "👑 **Elevate Your Experience**\n\n"
+        "Unlock limitless uploads and advanced features with our premium plans.\n\n"
+        "**Choose a plan:**",
+        reply_markup=get_premium_plan_keyboard()
+    )
+
+@app.on_callback_query(filters.regex("^select_plan_"))
+async def premium_plan_selection(client, callback_query):
+    plan = callback_query.data.split('_')[-1]
+    
+    await callback_query.message.edit_text(
+        f"You have selected the **{plan.replace('_', ' ').capitalize()}** plan.\n\n"
+        "Please choose the platform you want to apply this plan to:",
+        reply_markup=get_platform_selection_keyboard('buy_premium')
+    )
+    user_states[callback_query.from_user.id] = {"step": "awaiting_platform_for_purchase", "plan": plan}
+
+@app.on_callback_query(filters.regex("^buy_premium_platform_"))
+async def handle_premium_purchase(client, callback_query):
+    user_id = callback_query.from_user.id
+    state = user_states.get(user_id, {})
+    plan = state.get("plan")
+    platform = callback_query.data.split('_')[-1]
+
+    if not plan:
+        await callback_query.answer("❌ Session expired. Please restart from the Premium Plans menu.", show_alert=True)
+        return
+
+    await callback_query.answer("Generating payment details...")
+    
+    settings = settings_collection.find_one({"_id": "global_config"})
+    payment_info = settings.get("payment_info", f"To proceed, please contact the administrator: @{ADMIN_TOM_USERNAME}")
+    payment_qr = settings.get("payment_qr_code", "https://i.postimg.cc/SXDxJ92z/x.jpg")
+    
+    message_text = (
+        f"**💰 Payment for {platform.capitalize()} Premium ({plan.replace('_', ' ').capitalize()} Plan)**\n\n"
+        f"**Price:** {PREMIUM_PLANS[plan]['price']}\n\n"
+        f"{payment_info}"
+    )
+    
+    await client.send_photo(
+        chat_id=user_id,
+        photo=payment_qr,
+        caption=message_text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ I Have Paid", callback_data="payment_confirm")]
+        ])
+    )
+    user_states.pop(user_id, None)
 
 @app.on_callback_query(filters.regex("^settings_main_menu_inline$"))
 async def settings_main_menu_inline_callback(client, callback_query):
@@ -763,10 +857,7 @@ async def back_to_main_menu_from_inline(client, callback_query):
     user_states.pop(user_id, None)
     await callback_query.answer("System redirection initiated...")
 
-    if is_admin(user_id):
-        await client.send_message(user_id, "✅ **Returning to Command Center.**", reply_markup=main_menu_admin)
-    else:
-        await client.send_message(user_id, "✅ **Returning to Main System Interface.**", reply_markup=main_menu_user)
+    await client.send_message(user_id, "✅ **Returning to Main System Interface.**", reply_markup=get_main_menu(user_id))
     try:
         await callback_query.message.delete()
         logger.info(f"Deleted inline message for user {user_id}.")
@@ -791,23 +882,31 @@ async def settings_user_menu_callback(client, callback_query):
 @app.on_callback_query(filters.regex("^settings_my_plan$"))
 async def show_my_plan(client, callback_query):
     user_id = callback_query.from_user.id
-    plan, expiry, uploads = get_user_plan_and_expiry(user_id)
-    user_doc = get_user_data(user_id)
-    
-    if plan == "free" or plan is None:
-        message_text = "🆓 **Your Current Plan:** Free\n"
-        message_text += "You have a basic plan with limited features."
-    else:
-        uploads_today = user_doc.get("uploads_today", 0)
-        quota = PREMIUM_PLANS.get(plan, {}).get("upload_quota")
-
-        message_text = f"👑 **Your Current Plan:** {plan.capitalize()}\n"
-        if expiry:
-            message_text += f"**Expires On:** `{expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC`\n"
-        if quota:
-            message_text += f"**Daily Quota:** `{uploads_today}` / `{quota}` uploads today."
-    
     await callback_query.answer("Fetching plan details...")
+    
+    user_doc = get_user_data(user_id)
+    premium_data = user_doc.get("premium", {})
+    
+    message_text = "👑 **Your Current Premium Status:**\n\n"
+    
+    fb_plan_tier, fb_expiry, _ = get_user_plan_and_expiry(user_id, 'facebook')
+    if fb_plan_tier not in ["free", "trial"]:
+        message_text += f"**📘 Facebook Plan:** `{fb_plan_tier.replace('_', ' ').capitalize()}`\n"
+        message_text += f"**Expires On:** `{fb_expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC`\n\n"
+    
+    yt_plan_tier, yt_expiry, _ = get_user_plan_and_expiry(user_id, 'youtube')
+    if yt_plan_tier not in ["free", "trial"]:
+        message_text += f"**▶️ YouTube Plan:** `{yt_plan_tier.replace('_', ' ').capitalize()}`\n"
+        message_text += f"**Expires On:** `{yt_expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC`\n\n"
+
+    if "Expires On" not in message_text:
+        message_text += "You are currently on the **Free** plan.\n"
+        if user_doc.get("premium", {}).get("facebook", {}).get("type") == "trial":
+            message_text += f"Your Facebook trial expires on `{datetime.fromisoformat(premium_data['facebook']['until']).strftime('%Y-%m-%d %H:%M:%S')} UTC`.\n"
+        if user_doc.get("premium", {}).get("youtube", {}).get("type") == "trial":
+            message_text += f"Your YouTube trial expires on `{datetime.fromisoformat(premium_data['youtube']['until']).strftime('%Y-%m-%d %H:%M:%S')} UTC`.\n"
+        message_text += "Upgrade to a full plan for unlimited access!"
+
     await callback_query.message.edit_text(message_text, reply_markup=user_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
 
 @app.on_message(filters.text & filters.regex("^👤 Admin Panel$") & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
@@ -824,24 +923,114 @@ async def admin_users_list_inline(client, callback_query):
         logger.warning(f"Non-admin user {user_id} attempted to access admin_users_list.")
         return
     await callback_query.answer("Fetching system user directory...")
-    all_users = list(users_collection.find({}, {"_id": 1, "first_name": 1, "username": 1, "role": 1, "plan_tier": 1, "premium_expiry": 1}))
+    all_users = list(users_collection.find({}, {"_id": 1, "first_name": 1, "username": 1, "role": 1, "premium": 1}))
     user_list_text = "**👥 Registered System Users:**\n\n"
     if not all_users:
         user_list_text += "No user records found in the system database."
     else:
         for user in all_users:
             role = user.get("role", "user").capitalize()
-            plan_tier = user.get("plan_tier", "free").capitalize()
-            expiry_date_str = user.get("premium_expiry")
-            expiry_info = f", Expires: `{datetime.fromisoformat(expiry_date_str).strftime('%Y-%m-%d')}`" if expiry_date_str else ""
+            premium_status = []
+            for platform, data in user.get("premium", {}).items():
+                if data.get("status") == "active":
+                    expiry = datetime.fromisoformat(data['until'])
+                    expiry_info = f"Expires: `{expiry.strftime('%Y-%m-%d')}`" if data['type'] != 'lifetime' else "Lifetime"
+                    premium_status.append(f"{platform.capitalize()}: {data['type'].replace('_', ' ').capitalize()} ({expiry_info})")
+            
+            premium_info = "\n  " + "\n  ".join(premium_status) if premium_status else "Free"
+            
             user_list_text += (
                 f"• ID: `{user['_id']}`\n"
                 f"  Name: `{user.get('first_name', 'N/A')}`\n"
                 f"  Username: `@{user.get('username', 'N/A')}`\n"
-                f"  Status: `{role}`, Plan: `{plan_tier}`{expiry_info}\n\n"
+                f"  Status: `{role}`, Premium: `{premium_info}`\n\n"
             )
     await callback_query.edit_message_text(user_list_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed system users list.")
+
+# NEW FEATURE: Handler for the "Get User Info" button
+@app.on_callback_query(filters.regex("^admin_get_user_info_prompt$"))
+async def admin_get_user_info_prompt(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
+        return
+    
+    await callback_query.answer("Ready to inspect user.")
+    user_states[user_id] = {"step": AWAITING_USER_ID_FOR_INSPECTION}
+    await callback_query.edit_message_text(
+        "**🕵️ User Inspector**\n\n"
+        "Please send the **Telegram User ID** of the user you wish to inspect.",
+        reply_markup=Admin_markup
+    )
+
+# NEW FEATURE: Handler for receiving the user ID to inspect
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.from_user.id, {}).get("step") == AWAITING_USER_ID_FOR_INSPECTION))
+async def admin_inspect_user(client, message):
+    admin_id = message.from_user.id
+    if not is_admin(admin_id): return
+
+    try:
+        target_user_id = int(message.text.strip())
+    except ValueError:
+        await message.reply("❌ **Invalid ID.** Please provide a numeric Telegram User ID.", reply_markup=Admin_markup)
+        return
+    
+    user_doc = get_user_data(target_user_id)
+    
+    if not user_doc:
+        await message.reply(f"❌ **User Not Found.** No user with ID `{target_user_id}` exists in the database.", reply_markup=Admin_markup)
+        return
+
+    # Formatting the user info
+    info_text = f"**🕵️ User Profile: `{target_user_id}`**\n\n"
+    info_text += f"**Name:** `{user_doc.get('first_name', 'N/A')}`\n"
+    info_text += f"**Username:** `@{user_doc.get('username', 'N/A')}`\n"
+    info_text += f"**Role:** `{user_doc.get('role', 'user').capitalize()}`\n"
+    
+    join_date = user_doc.get('added_at')
+    if join_date:
+        info_text += f"**Date Joined:** `{join_date.strftime('%Y-%m-%d %H:%M')} UTC`\n"
+
+    info_text += "\n**⭐ Premium Status:**\n"
+    premium_data = user_doc.get("premium", {})
+    if not premium_data:
+        info_text += "  - No active plans.\n"
+    else:
+        for platform, data in premium_data.items():
+            if data.get("status") == "active":
+                plan_type = data.get('type', 'N/A').replace('_', ' ').capitalize()
+                expiry = datetime.fromisoformat(data['until'])
+                expiry_info = f"Expires: `{expiry.strftime('%Y-%m-%d')}`" if data['type'] != 'lifetime' else "**Lifetime**"
+                info_text += f"  - **{platform.capitalize()}:** `{plan_type}` ({expiry_info})\n"
+
+    info_text += "\n**📊 Upload Stats:**\n"
+    uploads_today = user_doc.get('uploads_today', {})
+    info_text += f"  - Facebook (Today): `{uploads_today.get('facebook', 0)}`\n"
+    info_text += f"  - YouTube (Today): `{uploads_today.get('youtube', 0)}`\n"
+
+    info_text += "\n**🔗 Linked Accounts:**\n"
+    fb_pages = user_doc.get('facebook_pages', [])
+    if fb_pages:
+        info_text += "**Facebook Pages:**\n"
+        for page in fb_pages:
+            active_marker = " (Active)" if page.get('id') == user_doc.get('facebook_selected_page_id') else ""
+            info_text += f"  - `{page.get('name', 'N/A')}`{active_marker}\n"
+    else:
+        info_text += "  - No Facebook pages linked.\n"
+
+    yt_accounts = user_doc.get('youtube_accounts', [])
+    if yt_accounts:
+        info_text += "**YouTube Channels:**\n"
+        for acc in yt_accounts:
+            active_marker = " (Active)" if acc.get('account_id') == user_doc.get('youtube_active_account_id') else ""
+            info_text += f"  - `{acc.get('channel_name', 'N/A')}`{active_marker}\n"
+    else:
+        info_text += "  - No YouTube channels linked.\n"
+
+    await message.reply(info_text, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
+    user_states.pop(admin_id, None)
+
 
 @app.on_callback_query(filters.regex("^admin_add_user_prompt$"))
 async def admin_add_user_prompt_inline(client, callback_query):
@@ -850,40 +1039,57 @@ async def admin_add_user_prompt_inline(client, callback_query):
         await callback_query.answer("🚫 **Unauthorized Access.**", show_alert=True)
         return
     await callback_query.answer("Initiating user upgrade protocol...")
-    user_states[user_id] = {"step": AWAITING_ADD_USER}
+    user_states[user_id] = {"step": AWAITING_ADD_PREMIUM}
+    
+    keyboard = []
+    for platform in ["facebook", "youtube"]:
+        for plan, details in PREMIUM_PLANS.items():
+            if plan in ["free", "trial"]: continue
+            keyboard.append([InlineKeyboardButton(f"Add {platform.capitalize()} {plan.replace('_', ' ').capitalize()}", callback_data=f"admin_add_user_plan_{platform}_{plan}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="back_to_admin_panel")])
+    
     await callback_query.edit_message_text(
-        "Please transmit the **Telegram User ID** and **plan duration (in days)**, separated by a space.\n"
-        "Example: `123456789 30`",
-        reply_markup=Admin_markup
+        "Please select the **plan** and **platform** you wish to grant to a user.\n"
+        "After selection, I will ask for the user ID.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
     logger.info(f"Admin {user_id} prompted to add premium user.")
+
+@app.on_callback_query(filters.regex("^admin_add_user_plan_"))
+async def admin_add_user_plan_selection(client, callback_query):
+    user_id = callback_query.from_user.id
+    parts = callback_query.data.split('_')
+    platform = parts[4]
+    plan = parts[5]
+    
+    user_states[user_id].update({"platform": platform, "plan": plan, "step": AWAITING_ADD_USER})
+
+    await callback_query.answer(f"Selected {platform.capitalize()} {plan.replace('_', ' ').capitalize()} plan.")
+    await callback_query.edit_message_text(
+        "Please transmit the **Telegram User ID** of the user you wish to grant this plan.\n"
+        "Example: `123456789`",
+        reply_markup=Admin_markup
+    )
 
 @app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_ADD_USER) & filters.create(lambda _, __, m: is_admin(m.from_user.id)))
 async def admin_add_user_id_input(client, message):
     user_id = message.from_user.id
+    state = user_states.get(user_id, {})
+    target_user_id_str = message.text.strip()
+    
     try:
-        target_user_id_str, days_str = message.text.strip().split()
         target_user_id = int(target_user_id_str)
-        days = int(days_str)
-        expiry_date = datetime.now(timezone.utc) + timedelta(days=days)
-        plan_tier = f"{days}day" if days in [2, 5, 8, 20, 30] else ("2mo" if days == 60 else ("6mo" if days == 180 else "1year"))
-
-        user_data_to_set = {
-            "is_premium": True,
-            "plan_tier": plan_tier,
-            "premium_expiry": expiry_date.isoformat(),
-            "uploads_today": 0
-        }
-
-        update_user_data(target_user_id, user_data_to_set)
-        await message.reply(f"✅ **Success!** User `{target_user_id}` has been granted **{plan_tier.capitalize()}** status expiring in **{days} days**.", reply_markup=Admin_markup)
-        try:
-            await client.send_message(target_user_id, f"🎉 **System Notification!** Your premium access has been extended by **{days} days**! Use `/start` to access your enhanced features.")
-        except Exception as e:
-            logger.warning(f"Could not notify user {target_user_id} about premium extension: {e}")
-        await log_to_channel(client, f"Admin `{message.from_user.id}` granted premium for `{days}` days to user `{target_user_id}`.")
-    except (ValueError, IndexError):
-        await message.reply("❌ **Input Error.** Invalid format. Please use `User ID days` (e.g., `123456789 30`).", reply_markup=Admin_markup)
+        if set_premium_plan(target_user_id, state["platform"], state["plan"]):
+            await message.reply(f"✅ **Success!** User `{target_user_id}` has been granted **PREMIUM** status for **{state['platform'].capitalize()}**.", reply_markup=Admin_markup)
+            try:
+                await client.send_message(target_user_id, f"🎉 **System Notification!** Your premium access for {state['platform'].capitalize()} has been granted! Use `/start` to access your enhanced features.")
+            except Exception as e:
+                logger.warning(f"Could not notify user {target_user_id} about premium extension: {e}")
+            await log_to_channel(client, f"Admin `{message.from_user.id}` granted premium for `{state['platform']}` to user `{target_user_id}`.")
+        else:
+            await message.reply("❌ **Error!** Failed to set premium plan.", reply_markup=Admin_markup)
+    except (ValueError, KeyError):
+        await message.reply("❌ **Input Error.** Invalid format or session data lost. Please use the buttons to restart the process.", reply_markup=Admin_markup)
     finally:
         user_states.pop(user_id, None)
 
@@ -914,17 +1120,13 @@ async def admin_remove_user_id_input(client, message):
             await message.reply("❌ **Security Alert!** Cannot revoke owner's premium status.", reply_markup=Admin_markup)
             return
 
-        user_doc = get_user_data(target_user_id)
-        if user_doc and user_doc.get("is_premium"):
-            update_user_data(target_user_id, {"is_premium": False, "plan_tier": "free", "premium_expiry": None})
-            await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS**.", reply_markup=Admin_markup)
-            try:
-                await client.send_message(target_user_id, "❗ **System Notification!** Your premium access has been revoked.")
-            except Exception as e:
-                logger.warning(f"Could not notify user {target_user_id} about premium revocation: {e}")
-            await log_to_channel(client, f"Admin `{message.from_user.id}` revoked premium from user `{target_user_id}`.")
-        else:
-            await message.reply(f"User `{target_user_id}` is not a premium user or no record found in the system.", reply_markup=Admin_markup)
+        update_user_data(target_user_id, {"premium": {}})
+        await message.reply(f"✅ **Success!** User `{target_user_id}` has been revoked from **PREMIUM ACCESS** on all platforms.", reply_markup=Admin_markup)
+        try:
+            await client.send_message(target_user_id, "❗ **System Notification!** Your premium access has been revoked.")
+        except Exception as e:
+            logger.warning(f"Could not notify user {target_user_id} about premium revocation: {e}")
+        await log_to_channel(client, f"Admin `{message.from_user.id}` revoked premium from user `{target_user_id}`.")
 
     except ValueError:
         await message.reply("❌ **Input Error.** Invalid User ID detected. Please transmit a numeric ID.", reply_markup=Admin_markup)
@@ -966,7 +1168,7 @@ async def broadcast_message_handler(client, message):
                 continue
             await client.send_message(target_user_id, f"📢 **ADMIN BROADCAST MESSAGE:**\n\n{text_to_broadcast}")
             success_count += 1
-            await asyncio.sleep(0.05) # Use asyncio.sleep in async functions
+            await asyncio.sleep(0.05)
         except Exception as e:
             fail_count += 1
             logger.warning(f"Failed to send broadcast to user {target_user_id}: {e}")
@@ -985,6 +1187,89 @@ async def cancel_broadcast_callback(client, callback_query):
     else:
         await callback_query.answer("No active broadcast protocol to terminate.", show_alert=True)
 
+@app.on_callback_query(filters.regex("^admin_bot_settings$"))
+async def admin_bot_settings(client, callback_query):
+    if not is_admin(callback_query.from_user.id): return
+    settings = settings_collection.find_one({"_id": "global_config"})
+    limit = settings.get("concurrent_uploads", 5)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Concurrent Uploads: {limit}", callback_data="admin_set_concurrent_uploads")],
+        [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="back_to_admin_panel")]
+    ])
+    await callback_query.edit_message_text("🔧 **Bot Settings:**\n\nConfigure global settings for the bot.", reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex("^back_to_admin_panel$"))
+async def back_to_admin_panel(client, callback_query):
+    if not is_admin(callback_query.from_user.id): return
+    await callback_query.edit_message_text("👋 **Administrator Command Center**", reply_markup=Admin_markup)
+
+@app.on_callback_query(filters.regex("^admin_payment_settings$"))
+async def admin_payment_settings(client, callback_query):
+    if not is_admin(callback_query.from_user.id): return
+    settings = settings_collection.find_one({"_id": "global_config"})
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Set Payment QR Code URL", callback_data="admin_set_payment_qr")],
+        [InlineKeyboardButton("Set Payment Info Text", callback_data="admin_set_payment_info")],
+        [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="back_to_admin_panel")]
+    ])
+    await callback_query.edit_message_text(f"💳 **Payment Settings**\n\n**Current QR URL:** `{settings.get('payment_qr_code')}`\n**Current Info:** `{settings.get('payment_info')}`", reply_markup=keyboard)
+
+@app.on_callback_query(filters.regex("^admin_set_concurrent_uploads$"))
+async def admin_set_concurrent_uploads_prompt(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id): return
+    user_states[user_id] = {"step": AWAITING_NEW_CONCURRENT_UPLOADS}
+    await callback_query.edit_message_text("Please enter the new limit for concurrent uploads (e.g., 5).")
+
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.from_user.id, {}).get("step") == AWAITING_NEW_CONCURRENT_UPLOADS))
+async def admin_set_concurrent_uploads_save(client, message):
+    user_id = message.from_user.id
+    if not is_admin(user_id): return
+    try:
+        new_limit = int(message.text.strip())
+        if not 1 <= new_limit <= 20: raise ValueError("Limit must be between 1 and 20.")
+        settings_collection.update_one({"_id": "global_config"}, {"$set": {"concurrent_uploads": new_limit}})
+        load_upload_semaphore()
+        await message.reply(f"✅ Concurrent upload limit updated to **{new_limit}**.")
+    except (ValueError, TypeError) as e:
+        await message.reply(f"❌ Invalid input. Please provide a number between 1 and 20. Error: {e}")
+    finally:
+        user_states.pop(user_id, None)
+
+@app.on_callback_query(filters.regex("^admin_set_payment_qr$"))
+async def admin_set_payment_qr_prompt(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id): return
+    user_states[user_id] = {"step": AWAITING_NEW_PAYMENT_QR}
+    await callback_query.edit_message_text("Please send the new URL for the Payment QR Code image.")
+
+@app.on_callback_query(filters.regex("^admin_set_payment_info$"))
+async def admin_set_payment_info_prompt(client, callback_query):
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id): return
+    user_states[user_id] = {"step": AWAITING_NEW_PAYMENT_INFO}
+    await callback_query.edit_message_text("Please send the new text for payment instructions.")
+
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.from_user.id, {}).get("step") == AWAITING_NEW_PAYMENT_QR))
+async def admin_set_payment_qr_save(client, message):
+    user_id = message.from_user.id
+    if not is_admin(user_id): return
+    
+    new_qr_url = message.text.strip()
+    settings_collection.update_one({"_id": "global_config"}, {"$set": {"payment_qr_code": new_qr_url}})
+    await message.reply(f"✅ Payment QR Code URL has been updated successfully.")
+    user_states.pop(user_id, None)
+
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.from_user.id, {}).get("step") == AWAITING_NEW_PAYMENT_INFO))
+async def admin_set_payment_info_save(client, message):
+    user_id = message.from_user.id
+    if not is_admin(user_id): return
+
+    new_payment_info = message.text.strip()
+    settings_collection.update_one({"_id": "global_config"}, {"$set": {"payment_info": new_payment_info}})
+    await message.reply(f"✅ Payment Info text has been updated successfully.")
+    user_states.pop(user_id, None)
+
 @app.on_callback_query(filters.regex("^admin_restart_bot$"))
 async def admin_restart_bot_callback(client, callback_query):
     user_id = callback_query.from_user.id
@@ -994,59 +1279,34 @@ async def admin_restart_bot_callback(client, callback_query):
     await callback_query.answer("System reboot sequence initiated...", show_alert=True)
     await callback_query.message.edit_text("🔄 **System Rebooting...** This may take a moment. Please send `/start` in a few seconds to re-establish connection.", reply_markup=None)
     await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) initiated bot restart.")
-    # A more graceful way to exit for process managers
     os.execv(sys.executable, ['python'] + sys.argv)
 
 @app.on_callback_query(filters.regex("^settings_bot_status_inline$"))
 async def settings_bot_status_inline_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    if not is_admin(user_id):
-        await callback_query.answer("🚫 **Access Restricted.** You are not authorized to access system diagnostics.", show_alert=True)
-        return
-
+    if not is_admin(callback_query.from_user.id): return
     await callback_query.answer("Fetching system diagnostics...")
     total_users = users_collection.count_documents({})
-    admin_users = users_collection.count_documents({"role": "admin"})
-    premium_users = users_collection.count_documents({"is_premium": True})
-    active_jobs = jobs_collection.count_documents({"status": {"$in": ["downloading", "processing", "transcoding", "uploading"]}})
-    failed_jobs_count = jobs_collection.count_documents({"status": "failed"})
-
-    total_fb_accounts = users_collection.count_documents({"facebook_pages": {"$ne": []}})
-    total_youtube_accounts = users_collection.count_documents({"youtube.logged_in": True})
-
-    total_uploads_count_agg = list(users_collection.aggregate([{"$group": {"_id": None, "total": {"$sum": "$total_uploads"}}}]))
-    total_uploads_count = total_uploads_count_agg[0]['total'] if total_uploads_count_agg else 0
-
+    premium_fb = users_collection.count_documents({"premium.facebook.status": "active"})
+    premium_yt = users_collection.count_documents({"premium.youtube.status": "active"})
+    cpu = psutil.cpu_percent()
+    ram = psutil.virtual_memory().percent
+    disk = psutil.disk_usage('/').percent
     stats_message = (
-        f"**📊 System Diagnostics & Statistics:**\n\n"
-        f"**User Matrix:**\n"
-        f"• Total Registered Users: `{total_users}`\n"
-        f"• System Administrators: `{admin_users}`\n"
-        f"• Premium Access Users: `{premium_users}`\n\n"
-        f"**Operational Metrics:**\n"
-        f"• Active Upload Jobs: `{active_jobs}`\n"
-        f"• Failed Jobs (Total): `{failed_jobs_count}`\n"
-        f"• Total Content Transmissions: `{total_uploads_count}`\n"
-        f"• Facebook Accounts Synced: `{total_fb_accounts}`\n"
-        f"• YouTube Accounts Synced: `{total_youtube_accounts}`\n\n"
+        f"**📊 System Diagnostics**\n\n"
+        f"**👤 User Base:**\n"
+        f"  - Total Users: `{total_users}`\n"
+        f"  - FB Premium: `{premium_fb}` | YT Premium: `{premium_yt}`\n\n"
+        f"**⚙️ System Health:**\n"
+        f"  - CPU Usage: `{cpu}%`\n"
+        f"  - RAM Usage: `{ram}%`\n"
+        f"  - Disk Usage: `{disk}%`"
     )
-    await callback_query.edit_message_text(stats_message, reply_markup=get_general_settings_inline_keyboard(user_id), parse_mode=enums.ParseMode.MARKDOWN)
-    await log_to_channel(client, f"Admin `{user_id}` (`{callback_query.from_user.username}`) viewed detailed system status.")
-
-# --- All other functions (Facebook, YouTube settings, etc.) remain the same ---
-# ... (The rest of the code from the previous turn) ...
-# To save space, only the changed functions are shown here. 
-# You should paste the rest of your unchanged code below this point.
-# The following is a placeholder for the rest of the functions from the previous provided code.
-# The complete code is very long, so I am including only the changed parts.
-
-# [PASTE THE REST OF YOUR UNCHANGED CODE HERE, STARTING FROM `show_facebook_settings` all the way to the end]
-# The functions below this comment are the same as the last version I sent.
+    await callback_query.edit_message_text(stats_message, reply_markup=Admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
 
 @app.on_callback_query(filters.regex("^settings_facebook$"))
 async def show_facebook_settings(client, callback_query):
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id) and not is_admin(user_id):
+    if not is_premium_user(user_id, 'facebook') and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing Facebook configurations...")
@@ -1059,18 +1319,17 @@ async def show_facebook_settings(client, callback_query):
 @app.on_callback_query(filters.regex("^settings_youtube$"))
 async def show_youtube_settings(client, callback_query):
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id) and not is_admin(user_id):
+    if not is_premium_user(user_id, 'youtube') and not is_admin(user_id):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Accessing YouTube configurations...")
     await callback_query.message.edit_text("▶️ **YouTube Configuration Module:**", reply_markup=youtube_settings_inline_menu)
     logger.info(f"User {user_id} accessed YouTube settings.")
 
-# --- NEW YouTube Login Flow (OAuth 2.0) ---
 @app.on_callback_query(filters.regex("^yt_login_prompt$"))
 async def yt_login_prompt(client, callback_query):
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
+    if not is_premium_user(user_id, 'youtube'):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Initiating YouTube OAuth 2.0 flow...")
@@ -1138,81 +1397,71 @@ async def yt_get_client_secret(client, message):
         user_states.pop(user_id, None)
         await message.reply(f"❌ **Error during URL generation:** `{e}`\nPlease check your Client ID and Secret, then restart the process.", reply_markup=youtube_settings_inline_menu)
 
-@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_YT_AUTH_CODE))
+@app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.from_user.id, {}).get("step") == AWAITING_YT_AUTH_CODE))
 async def yt_get_auth_code(client, message):
     user_id = message.from_user.id
     state_data = user_states.get(user_id)
-    if not state_data:
-        await message.reply("❌ **Session Expired.** Please restart the YouTube login flow.")
-        return
-    
-    redirect_response_url = message.text.strip()
+    if not state_data: return await message.reply("Session expired. Please restart the login process.")
     try:
-        temp_creds_json = state_data["flow_config"]
-        flow = Flow.from_client_config(temp_creds_json, scopes=GOOGLE_API_SCOPES, state=state_data["state"])
+        flow = Flow.from_client_config(state_data["flow_config"], scopes=GOOGLE_API_SCOPES, state=state_data["state"])
         flow.redirect_uri = REDIRECT_URI
-        
-        flow.fetch_token(authorization_response=redirect_response_url)
-        
+        flow.fetch_token(authorization_response=message.text.strip())
         creds = flow.credentials
         
-        youtube_data = {
-            "logged_in": True,
-            "access_token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_expiry": creds.expiry.isoformat(),
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret
+        youtube_api = build('youtube', 'v3', credentials=creds)
+        channels_response = youtube_api.channels().list(part='snippet', mine=True).execute()
+        channel_name = channels_response['items'][0]['snippet']['title'] if channels_response.get('items') else f"Account-{str(uuid4())[:4]}"
+        
+        new_account_id = str(uuid4())
+        youtube_account_data = {
+            "account_id": new_account_id, "channel_name": channel_name, "logged_in": True,
+            "access_token": creds.token, "refresh_token": creds.refresh_token,
+            "token_expiry": creds.expiry.isoformat(), "client_id": creds.client_id, "client_secret": creds.client_secret
         }
         
-        update_user_data(user_id, {"youtube": youtube_data})
-        
-        await message.reply(
-            f"✅ **YouTube Login Successful!**",
-            reply_markup=youtube_settings_inline_menu
+        users_collection.update_one(
+            {"_id": user_id},
+            {"$push": {"youtube_accounts": youtube_account_data}, "$set": {"youtube_active_account_id": new_account_id}},
+            upsert=True
         )
-        await log_to_channel(client, f"User `{user_id}` successfully linked YouTube.")
-        
+        await message.reply(f"✅ **Success!** Channel **'{channel_name}'** has been linked and set as active.", reply_markup=youtube_settings_inline_menu)
     except Exception as e:
-        await message.reply(f"❌ **Authentication Failed.** An error occurred: `{e}`. Please ensure you copied the full URL and that your `REDIRECT_URI` is set correctly.", reply_markup=youtube_settings_inline_menu)
-        logger.error(f"YouTube auth code exchange failed for user {user_id}: {e}")
+        await message.reply(f"❌ **Authentication Failed:** `{e}`. Please check the URL and try again.")
     finally:
         user_states.pop(user_id, None)
 
-@app.on_callback_query(filters.regex("^yt_check_expiry_date$"))
-async def yt_check_expiry_date(client, callback_query):
+
+@app.on_callback_query(filters.regex("^yt_manage_accounts$"))
+async def yt_manage_accounts_inline(client, callback_query):
     user_id = callback_query.from_user.id
-    await callback_query.answer("Retrieving YouTube token expiry data...")
     user_doc = get_user_data(user_id)
-    yt_data = user_doc.get("youtube", {})
-    
-    if not yt_data.get("logged_in"):
-        await callback_query.message.edit_text("❌ **No YouTube Account Linked.**", reply_markup=youtube_settings_inline_menu)
-        return
-        
-    creds = get_youtube_credentials(user_id)
-    
-    status_text = ""
-    if creds:
-        expiry_date = creds.expiry
-        if expiry_date > datetime.now(timezone.utc):
-            status_text = f"✅ Valid until: `{expiry_date.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
-        else:
-            status_text = "❌ Expired and refresh failed. Please log in again."
+    accounts = user_doc.get("youtube_accounts", [])
+    active_id = user_doc.get("youtube_active_account_id")
+    keyboard = []
+    if not accounts:
+        await callback_query.answer("No YouTube accounts linked yet.", show_alert=True)
     else:
-        status_text = "❌ Not Logged In or invalid credentials."
-        
-    info_text = f"🗓️ **YouTube Token Expiry Status:**\n{status_text}\n\n_**Note:** Tokens are refreshed automatically._"
-    
-    await callback_query.message.edit_text(info_text, reply_markup=youtube_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
+        for acc in accounts:
+            is_active = "✅ " if acc.get("account_id") == active_id else ""
+            channel_name = acc.get("channel_name", "Unknown Channel")
+            keyboard.append([InlineKeyboardButton(f"{is_active}{channel_name}", callback_data=f"yt_switch_account_{acc['account_id']}")])
+    keyboard.append([InlineKeyboardButton("🔗 Link New Account", callback_data="yt_login_prompt")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_youtube")])
+    await callback_query.edit_message_text("**🔑 Manage Your YouTube Accounts:**\n\nSelect an account to make it active for uploads.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+@app.on_callback_query(filters.regex("^yt_switch_account_"))
+async def yt_switch_account(client, callback_query):
+    user_id = callback_query.from_user.id
+    new_active_id = callback_query.data.split('_')[-1]
+    update_user_data(user_id, {"youtube_active_account_id": new_active_id})
+    await callback_query.answer("✅ Active YouTube account switched!", show_alert=True)
+    await yt_manage_accounts_inline(client, callback_query)
 
 
-
-# --- NEW conversational Facebook Login Flow (OAuth) ---
 @app.on_callback_query(filters.regex("^fb_oauth_login_prompt$"))
 async def fb_oauth_login_prompt(client, callback_query):
     user_id = callback_query.from_user.id
-    if not is_premium_user(user_id):
+    if not is_premium_user(user_id, 'facebook'):
         await callback_query.answer("⚠️ **Access Restricted.** This feature requires premium access.", show_alert=True)
         return
     await callback_query.answer("Starting Facebook OAuth Login...")
@@ -1246,10 +1495,24 @@ async def fb_get_oauth_token(client, message):
             page_info = {
                 "id": page_data['id'],
                 "name": page_data['name'],
-                "access_token": page_access_token
+                "access_token": page_access_token,
+                "is_active": True
             }
+            
+            user_doc = get_user_data(user_id)
+            pages = user_doc.get("facebook_pages", [])
+            for p in pages:
+                p["is_active"] = False
+            
+            for p in pages:
+                if p['id'] == page_info['id']:
+                    p.update(page_info)
+                    break
+            else:
+                pages.append(page_info)
+            
             update_user_data(user_id, {
-                "facebook_pages": [page_info],
+                "facebook_pages": pages,
                 "facebook_selected_page_id": page_data['id'],
                 "facebook_selected_page_name": page_data['name'],
             })
@@ -1268,30 +1531,49 @@ async def fb_get_oauth_token(client, message):
     except Exception as e:
         await message.reply(f"❌ **An unexpected error occurred:** `{e}`. Please try again.", reply_markup=facebook_settings_inline_menu)
 
-@app.on_callback_query(filters.regex("^fb_stats_status$"))
-async def fb_stats_status(client, callback_query):
+@app.on_callback_query(filters.regex("^fb_manage_accounts$"))
+async def fb_manage_accounts_inline(client, callback_query):
     user_id = callback_query.from_user.id
     user_doc = get_user_data(user_id)
-    page_name = user_doc.get("facebook_selected_page_name", "Not Logged In")
-    page_id = user_doc.get("facebook_selected_page_id", "N/A")
-
-    message_text = (
-        "📈 **Facebook Account Status**\n\n"
-        f"**Account Status:** {'✅ Logged In' if page_name != 'Not Logged In' else '❌ Not Logged In'}\n"
-        f"**Page Name:** `{page_name}`\n"
-        f"**Page ID:** `{page_id}`\n"
-        f"**Token Status:** The token is stored and will be used for uploads.\n"
-    )
-    await callback_query.answer("Fetching account status...")
-    await callback_query.message.edit_text(message_text, reply_markup=facebook_settings_inline_menu, parse_mode=enums.ParseMode.MARKDOWN)
-
-@app.on_callback_query(filters.regex("^fb_refresh_pages_list$"))
-async def refresh_facebook_pages(client, callback_query):
-    user_id = callback_query.from_user.id
-    user_doc = get_user_data(user_id)
-    user_access_token = user_doc.get("facebook_long_lived_token")
+    pages = user_doc.get("facebook_pages", [])
     
-    await callback_query.answer("This feature requires a user access token and is currently unavailable.", show_alert=True)
+    if not pages:
+        await callback_query.answer("No Facebook accounts linked. Please log in first.", show_alert=True)
+        return
+    
+    keyboard = []
+    for page in pages:
+        is_active = page.get("is_active", False)
+        checkmark = "✅ " if is_active else ""
+        button_text = f"{checkmark}{page['name']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"fb_switch_account_{page['id']}")])
+    
+    keyboard.append([InlineKeyboardButton("🔑 Link New Account", callback_data="fb_oauth_login_prompt")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_facebook")])
+    
+    await callback_query.message.edit_text("Select an active Facebook account to use for uploads:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+@app.on_callback_query(filters.regex("^fb_switch_account_"))
+async def fb_switch_account(client, callback_query):
+    user_id = callback_query.from_user.id
+    new_page_id = callback_query.data.split('_')[-1]
+    
+    user_doc = get_user_data(user_id)
+    pages = user_doc.get("facebook_pages", [])
+    
+    for page in pages:
+        page["is_active"] = (page["id"] == new_page_id)
+    
+    selected_page_name = next((p['name'] for p in pages if p['id'] == new_page_id), "N/A")
+    
+    update_user_data(user_id, {
+        "facebook_pages": pages,
+        "facebook_selected_page_id": new_page_id,
+        "facebook_selected_page_name": selected_page_name
+    })
+    
+    await callback_query.answer(f"Switched to account: {selected_page_name}", show_alert=True)
+    await fb_manage_accounts_inline(client, callback_query)
 
 @app.on_callback_query(filters.regex("^fb_set_title$"))
 async def fb_set_title_prompt(client, callback_query):
@@ -1462,66 +1744,56 @@ async def fb_set_privacy(client, callback_query):
     await log_to_channel(client, f"User `{user_id}` set Facebook privacy to `{privacy}`.")
     logger.info(f"User {user_id} set Facebook privacy to {privacy}.")
 
-@app.on_message(filters.text & filters.regex("^⬆️ Upload Content$"))
-async def prompt_platform_for_upload(client, message):
+@app.on_message(filters.text & filters.regex("^📘 Upload to Facebook$"))
+async def prompt_facebook_upload(client, message):
     user_id = message.chat.id
+    if not is_premium_user(user_id, 'facebook') and not is_admin(user_id):
+        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** for Facebook uploads. Please contact the administrator to upgrade your privileges.")
+        return
+
+    if not has_upload_quota(user_id, 'facebook') and not is_admin(user_id):
+        await message.reply("❌ **Quota Exceeded.** You have reached your daily upload limit for Facebook. Please upgrade your plan or try again tomorrow.")
+        return
+        
     user_doc = get_user_data(user_id)
-    if not user_doc:
-        await message.reply("⛔ **Access Denied!** Please send `/start` first to initialize your account in the system.")
+    if not user_doc.get("facebook_pages"):
+        await message.reply("❌ **Authentication Required.** You are not logged into Facebook. Please navigate to `⚙️ Settings` -> `📘 Facebook Settings` to configure your account first.", reply_markup=get_main_menu(user_id))
         return
 
-    if not is_premium_user(user_id) and not is_admin(user_id):
-        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** to use upload features. Please contact the administrator to upgrade your privileges.")
-        return
-
-    if not has_upload_quota(user_id) and not is_admin(user_id):
-        await message.reply("❌ **Quota Exceeded.** You have reached your daily upload limit. Please upgrade your plan or try again tomorrow.")
-        return
-    
+    user_states[user_id] = {"step": AWAITING_UPLOAD_TYPE_SELECTION, "platform": "facebook"}
     await message.reply(
-        "🚀 **Content Transmission Platform Selection.**\n\n"
-        "Please select the target platform for your upload:",
-        reply_markup=platform_selection_inline_menu
+        "What type of content are you transmitting to Facebook?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎥 Video", callback_data="upload_type_fb_video")],
+            [InlineKeyboardButton("🎞️ Reel", callback_data="upload_type_fb_reels")],
+            [InlineKeyboardButton("🖼️ Photo", callback_data="upload_type_fb_photo")]
+        ])
     )
-    logger.info(f"User {user_id} initiated generic upload flow, prompted for platform selection.")
+    logger.info(f"User {user_id} selected Facebook for upload, prompted for content type.")
 
-@app.on_callback_query(filters.regex("^upload_select_"))
-async def handle_upload_platform_selection(client, callback_query):
-    user_id = callback_query.from_user.id
-    platform = callback_query.data.split("_")[-1]
+@app.on_message(filters.text & filters.regex("^▶️ Upload to YouTube$"))
+async def prompt_youtube_upload(client, message):
+    user_id = message.chat.id
+    if not is_premium_user(user_id, 'youtube') and not is_admin(user_id):
+        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** for YouTube uploads. Please contact the administrator to upgrade your privileges.")
+        return
 
-    await callback_query.answer(f"Selected {platform.capitalize()} for upload.")
+    if not has_upload_quota(user_id, 'youtube') and not is_admin(user_id):
+        await message.reply("❌ **Quota Exceeded.** You have reached your daily upload limit for YouTube. Please upgrade your plan or try again tomorrow.")
+        return
     
     user_doc = get_user_data(user_id)
-    
-    if platform == "facebook":
-        if not user_doc.get("facebook_pages"):
-            await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into Facebook or haven't selected a page. Please navigate to `⚙️ Settings` -> `📘 Facebook Settings` to configure your account first.")
-            return
+    if not user_doc.get("youtube_accounts"):
+        await message.reply("❌ **Authentication Required.** You are not logged into YouTube. Please navigate to `⚙️ Settings` -> `▶️ YouTube Settings` to configure your account first.", reply_markup=get_main_menu(user_id))
+        return
 
-        user_states[user_id] = {"step": AWAITING_UPLOAD_TYPE_SELECTION, "platform": "facebook"}
-        await callback_query.message.edit_text(
-            "What type of content are you transmitting to Facebook?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎥 Video", callback_data="upload_type_fb_video")],
-                [InlineKeyboardButton("🎞️ Reel", callback_data="upload_type_fb_reels")],
-                [InlineKeyboardButton("🖼️ Photo", callback_data="upload_type_fb_photo")]
-            ])
-        )
-        logger.info(f"User {user_id} selected Facebook for upload, prompted for content type.")
-
-    elif platform == "youtube":
-        if not user_doc.get("youtube", {}).get("logged_in"):
-            await callback_query.message.edit_text("❌ **Authentication Required.** You are not logged into YouTube. Please navigate to `⚙️ Settings` -> `▶️ YouTube Settings` to configure your account first.")
-            return
-
-        user_states[user_id] = {"step": AWAITING_UPLOAD_FILE, "platform": "youtube"}
-        await callback_query.message.edit_text(
-            "🎥 **Content Transmission Protocol Active.** Please transmit your video file for YouTube now.",
-            reply_markup=None
-        )
-        await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
-        logger.info(f"User {user_id} selected YouTube for upload, awaiting file.")
+    user_states[user_id] = {"step": AWAITING_UPLOAD_FILE, "platform": "youtube"}
+    await message.reply(
+        "🎥 **Content Transmission Protocol Active.** Please transmit your video file for YouTube now.",
+        reply_markup=None
+    )
+    await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=get_main_menu(user_id))
+    logger.info(f"User {user_id} selected YouTube for upload, awaiting file.")
 
 @app.on_callback_query(filters.regex("^upload_type_fb_"))
 async def handle_facebook_upload_type_selection(client, callback_query):
@@ -1540,98 +1812,56 @@ async def handle_facebook_upload_type_selection(client, callback_query):
         f"🎥 **Content Transmission Protocol Active.** Please transmit your {'video' if upload_type != 'photo' else 'image'} file for Facebook now.",
         reply_markup=None
     )
-    await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=main_menu_user if not is_admin(user_id) else main_menu_admin)
+    await client.send_message(user_id, "You can use '🔙 Main Menu' to abort the transmission.", reply_markup=get_main_menu(user_id))
     logger.info(f"User {user_id} selected Facebook upload type '{upload_type}', awaiting file.")
 
-@app.on_message(filters.video | filters.photo)
+# REFINED - Integrated video processing correctly
+@app.on_message((filters.video | filters.photo) & filters.private)
+@with_user_lock
 async def handle_media_upload(client, message):
-    user_id = message.chat.id
-    if not get_user_data(user_id):
-        await message.reply("⛔ **Access Denied!** Please send `/start` first to initialize your account in the system.")
-        return
-
+    user_id = message.from_user.id
     state = user_states.get(user_id)
-    if not state or (state.get("step") != AWAITING_UPLOAD_FILE):
-        # Allow media sending even without a state, but don't process it.
-        # This prevents the bot from erroring out when a user sends a random video.
-        logger.warning(f"User {user_id} sent media without an active upload state. Ignoring.")
-        return
+    if not state or state.get("step") != AWAITING_UPLOAD_FILE: return
 
-    if not is_premium_user(user_id) and not is_admin(user_id):
-        await message.reply("❌ **Access Restricted.** You need **PREMIUM ACCESS** to upload content. Please contact the administrator.")
-        user_states.pop(user_id, None)
-        logger.warning(f"Non-premium user {user_id} attempted media upload.")
-        return
+    platform = state.get("platform")
+    if not (is_premium_user(user_id, platform) or is_admin(user_id)):
+        return await message.reply("❌ **Access Restricted.** Premium access is required for uploads.")
     
     file_info = message.video or message.photo
-    if file_info.file_size > 3 * 1024 * 1024 * 1024: # 3 GB Limit
-        await message.reply("❌ **File Size Limit Exceeded.** The maximum allowed file size is 3GB.")
-        user_states.pop(user_id, None)
-        return
+    if file_info.file_size > 4 * 1024 * 1024 * 1024:
+        return await message.reply("❌ **File Size Limit Exceeded.** Maximum file size is 4GB.")
 
-    if not os.path.exists("downloads"):
-        os.makedirs("downloads")
-    
-    initial_status_msg = await message.reply("⏳ **Data Acquisition In Progress...** Downloading your content.")
-    
-    job_id = jobs_collection.insert_one({
-        "user_id": user_id,
-        "platform": state["platform"],
-        "status": "downloading",
-        "start_time": datetime.utcnow()
-    }).inserted_id
-    user_states[user_id]["job_id"] = str(job_id)
-
+    status_msg = await message.reply("⏳ **Preparing file...**")
+    download_path, processed_path = None, None
     try:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        file_extension = os.path.splitext(file_info.file_name or "video.mp4")[1] if message.video else ".jpg"
-        download_filename = f"downloads/{user_id}_{timestamp}{file_extension}"
+        start_time = time.time()
+        download_path = await client.download_media(message, progress=download_progress_callback, progress_args=(client, status_msg, start_time))
         
-        file_path = await client.download_media(
-            message,
-            file_name=download_filename,
-            progress=download_progress_callback,
-            progress_args=(client, initial_status_msg)
+        # REFINED LOGIC - Always process video, but keep photo as is
+        if message.video:
+            await status_msg.edit_text("⏳ **Processing video...** This may take a moment.")
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                processed_path = await loop.run_in_executor(pool, process_video_for_upload, download_path)
+        else:
+            processed_path = download_path # If it's a photo, no processing needed
+
+        state["file_path"] = processed_path
+        state["source_filename"] = getattr(file_info, "file_name", "media")
+        state["step"] = AWAITING_UPLOAD_TITLE
+        
+        await status_msg.edit_text(
+            f"✅ **Processing Complete.**\n\n"
+            f"Now, please send the **title** for your `{platform.capitalize()}` upload."
         )
-        
-        user_states[user_id]["file_path"] = file_path
-        user_states[user_id]["step"] = AWAITING_UPLOAD_TITLE
-        
-        user_doc = get_user_data(user_id)
-        platform = state["platform"]
-        default_title = user_doc.get(f"{platform}_settings", {}).get("title", "Default Title")
-        
-        video_metadata = get_video_metadata(file_path) if message.video else None
-        
-        if video_metadata:
-            is_shorts_candidate = video_metadata['duration'] <= 60 and video_metadata.get('aspect_ratio', 1) < 1.0
-            
-            summary_msg = f"🎬 **File: {file_info.file_name or 'video'}** | ⏱️ {video_metadata['duration']:.0f}s | 📐 {video_metadata['width']}x{video_metadata['height']}\n\n"
-            
-            if platform == 'youtube' and is_shorts_candidate:
-                summary_msg += "Detected: **YouTube Shorts Candidate**"
-                state["upload_intent"] = "shorts"
-            else:
-                summary_msg += "Detected: **Normal Video**"
-                state["upload_intent"] = "video"
-
-            await initial_status_msg.edit_text(summary_msg)
-            await asyncio.sleep(1)
-
-            jobs_collection.update_one({"_id": job_id}, {"$set": {"analysis": video_metadata, "upload_intent": state.get("upload_intent")}})
-
-        await client.send_message(
-            user_id,
-            f"✅ **Download Complete.**\n\n"
-            f"📝 **Metadata Input Required.** Now, transmit the **title** for your `{platform.capitalize()}` content.\n"
-            f"_(Type 'skip' to use your default title: '{default_title}')_"
-        )
-        logger.info(f"User {user_id} media downloaded to {file_path}. Awaiting title.")
     except Exception as e:
-        await initial_status_msg.edit_text(f"❌ **Data Acquisition Failed.** Error downloading media: `{e}`")
-        logger.error(f"Failed to download media for user {user_id}: {e}", exc_info=True)
-        jobs_collection.update_one({"_id": job_id}, {"$set": {"status": "failed", "error": str(e)}})
+        await status_msg.edit_text(f"❌ **Error:** `{e}`")
+        logger.error(f"Error during media handling for user {user_id}: {e}", exc_info=True)
         user_states.pop(user_id, None)
+    finally:
+        # Clean up the original downloaded file if a processed version was created
+        if download_path and processed_path and download_path != processed_path and os.path.exists(download_path):
+            os.remove(download_path)
 
 @app.on_message(filters.text & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_UPLOAD_TITLE))
 async def handle_upload_title(client, message):
@@ -1737,12 +1967,11 @@ async def handle_thumbnail_selection(client, callback_query):
     if choice == "custom":
         state["thumbnail_choice"] = "custom"
         await callback_query.message.edit_text("Please send the **image file** you want to use as a thumbnail.")
-        user_states[user_id]["step"] = "awaiting_custom_thumbnail"
+        user_states[user_id]["step"] = AWAITING_CUSTOM_THUMBNAIL
     elif choice == "auto_generate":
         state["thumbnail_choice"] = "auto_generate"
         await callback_query.message.edit_text("⏳ **Generating thumbnail...** This might take a moment.")
         
-        # FIXED: Run blocking I/O in an executor to prevent freezing the bot
         loop = asyncio.get_event_loop()
         with concurrent.futures.ThreadPoolExecutor() as pool:
             thumbnail_path = await loop.run_in_executor(
@@ -1751,14 +1980,14 @@ async def handle_thumbnail_selection(client, callback_query):
         state["thumbnail_path"] = thumbnail_path
 
         if state["thumbnail_path"]:
-            await callback_query.message.delete() # Clean up the "Generating..." message
+            await callback_query.message.delete()
             user_states[user_id]["step"] = AWAITING_UPLOAD_VISIBILITY
             await prompt_visibility_selection(client, callback_query.message, user_id, state["platform"])
         else:
             await callback_query.message.edit_text("❌ **Thumbnail Generation Failed.** Please try uploading a custom one or check the logs.")
             user_states.pop(user_id, None)
 
-@app.on_message(filters.photo & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == "awaiting_custom_thumbnail"))
+@app.on_message(filters.photo & filters.private & filters.create(lambda _, __, m: user_states.get(m.chat.id, {}).get("step") == AWAITING_CUSTOM_THUMBNAIL))
 async def handle_custom_thumbnail(client, message):
     user_id = message.chat.id
     state = user_states.get(user_id)
@@ -1788,7 +2017,7 @@ async def prompt_visibility_selection(client, message, user_id, platform):
                 [InlineKeyboardButton("Unlisted", callback_data="visibility_unlisted")]
             ]
         )
-    else: # Facebook
+    else:
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Public", callback_data="visibility_public")],
@@ -1882,28 +2111,30 @@ async def handle_schedule_datetime_input(client, message):
         await message.reply(f"❌ **Operation Failed.** An error occurred while processing schedule time: `{e}`")
         logger.error(f"Error processing schedule time for user {user_id}: {e}", exc_info=True)
 
-# FIXED: Complete function rewrite to fix SyntaxError and improve robustness.
 async def initiate_upload(client, message, user_id):
-    """Initiates the actual content upload with a proper try/finally block for cleanup."""
     state = user_states.get(user_id)
     if not state:
         await client.send_message(user_id, "❌ **Upload Process Aborted.** Session state lost.")
         logger.error(f"Upload initiated without valid state for user {user_id}.")
         return
 
-    # Extract state variables early
     file_path = state.get("file_path")
     thumbnail_path = state.get("thumbnail_path")
-    processed_file_path = file_path  # Default to original file path
-
+    
     try:
-        # Check for essential data
         if not all([file_path, state.get("title"), state.get("description")]):
             await client.send_message(user_id, "❌ **Upload Failure.** Missing essential metadata. Please restart.")
             logger.error(f"Missing essential upload data for user {user_id}. State: {state}")
             return
 
-        job_id = ObjectId(state["job_id"])
+        job_id = jobs_collection.insert_one({
+            "user_id": user_id,
+            "platform": state["platform"],
+            "status": "processing",
+            "start_time": datetime.utcnow()
+        }).inserted_id
+        user_states[user_id]["job_id"] = str(job_id)
+        
         jobs_collection.update_one({"_id": job_id}, {"$set": {"status": "processing"}})
         status_msg = await client.send_message(user_id, "⏳ **Data Processing Initiated...**")
 
@@ -1915,16 +2146,13 @@ async def initiate_upload(client, message, user_id):
 
         for attempt in range(retries):
             try:
-                # --- Platform-specific logic ---
                 if state["platform"] == "facebook":
-                    # (Facebook upload logic as before)
-                    # This section is kept concise for the example. Your full logic goes here.
                     fb_access_token, fb_page_id = get_facebook_page_info(user_id)
                     if not fb_access_token: raise RuntimeError("Facebook login required.")
-
+                    
                     def fb_upload_task():
                         return upload_facebook_content(
-                            file_path=processed_file_path,
+                            file_path=file_path,
                             content_type=state.get("upload_type", "video").lower(),
                             title=state.get("title"),
                             description=state.get("description"),
@@ -1948,34 +2176,41 @@ async def initiate_upload(client, message, user_id):
                         raise RuntimeError(f"Facebook API did not return an ID. Response: {fb_result}")
 
                 elif state["platform"] == "youtube":
-                    # (YouTube upload logic as before)
-                    # This section is kept concise for the example. Your full logic goes here.
                     creds = get_youtube_credentials(user_id)
                     if not creds: raise RuntimeError("YouTube login required.")
                     
-                    def yt_upload_task():
+                    def yt_upload_task(status_message):
                         youtube = build('youtube', 'v3', credentials=creds)
                         body = {
                             'snippet': {'title': state.get('title'), 'description': state.get('description'), 'tags': state.get('tags', [])},
                             'status': {'privacyStatus': state.get('visibility')}
                         }
-                        if state.get('schedule_time'): body['status']['publishAt'] = state['schedule_time'].isoformat() + "Z"
+                        if state.get('schedule_time'):
+                            body['status']['publishAt'] = state['schedule_time'].isoformat() + "Z"
 
-                        media_file = MediaFileUpload(processed_file_path, chunksize=-1, resumable=True)
-                        request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media_file)
+                        media_file = MediaFileUpload(file_path, chunksize=-1, resumable=True)
+                        
+                        request = youtube.videos().insert(
+                            part=",".join(body.keys()),
+                            body=body,
+                            media_body=media_file
+                        )
                         
                         response = None
                         while response is None:
                             status, response = request.next_chunk()
                             if status:
-                                logger.info(f"Uploaded {int(status.progress() * 100)}% to YouTube.")
+                                asyncio.run_coroutine_threadsafe(
+                                    upload_progress_callback(status_message, status), 
+                                    client.loop
+                                )
                         return response
 
                     await status_msg.edit_text(f"📤 **Uploading to YouTube...** (Attempt {attempt + 1}/{retries})")
                     jobs_collection.update_one({"_id": job_id}, {"$set": {"status": "uploading"}})
 
                     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        yt_result = await asyncio.get_event_loop().run_in_executor(executor, yt_upload_task)
+                        yt_result = await asyncio.get_event_loop().run_in_executor(executor, yt_upload_task, status_msg)
                     
                     if yt_result and 'id' in yt_result:
                         await status_msg.edit_text(f"✅ **YouTube Upload Complete!** Video ID: `{yt_result['id']}`")
@@ -1991,28 +2226,23 @@ async def initiate_upload(client, message, user_id):
                     await status_msg.edit_text(f"❌ **Upload Failed.** Retrying in 5 seconds...")
                     await asyncio.sleep(5)
         
-        # After the loop
         if not upload_successful:
             await status_msg.edit_text(f"❌ **Upload Failed After All Retries.** Reason: `{last_error}`")
             jobs_collection.update_one({"_id": job_id}, {"$set": {"status": "failed", "error": last_error, "end_time": datetime.utcnow()}})
         else:
-            users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1, "uploads_today": 1}})
+            users_collection.update_one({"_id": user_id}, {"$inc": {"total_uploads": 1, f"uploads_today.{state['platform']}": 1}})
             jobs_collection.update_one({"_id": job_id}, {"$set": {"status": "success", "end_time": datetime.utcnow()}})
 
     finally:
-        # This cleanup block will ALWAYS run, regardless of success or failure.
         logger.info(f"Cleaning up files for job {state.get('job_id')}")
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
-            logger.info(f"Removed original file: {file_path}")
-        if processed_file_path and processed_file_path != file_path and os.path.exists(processed_file_path):
-            os.remove(processed_file_path)
-            logger.info(f"Removed processed file: {processed_file_path}")
+            logger.info(f"Removed processed file: {file_path}")
         if thumbnail_path and os.path.exists(thumbnail_path):
             os.remove(thumbnail_path)
             logger.info(f"Removed thumbnail: {thumbnail_path}")
         
-        user_states.pop(user_id, None) # Clear the user's state
+        user_states.pop(user_id, None)
         logger.info(f"State cleared for user {user_id}")
 
 # === KEEP ALIVE SERVER ===
@@ -2022,7 +2252,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
-            # Provide a simple, user-friendly response page
             html_content = """
             <html>
             <head><title>Authentication Successful</title></head>
@@ -2044,13 +2273,14 @@ def run_server():
     logger.info("Keep-alive HTTP server started on port 8080.")
     httpd.serve_forever()
 
-threading.Thread(target=run_server, daemon=True).start()
-
-# === START BOT ===
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
-        logger.info("Created 'downloads' directory.")
-
+    
+    initialize_global_settings()
+    load_upload_semaphore()
+    
+    threading.Thread(target=run_server, daemon=True).start()
+    
     logger.info("Bot system initiating...")
     app.run()
