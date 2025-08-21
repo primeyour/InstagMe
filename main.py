@@ -12,14 +12,18 @@ from functools import wraps, partial
 import re
 import time
 import requests
+import random
+import string
+from urllib.parse import urlparse, parse_qs
 
 # Load environment variables
 from dotenv import load_dotenv
-
 load_dotenv()
+
 # MongoDB
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
+
 # Pyrogram (Telegram Bot)
 from pyrogram import Client, filters, enums, idle
 from pyrogram.errors import UserNotParticipant, FloodWait
@@ -30,14 +34,24 @@ from pyrogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardRemove
 )
+
 # Google/YouTube Client
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
+
 # System Utilities
 import psutil
+
+# --- Enhanced YouTube Authentication ---
+# This dictionary will temporarily store a user's OAuth flow object, keyed by a unique state.
+oauth_flows = {}
+# Simple in-memory store for auth codes received by the local server.
+oauth_tokens = {}
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +61,7 @@ logging.basicConfig(
         logging.FileHandler("bot.log")
     ]
 )
-logger = logging.getLogger("YtBot")
+logger = logging.getLogger("YTFBUser")
 
 # === Load and Validate Environment Variables ===
 API_ID_STR = os.getenv("TELEGRAM_API_ID")
@@ -56,6 +70,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOG_CHANNEL_STR = os.getenv("LOG_CHANNEL_ID") # e.g., -1001234567890
 MONGO_URI = os.getenv("MONGO_DB")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
+# NEW: Required for the secure YouTube OAuth flow
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080")
+PORT_STR = os.getenv("PORT", "8080") # Port for the local redirect server
 
 # Validate required environment variables
 if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI]):
@@ -66,69 +83,93 @@ if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI]):
 API_ID = int(API_ID_STR)
 ADMIN_ID = int(ADMIN_ID_STR)
 LOG_CHANNEL = int(LOG_CHANNEL_STR) if LOG_CHANNEL_STR else None
+PORT = int(PORT_STR)
 
-# === Video Conversion Helpers ===
+# === Advanced Video Processing Helpers ===
 
-def needs_conversion(input_file: str) -> bool:
-    """
-    Checks if a video file needs conversion to be compatible (MP4/AAC).
-    Uses ffprobe to inspect the file's container and audio codec.
-    """
+def get_video_metadata(file_path: str) -> dict:
+    """Uses ffprobe to get detailed video metadata."""
     try:
         command = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-show_streams', input_file
+            '-show_format', '-show_streams', file_path
         ]
         result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
-        data = json.loads(result.stdout)
-        
-        format_name = data.get('format', {}).get('format_name', '')
-        is_compatible_container = any(x in format_name for x in ['mp4', 'mov', '3gp'])
+        return json.loads(result.stdout)
+    except (FileNotFoundError, subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        logger.error(f"Could not probe file '{file_path}': {e}")
+        return {}
 
-        audio_codec = 'none'
-        for stream in data.get('streams', []):
-            if stream.get('codec_type') == 'audio':
-                audio_codec = stream.get('codec_name')
-                break
-        
-        is_compatible_audio = (audio_codec == 'aac' or audio_codec == 'none')
-
-        if is_compatible_container and is_compatible_audio:
-            logger.info(f"'{input_file}' is already compatible. No conversion needed.")
-            return False
-        else:
-            logger.warning(f"'{input_file}' needs conversion (Container: {format_name}, Audio: {audio_codec}).")
-            return True
-
-    except FileNotFoundError:
-        logger.error("ffprobe/ffmpeg is not installed. Assuming conversion is needed as a fallback.")
-        return True
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        logger.error(f"Could not probe file '{input_file}'. Assuming conversion is needed.")
-        return True
-
-def fix_video_format(input_file: str, output_file: str) -> str:
-    """
-    Converts a video file to a web-compatible format (MP4 container, AAC audio).
-    """
+def generate_thumbnail(video_path: str, output_path: str) -> str | None:
+    """Intelligently generates a thumbnail by finding a visually complex scene."""
     try:
-        logger.info(f"Converting '{input_file}' to compatible format...")
-        command = [
-            'ffmpeg', '-y', '-i', input_file, '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
-            '-movflags', '+faststart', output_file
+        logger.info(f"Generating intelligent thumbnail for {video_path}...")
+        # Find a visually complex scene to use for the thumbnail
+        ffmpeg_command = [
+            'ffmpeg', '-i', video_path,
+            '-vf', "select='gt(scene,0.4)',scale=1280:-1",
+            '-frames:v', '1', '-q:v', '2',
+            output_path, '-y'
         ]
-        
+        subprocess.run(ffmpeg_command, check=True, capture_output=True)
+        logger.info(f"Thumbnail saved to {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Thumbnail generation failed: {e}. Falling back to a random frame.")
+        try:
+            # Fallback to a random frame in the first 30 seconds if scene detection fails
+            fallback_command = [
+                'ffmpeg', '-i', video_path, '-ss', str(random.randint(1, 29)),
+                '-vframes', '1', '-q:v', '2', output_path, '-y'
+            ]
+            subprocess.run(fallback_command, check=True, capture_output=True)
+            return output_path
+        except Exception as fallback_e:
+            logger.error(f"Fallback thumbnail generation also failed: {fallback_e}")
+            return None
+
+def process_video_for_upload(input_file: str, output_file: str) -> str:
+    """
+    Ensures the video is in a web-compatible format (H.264 video, AAC audio, MP4 container).
+    This function replaces the old `fix_video_format` and `needs_conversion`.
+    """
+    metadata = get_video_metadata(input_file)
+    if not metadata:
+        raise ValueError("Could not get video metadata. Assuming conversion is needed.")
+
+    v_codec = "none"
+    a_codec = "none"
+    for stream in metadata.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            v_codec = stream.get('codec_name')
+        elif stream.get('codec_type') == 'audio':
+            a_codec = stream.get('codec_name')
+
+    # If already compatible, just copy the file to avoid re-encoding
+    if v_codec == 'h264' and a_codec == 'aac' and 'mp4' in metadata.get('format', {}).get('format_name', ''):
+        logger.info(f"'{input_file}' is already compatible. No conversion needed.")
+        if input_file != output_file:
+            import shutil
+            shutil.copy(input_file, output_file)
+        return output_file
+
+    logger.warning(f"'{input_file}' needs conversion (Video: {v_codec}, Audio: {a_codec}).")
+    try:
+        command = [
+            'ffmpeg', '-y', '-i', input_file,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', # Good quality H.264
+            '-c:a', 'aac', '-b:a', '192k', # Standard AAC audio
+            '-movflags', '+faststart', # For web streaming
+            output_file
+        ]
         subprocess.run(command, check=True, capture_output=True, text=True)
         logger.info(f"Successfully converted video to '{output_file}'.")
         return output_file
-        
     except FileNotFoundError:
-        logger.critical("ffmpeg is not installed. Video conversion is not possible.")
-        raise FileNotFoundError("ffmpeg is not installed. Cannot process video files.")
+        raise FileNotFoundError("ffmpeg is not installed. Video processing is not possible.")
     except subprocess.CalledProcessError as e:
         logger.error(f"ffmpeg conversion failed for {input_file}. Error: {e.stderr}")
-        raise ValueError(f"Video format is incompatible and conversion failed. Error: {e.stderr}")
+        raise ValueError(f"Video format is incompatible and conversion failed.")
 
 
 # === Global Bot Settings ===
@@ -137,7 +178,7 @@ DEFAULT_GLOBAL_SETTINGS = {
     "special_event_title": "🎉 Special Event!",
     "special_event_message": "Enjoy our special event features!",
     "max_concurrent_uploads": 15,
-    "max_file_size_mb": 250,
+    "max_file_size_mb": 500, # Increased default limit
     "payment_settings": {
         "google_play_qr_file_id": "",
         "upi": "", "usdt": "", "btc": "", "others": "", "custom_buttons": {}
@@ -216,6 +257,7 @@ async def safe_task_wrapper(coro):
     try:
         await coro
     except asyncio.CancelledError:
+        # This is expected, so we log it as a warning
         logger.warning(f"Task {asyncio.current_task().get_name()} was cancelled.")
     except Exception:
         logger.exception(f"Unhandled exception in background task: {asyncio.current_task().get_name()}")
@@ -236,6 +278,7 @@ def to_bold_sans(text: str) -> str:
         's': '𝘀', 't': '𝘁', 'u': '𝘂', 'v': '𝘃', 'w': '𝘄', 'x': '𝘅', 'y': '𝘆', 'z': '𝘇',
         '0': '𝟬', '1': '𝟭', '2': '𝟮', '3': '𝟯', '4': '𝟰', '5': '𝟱', '6': '𝟲', '7': '𝟳', '8': '𝟴', '9': '𝟵'
     }
+    # Sanitize text to handle potential emoji or special characters gracefully
     sanitized_text = text.encode('utf-8', 'surrogatepass').decode('utf-8')
     return ''.join(bold_sans_map.get(char, char) for char in sanitized_text)
 
@@ -280,7 +323,9 @@ def get_main_keyboard(user_id, premium_platforms):
     if fb_buttons:
         buttons.insert(0, fb_buttons)
     if yt_buttons:
-        buttons.insert(1, yt_buttons)
+        # Insert YouTube buttons after Facebook buttons if they exist
+        insert_index = 1 if fb_buttons else 0
+        buttons.insert(insert_index, yt_buttons)
 
     buttons.append([KeyboardButton("⭐ ᴩʀᴇᴍɪᴜᴍ"), KeyboardButton("/premiumdetails")])
     if is_admin(user_id):
@@ -421,31 +466,28 @@ def get_progress_markup():
         [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ", callback_data="cancel_upload")]
     ])
 
-def get_upload_options_markup(platform):
-    """Markup shown AFTER deferred download and title set."""
+# NEW: Unified markup for the entire upload flow
+def get_upload_flow_markup(platform, step):
     buttons = []
-    if platform == 'youtube':
+    if step == "thumbnail":
         buttons.extend([
-            [InlineKeyboardButton("📄 ᴀᴅᴅ ᴅᴇꜱᴄʀɪᴩᴛɪᴏɴ", callback_data="add_description_yt")],
-            [InlineKeyboardButton("🏷️ ᴀᴅᴅ ᴛᴀɢꜱ", callback_data="add_tags_yt")],
-            [InlineKeyboardButton("🖼️ ᴀᴅᴅ ᴛʜᴜᴍʙɴᴀɪʟ", callback_data="add_thumbnail_yt")]
+            [InlineKeyboardButton("🖼️ ᴜᴩʟᴏᴀᴅ ᴄᴜꜱᴛᴏᴍ", callback_data="upload_flow_thumbnail_custom")],
+            [InlineKeyboardButton("🤖 ᴀᴜᴛᴏ-ɢᴇɴᴇʀᴀᴛᴇ", callback_data="upload_flow_thumbnail_auto")]
         ])
-    elif platform == 'facebook':
-         buttons.extend([
-            [InlineKeyboardButton("📄 ᴀᴅᴅ ᴅᴇꜱᴄʀɪᴩᴛɪᴏɴ", callback_data="add_description_fb")]
+    elif step == "visibility":
+        buttons.extend([
+            [InlineKeyboardButton("🌍 ᴩᴜʙʟɪᴄ", callback_data="upload_flow_visibility_public")],
+            [InlineKeyboardButton("🔒 ᴩʀɪᴠᴀᴛᴇ", callback_data="upload_flow_visibility_private")],
+            [InlineKeyboardButton("🔗 ᴜɴʟɪꜱᴛᴇᴅ", callback_data="upload_flow_visibility_unlisted")]
+        ])
+    elif step == "publish":
+        buttons.extend([
+            [InlineKeyboardButton("🚀 ᴩᴜʙʟɪꜱʜ ɴᴏᴡ", callback_data="upload_flow_publish_now")],
+            [InlineKeyboardButton("⏰ ꜱᴄʜᴇᴅᴜʟᴇ ʟᴀᴛᴇʀ", callback_data="upload_flow_publish_schedule")]
         ])
 
-    buttons.append([InlineKeyboardButton("⬆️ ᴜᴩʟᴏᴀᴅ", callback_data="upload_now")])
     buttons.append([InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ", callback_data="cancel_upload")])
     return InlineKeyboardMarkup(buttons)
-
-def get_yt_visibility_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌍 ᴩᴜʙʟɪᴄ", callback_data="set_visibility_public")],
-        [InlineKeyboardButton("🔒 ᴩʀɪᴠᴀᴛᴇ", callback_data="set_visibility_private")],
-        [InlineKeyboardButton("🔗 ᴜɴʟɪꜱᴛᴇᴅ", callback_data="set_visibility_unlisted")],
-        [InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ yᴛ ꜱᴇᴛᴛɪɴɢꜱ", callback_data="hub_settings_youtube")]
-    ])
 
 # ===================================================================
 # ====================== HELPER FUNCTIONS ===========================
@@ -456,6 +498,7 @@ def is_admin(user_id):
 
 async def _get_user_data(user_id):
     if db is None:
+        # Return a default structure if DB is offline
         return {"_id": user_id, "premium": {}}
     return await asyncio.to_thread(db.users.find_one, {"_id": user_id})
 
@@ -463,6 +506,7 @@ async def _save_user_data(user_id, data_to_update):
     if db is None:
         logger.warning(f"DB not connected. Skipping save for user {user_id}.")
         return
+    # Sanitize data before saving to prevent MongoDB errors
     serializable_data = {}
     for key, value in data_to_update.items():
         if isinstance(value, dict):
@@ -505,9 +549,11 @@ async def is_premium_for_platform(user_id, platform):
     if premium_type == "lifetime":
         return True
 
+    # Ensure premium_until is a datetime object before comparison
     if premium_until and isinstance(premium_until, datetime) and premium_until > datetime.utcnow():
         return True
 
+    # If premium has expired, update the status in the DB
     if premium_type and premium_until and premium_until <= datetime.utcnow():
         await asyncio.to_thread(
             db.users.update_one,
@@ -515,6 +561,7 @@ async def is_premium_for_platform(user_id, platform):
             {"$set": {f"premium.{platform}.status": "expired"}}
         )
         logger.info(f"Premium for {platform} expired for user {user_id}. Status updated in DB.")
+        return False
 
     return False
 
@@ -566,6 +613,7 @@ async def get_user_settings(user_id):
     if db is not None:
         settings = await asyncio.to_thread(db.settings.find_one, {"_id": user_id}) or {}
     
+    # Set default values for all expected keys to avoid KeyErrors
     # Facebook defaults
     settings.setdefault("caption_facebook", "")
     settings.setdefault("active_facebook_id", None)
@@ -583,6 +631,7 @@ async def safe_edit_message(message, text, reply_markup=None, parse_mode=enums.P
         if not message:
             logger.warning("safe_edit_message called with a None message object.")
             return
+        # Avoid editing if the message content is identical to prevent API errors
         current_text = getattr(message, 'text', '') or getattr(message, 'caption', '')
         if current_text and hasattr(current_text, 'strip') and current_text.strip() == text.strip() and message.reply_markup == reply_markup:
             return
@@ -592,15 +641,17 @@ async def safe_edit_message(message, text, reply_markup=None, parse_mode=enums.P
             parse_mode=parse_mode
         )
     except Exception as e:
+        # Ignore "MESSAGE_NOT_MODIFIED" as it's not a critical error
         if "MESSAGE_NOT_MODIFIED" not in str(e):
             logger.warning(f"Couldn't edit message: {e}")
 
 async def safe_reply(message, text, **kwargs):
-    """A helper to reply to a message, safely handling different message types."""
+    """A helper to reply to a message, safely handling potential errors."""
     try:
         await message.reply(text, **kwargs)
     except Exception as e:
         logger.error(f"Failed to reply to message {message.id}: {e}")
+        # As a fallback, try sending a new message to the chat
         try:
             await app.send_message(message.chat.id, text, **kwargs)
         except Exception as e2:
@@ -621,24 +672,42 @@ async def restart_bot(msg):
     shutdown_event.set()
 
 _progress_updates = {}
+_upload_progress = {} # For resumable API uploads
 
-def progress_callback_threaded(current, total, ud_type, msg_id, chat_id, start_time, last_update_time):
+# Thread-safe progress callback for Pyrogram downloads
+def download_progress_callback(current, total, ud_type, msg_id, chat_id, start_time, last_update_time):
     now = time.time()
     if now - last_update_time[0] < 2 and current != total:
         return
     last_update_time[0] = now
     
+    # Use a lock to prevent race conditions when updating the shared dictionary
     with threading.Lock():
         _progress_updates[(chat_id, msg_id)] = {
             "current": current, "total": total, "ud_type": ud_type, "start_time": start_time, "now": now
         }
 
+# Callback for YouTube resumable upload progress
+def youtube_upload_progress(response):
+    if response:
+        # This function will be called by the Google API client library
+        # `response` will be the video resource if the upload is complete.
+        # It's None otherwise. We use this to signal completion.
+        _upload_progress['status'] = 'complete'
+    else:
+        # You can access status.progress() if you need the percentage,
+        # but for simplicity, we just show a generic "uploading" message.
+        pass
+
 async def monitor_progress_task(chat_id, msg_id, progress_msg):
+    """Monitors and updates the progress of a download or upload."""
     try:
         while True:
             await asyncio.sleep(2)
+            # Check for download progress
             with threading.Lock():
                 update_data = _progress_updates.get((chat_id, msg_id))
+            
             if update_data:
                 current, total, ud_type, start_time, now = (
                     update_data['current'], update_data['total'], update_data['ud_type'],
@@ -652,23 +721,32 @@ async def monitor_progress_task(chat_id, msg_id, progress_msg):
                 progress_text = (
                     f"{to_bold_sans(f'{ud_type} Progress')}: `{progress_bar}`\n"
                     f"📊 **Percentage**: `{percentage:.2f}%`\n"
-                    f"✅ **Downloaded**: `{current / (1024 * 1024):.2f}` MB / `{total / (1024 * 1024):.2f}` MB\n"
+                    f"✅ **Done**: `{current / (1024 * 1024):.2f}` MB / `{total / (1024 * 1024):.2f}` MB\n"
                     f"🚀 **Speed**: `{speed / (1024 * 1024):.2f}` MB/s\n"
                     f"⏳ **ETA**: `{eta}`"
                 )
-                try:
-                    await safe_edit_message(
-                        progress_msg, progress_text,
-                        reply_markup=get_progress_markup(),
-                        parse_mode=None
-                    )
-                except Exception:
-                    pass
-            
-            if update_data and update_data['current'] == update_data['total']:
-                with threading.Lock():
-                    _progress_updates.pop((chat_id, msg_id), None)
+                await safe_edit_message(
+                    progress_msg, progress_text,
+                    reply_markup=get_progress_markup(),
+                    parse_mode=None # Use None for better compatibility with special characters
+                )
+                
+                if current == total:
+                    with threading.Lock():
+                        _progress_updates.pop((chat_id, msg_id), None)
+                    break # Exit monitor loop once download is complete
+
+            # Check for API upload progress (simplified)
+            elif _upload_progress.get('status') == 'uploading':
+                await safe_edit_message(
+                    progress_msg,
+                    "⬆️ " + to_bold_sans("Uploading To API... Please Wait."),
+                    reply_markup=get_progress_markup()
+                )
+            elif _upload_progress.get('status') == 'complete':
+                _upload_progress.clear()
                 break
+
     except asyncio.CancelledError:
         logger.info(f"Progress monitor task for msg {msg_id} was cancelled.")
 
@@ -681,6 +759,7 @@ def cleanup_temp_files(files_to_delete):
                 logger.error(f"Error deleting file {file_path}: {e}")
 
 def with_user_lock(func):
+    """A decorator to prevent a user from running multiple commands simultaneously."""
     @wraps(func)
     async def wrapper(client, message, *args, **kwargs):
         user_id = message.from_user.id
@@ -737,6 +816,7 @@ async def start(_, msg):
         await msg.reply(welcome_msg, reply_markup=trial_markup, parse_mode=enums.ParseMode.MARKDOWN)
         return
     else:
+        # Update user info on every start
         await _save_user_data(user_id, {"last_active": datetime.utcnow(), "username": msg.from_user.username})
 
     event_toggle = global_settings.get("special_event_toggle", False)
@@ -758,6 +838,9 @@ async def start(_, msg):
             if p_expiry:
                 remaining = p_expiry - datetime.utcnow()
                 premium_details_text += f"⭐ {platform.capitalize()} premium expires in: `{remaining.days} days, {remaining.seconds // 3600} hours`.\n"
+            elif p_data.get("type") == "lifetime":
+                 premium_details_text += f"⭐ {platform.capitalize()} premium: **Lifetime**\n"
+
 
     if not has_any_premium:
         premium_details_text = (
@@ -783,8 +866,12 @@ async def facebook_login_cmd(_, msg):
     if not await is_premium_for_platform(user_id, "facebook"):
         return await msg.reply("❌ " + to_bold_sans("Facebook Premium Access Is Required. Use /premiumplan To Upgrade."))
     
-    user_states[user_id] = {"action": "waiting_for_fb_app_id"}
-    await msg.reply("🆔 " + to_bold_sans("Please Send Your Facebook App ID."))
+    # Start the Facebook login flow
+    user_states[user_id] = {"action": "waiting_for_fb_token"}
+    await msg.reply(
+        "🔑 " + to_bold_sans("Please Send Your Long-lived Facebook Page Access Token.") + "\n\n"
+        "This token must have `pages_show_list` and `pages_manage_posts` permissions."
+    )
 
 @app.on_message(filters.command(["ytlogin", "ylogin"]))
 @with_user_lock
@@ -793,8 +880,16 @@ async def youtube_login_cmd(_, msg):
     if not await is_premium_for_platform(user_id, "youtube"):
         return await msg.reply("❌ " + to_bold_sans("YouTube Premium Access Is Required. Use /premiumplan To Upgrade."))
     
-    user_states[user_id] = {"action": "waiting_for_yt_client_id"}
-    await msg.reply("🆔 " + to_bold_sans("Please Send Your Google OAuth Client ID."))
+    user_states[user_id] = {"action": "waiting_for_yt_client_secrets_json"}
+    await msg.reply(
+        "🤫 " + to_bold_sans("Please Send Your Google OAuth `client_secrets.json` File.") + "\n\n"
+        "1. Go to the [Google Cloud Console](https://console.cloud.google.com/apis/credentials).\n"
+        "2. Create or select a project.\n"
+        "3. Go to **Credentials**, click **+ CREATE CREDENTIALS**, and choose **OAuth client ID**.\n"
+        "4. Select **Desktop app** as the application type.\n"
+        "5. Download the JSON file and send it here.",
+        disable_web_page_preview=True
+    )
 
 @app.on_message(filters.command(["buypypremium", "premiumplan"]))
 @app.on_message(filters.regex("⭐ ᴩʀᴇᴍɪᴜᴍ"))
@@ -864,7 +959,7 @@ async def broadcast_cmd(_, msg):
             if user["_id"] == ADMIN_ID: continue
             await app.send_message(user["_id"], broadcast_message, parse_mode=enums.ParseMode.MARKDOWN)
             sent_count += 1
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1) # Small delay to avoid hitting API limits
         except Exception as e:
             failed_count += 1
             logger.error(f"Failed to send broadcast to user {user['_id']}: {e}")
@@ -882,16 +977,17 @@ async def handle_skip_command(_, msg):
     state_data = user_states.get(user_id)
     if not state_data: return
 
+    # This command allows skipping optional steps in the upload flow
     action = state_data.get('action')
     if action == 'waiting_for_title':
-        file_info = state_data.get("file_info", {})
-        file_info["custom_title"] = None  # Signal to use default
-        user_states[user_id]["file_info"] = file_info
-        await _deferred_download_and_show_options(msg, file_info)
-    elif action in ['waiting_for_yt_description', 'waiting_for_yt_tags', 'waiting_for_yt_thumbnail']:
-        # This allows skipping optional steps
-        await upload_now_cb(app, type('obj', (object,), {'from_user': msg.from_user, 'message': state_data.get('status_msg')})())
-
+        state_data["file_info"]["title"] = None # Signal to use default
+        await process_upload_step(msg) # Move to next step
+    elif action == 'waiting_for_description':
+        state_data["file_info"]["description"] = "" # Use empty description
+        await process_upload_step(msg)
+    elif action == 'waiting_for_tags':
+        state_data["file_info"]["tags"] = "" # Use empty tags
+        await process_upload_step(msg)
 
 # ===================================================================
 # ======================== REGEX HANDLERS ===========================
@@ -934,6 +1030,7 @@ async def show_stats(_, msg):
     
     total_users = await asyncio.to_thread(db.users.count_documents, {})
     
+    # Efficiently count premium users with an aggregation pipeline
     pipeline = [
         {"$project": {
             "is_premium": {"$or": [
@@ -1010,11 +1107,16 @@ async def initiate_upload(_, msg):
     if not sessions:
         return await msg.reply(f"❌ " + to_bold_sans(f"Please Login To {platform.capitalize()} First Using /{platform[0]}login"), parse_mode=enums.ParseMode.MARKDOWN)
     
-    action = f"waiting_for_{platform}_{upload_type}"
-    user_states[user_id] = {"action": action, "platform": platform, "upload_type": upload_type}
+    action = f"waiting_for_media"
+    user_states[user_id] = {
+        "action": action,
+        "platform": platform,
+        "upload_type": upload_type,
+        "file_info": {} # Initialize file_info here
+    }
     
     media_type = "photo" if upload_type == "post" else "video"
-    await msg.reply("✅ " + to_bold_sans(f"Send The {media_type} File, Ready When You Are!"))
+    await msg.reply("✅ " + to_bold_sans(f"Send The {media_type} File, Ready When You Are!"), reply_markup=ReplyKeyboardRemove())
 
 
 # ===================================================================
@@ -1029,22 +1131,12 @@ async def handle_text_input(_, msg):
     await _save_user_data(user_id, {"last_active": datetime.utcnow()})
 
     if not state_data:
-        return await msg.reply(to_bold_sans("I Don't Understand That. Please Use The Menu Buttons."))
+        return # Ignore random text if user is not in a specific state
 
     action = state_data.get("action")
 
     # --- Login Flows ---
-    if action == "waiting_for_fb_app_id":
-        user_states[user_id]['app_id'] = msg.text.strip()
-        user_states[user_id]['action'] = 'waiting_for_fb_app_secret'
-        return await msg.reply("🤫 " + to_bold_sans("Please Send Your Facebook App Secret."))
-    
-    elif action == "waiting_for_fb_app_secret":
-        user_states[user_id]['app_secret'] = msg.text.strip()
-        user_states[user_id]['action'] = 'waiting_for_fb_token'
-        return await msg.reply("🔑 " + to_bold_sans("Please Send Your Long-lived Page Access Token."))
-    
-    elif action == "waiting_for_fb_token":
+    if action == "waiting_for_fb_token":
         token = msg.text.strip()
         login_msg = await msg.reply("🔐 " + to_bold_sans("Validating Token And Fetching Pages..."))
         
@@ -1068,59 +1160,24 @@ async def handle_text_input(_, msg):
             await safe_edit_message(login_msg, f"❌ " + to_bold_sans(f"Login Failed: Invalid token or API error. {e}"))
             if user_id in user_states: del user_states[user_id]
 
-    elif action == "waiting_for_yt_client_id":
-        user_states[user_id]['client_id'] = msg.text.strip()
-        user_states[user_id]['action'] = "waiting_for_yt_client_secret"
-        return await msg.reply("🤫 " + to_bold_sans("Please Send Your Google OAuth Client Secret."))
-
-    elif action == "waiting_for_yt_client_secret":
-        client_id = user_states[user_id]['client_id']
-        client_secret = msg.text.strip()
-
-        # Save secrets to state
-        user_states[user_id]['client_secret'] = client_secret
+    elif action == "waiting_for_yt_auth_url":
+        # User pastes the final URL from the browser after authenticating
+        redirect_response = msg.text.strip()
+        state = parse_qs(urlparse(redirect_response).query).get('state', [None])[0]
         
-        try:
-            flow = InstalledAppFlow.from_client_config(
-                {"web": {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
-                }},
-                scopes=["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"]
-            )
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-            auth_url, _ = flow.authorization_url(prompt='consent')
-            
-            user_states[user_id]['flow'] = flow
-            user_states[user_id]['action'] = 'waiting_for_yt_code'
-            await msg.reply(
-                f"🔗 {to_bold_sans('Click The Link Below To Authorize Your Account:')}\n\n"
-                f"`{auth_url}`\n\n"
-                f"{to_bold_sans('After Authorizing, Copy The Code And Paste It Here.')}",
-                disable_web_page_preview=True
-            )
-        except Exception as e:
-            logger.error(f"YouTube OAuth flow failed for {user_id}: {e}")
-            await msg.reply(f"❌ {to_bold_sans('Failed To Start Login Process.')} Error: {e}")
-            if user_id in user_states: del user_states[user_id]
+        if not state or state not in oauth_flows:
+            return await msg.reply("❌ " + to_bold_sans("Invalid or expired authentication link. Please try /ytlogin again."))
 
-    elif action == "waiting_for_yt_code":
-        code = msg.text.strip()
-        flow = user_states[user_id]['flow']
-        login_msg = await msg.reply("🔐 " + to_bold_sans("Fetching Tokens And Channel Info..."))
-        
+        flow = oauth_flows[state]
         try:
-            await asyncio.to_thread(flow.fetch_token, code=code)
+            await asyncio.to_thread(flow.fetch_token, authorization_response=redirect_response)
             credentials = flow.credentials
             
             youtube = build('youtube', 'v3', credentials=credentials)
             channels_response = await asyncio.to_thread(youtube.channels().list(part='snippet', mine=True).execute)
             
             if not channels_response.get('items'):
-                return await safe_edit_message(login_msg, "❌ " + to_bold_sans("No YouTube Channel Found For This Account."))
+                return await msg.reply("❌ " + to_bold_sans("No YouTube Channel Found For This Account."))
             
             channel = channels_response['items'][0]
             channel_id = channel['id']
@@ -1137,14 +1194,15 @@ async def handle_text_input(_, msg):
             user_settings["active_youtube_id"] = channel_id
             await save_user_settings(user_id, user_settings)
             
-            await safe_edit_message(login_msg, f"✅ " + to_bold_sans(f"YouTube Login Successful For Channel: {channel_name}!"))
+            await msg.reply(f"✅ " + to_bold_sans(f"YouTube Login Successful For Channel: {channel_name}!"))
             await send_log_to_channel(app, LOG_CHANNEL, f"📝 New YouTube Login: User `{user_id}`, Channel: `{channel_name}`")
-            if user_id in user_states: del user_states[user_id]
-        
         except Exception as e:
-            await safe_edit_message(login_msg, f"❌ " + to_bold_sans(f"Login Failed. Please Try /ytlogin Again. Error: {e}"))
-            logger.error(f"YouTube code exchange failed for {user_id}: {e}")
+            await msg.reply(f"❌ " + to_bold_sans(f"Login Failed. Please Try /ytlogin Again. Error: {e}"))
+            logger.error(f"YouTube token exchange failed for {user_id}: {e}")
+        finally:
+            if state in oauth_flows: del oauth_flows[state]
             if user_id in user_states: del user_states[user_id]
+
 
     # --- Settings Flow ---
     elif action.startswith("waiting_for_caption_"):
@@ -1180,25 +1238,27 @@ async def handle_text_input(_, msg):
 
     # --- Upload Flow ---
     elif action == "waiting_for_title":
-        file_info = state_data.get("file_info", {})
-        file_info["custom_title"] = msg.text
-        user_states[user_id]["file_info"] = file_info
-        await _deferred_download_and_show_options(msg, file_info)
-    
-    elif action in ["waiting_for_yt_description", "waiting_for_fb_description"]:
-        platform = "youtube" if "yt" in action else "facebook"
-        file_info = state_data.get("file_info", {})
-        file_info["description"] = msg.text
-        user_states[user_id]["file_info"] = file_info
-        await msg.reply("✅ " + to_bold_sans("Description Set! Choose Next Option Or Upload."))
-        user_states[user_id]['action'] = "waiting_for_upload_options"
-    
-    elif action == "waiting_for_yt_tags":
-        file_info = state_data.get("file_info", {})
-        file_info["tags"] = msg.text
-        user_states[user_id]["file_info"] = file_info
-        await msg.reply("✅ " + to_bold_sans("Tags Set! Choose Next Option Or Upload."))
-        user_states[user_id]['action'] = "waiting_for_upload_options"
+        state_data["file_info"]["title"] = msg.text
+        await process_upload_step(msg)
+    elif action == "waiting_for_description":
+        state_data["file_info"]["description"] = msg.text
+        await process_upload_step(msg)
+    elif action == "waiting_for_tags":
+        state_data["file_info"]["tags"] = msg.text
+        await process_upload_step(msg)
+    elif action == "waiting_for_schedule_time":
+        try:
+            # Expecting format like "YYYY-MM-DD HH:MM"
+            schedule_time_utc = datetime.fromisoformat(msg.text.strip())
+            if schedule_time_utc <= datetime.utcnow():
+                return await msg.reply("❌ " + to_bold_sans("Scheduled time must be in the future."))
+            
+            # YouTube API requires ISO 8601 format with 'Z' for UTC
+            state_data['file_info']['schedule_time'] = schedule_time_utc.isoformat() + "Z"
+            await process_upload_step(msg)
+        except ValueError:
+            await msg.reply("❌ " + to_bold_sans("Invalid format. Please use `YYYY-MM-DD HH:MM` in UTC."))
+
 
     # --- Admin Flow ---
     elif action == "waiting_for_target_user_id_premium_management":
@@ -1225,7 +1285,6 @@ async def handle_text_input(_, msg):
         finally:
             if user_id in user_states: del user_states[user_id]
             
-    # ... (Other admin text handlers like max_uploads, proxy, etc. are preserved below) ...
     elif action == "waiting_for_max_uploads":
         if not is_admin(user_id): return
         try:
@@ -1298,7 +1357,13 @@ async def manage_accounts_cb(_, query):
     if not logged_in_accounts:
         await query.answer(f"You have no {platform.capitalize()} accounts logged in. Let's add one.", show_alert=True)
         # This will trigger the login flow
-        await add_account_cb(app, type('obj', (object,), {'from_user': query.from_user, 'message': query.message, 'data': f'add_account_{platform}'})())
+        # We simulate a new callback query object to call the handler directly
+        class MockQuery:
+            def __init__(self, user, message, data):
+                self.from_user = user
+                self.message = message
+                self.data = data
+        await add_account_cb(app, MockQuery(query.from_user, query.message, f'add_account_{platform}'))
         return
 
     await safe_edit_message(query.message, "👤 " + to_bold_sans(f"Select Your Active {platform.capitalize()} Account"),
@@ -1308,18 +1373,24 @@ async def manage_accounts_cb(_, query):
 @app.on_callback_query(filters.regex("^select_acc_"))
 async def select_account_cb(_, query):
     user_id = query.from_user.id
-    _, platform, acc_id = query.data.split("_")
+    _, _, platform, acc_id = query.data.split("_")
     
     user_settings = await get_user_settings(user_id)
     user_settings[f"active_{platform}_id"] = acc_id
     await save_user_settings(user_id, user_settings)
     
     await query.answer(f"✅ Active account for {platform.capitalize()} has been updated.", show_alert=True)
-    await manage_accounts_cb(app, type('obj', (object,), {'from_user': query.from_user, 'message': query.message, 'data': f'manage_{platform}_accounts'}()) ) # Refresh panel
+    # Refresh the account management panel
+    class MockQuery:
+        def __init__(self, user, message, data):
+            self.from_user = user
+            self.message = message
+            self.data = data
+    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{platform}_accounts'))
 
 @app.on_callback_query(filters.regex("^confirm_logout_"))
 async def confirm_logout_cb(_, query):
-    _, platform, acc_id = query.data.split("_")
+    _, _, platform, acc_id = query.data.split("_")
     sessions = await load_platform_sessions(query.from_user.id, platform)
     acc_name = next((s['session_data']['name'] for s in sessions if s['account_id'] == acc_id), "Account")
     
@@ -1332,18 +1403,24 @@ async def confirm_logout_cb(_, query):
 @app.on_callback_query(filters.regex("^logout_acc_"))
 async def logout_account_cb(_, query):
     user_id = query.from_user.id
-    _, platform, acc_id_to_logout = query.data.split("_")
+    _, _, platform, acc_id_to_logout = query.data.split("_")
 
     await delete_platform_session(user_id, platform, acc_id_to_logout)
     
     user_settings = await get_user_settings(user_id)
     if user_settings.get(f"active_{platform}_id") == acc_id_to_logout:
         sessions = await load_platform_sessions(user_id, platform)
+        # Set the active account to the next available one, or None
         user_settings[f"active_{platform}_id"] = sessions[0]['account_id'] if sessions else None
         await save_user_settings(user_id, user_settings)
     
     await query.answer(f"✅ Logged out successfully.", show_alert=True)
-    await manage_accounts_cb(app, type('obj', (object,), {'from_user': query.from_user, 'message': query.message, 'data': f'manage_{platform}_accounts'}()) )
+    class MockQuery:
+        def __init__(self, user, message, data):
+            self.from_user = user
+            self.message = message
+            self.data = data
+    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{platform}_accounts'))
 
 @app.on_callback_query(filters.regex("^add_account_"))
 async def add_account_cb(_, query):
@@ -1354,60 +1431,68 @@ async def add_account_cb(_, query):
         return await query.answer("❌ This is a premium feature.", show_alert=True)
     
     if platform == "facebook":
-        user_states[user_id] = {"action": "waiting_for_fb_app_id"}
-        await safe_edit_message(query.message, "🆔 " + to_bold_sans("Please Send Your Facebook App ID."))
+        user_states[user_id] = {"action": "waiting_for_fb_token"}
+        await safe_edit_message(query.message, "🔑 " + to_bold_sans("Please Send Your Facebook Page Access Token."))
     elif platform == "youtube":
-        user_states[user_id] = {"action": "waiting_for_yt_client_id"}
-        await safe_edit_message(query.message, "🆔 " + to_bold_sans("Please Send Your Google OAuth Client ID."))
+        user_states[user_id] = {"action": "waiting_for_yt_client_secrets_json"}
+        await safe_edit_message(query.message, "🤫 " + to_bold_sans("Please Send Your Google OAuth `client_secrets.json` File."))
 
 # --- General Callbacks ---
 @app.on_callback_query(filters.regex("^cancel_upload$"))
 async def cancel_upload_cb(_, query):
     user_id = query.from_user.id
     await query.answer("Upload cancelled.", show_alert=True)
-    await safe_edit_message(query.message, "❌ **" + to_bold_sans("Upload Cancelled") + "**\n\n" + to_bold_sans("Your Operation Has Been Successfully Cancelled."))
-
+    
     state_data = user_states.get(user_id, {})
+    status_msg = state_data.get('status_msg', query.message)
+    await safe_edit_message(status_msg, "❌ **" + to_bold_sans("Upload Cancelled") + "**\n\n" + to_bold_sans("Your Operation Has Been Successfully Cancelled."))
+
     file_info = state_data.get("file_info", {})
-    files_to_clean = [file_info.get("downloaded_path"), file_info.get("thumbnail_path")]
+    files_to_clean = [file_info.get("downloaded_path"), file_info.get("processed_path"), file_info.get("thumbnail_path")]
     
     cleanup_temp_files(files_to_clean)
     if user_id in user_states: del user_states[user_id]
     await task_tracker.cancel_all_user_tasks(user_id)
     logger.info(f"User {user_id} cancelled their upload.")
 
-@app.on_callback_query(filters.regex("^upload_now$"))
-async def upload_now_cb(_, query):
+# --- NEW: Upload Flow Callbacks ---
+@app.on_callback_query(filters.regex("^upload_flow_"))
+async def upload_flow_cb(_, query):
     user_id = query.from_user.id
+    data = query.data.replace("upload_flow_", "")
+    
     state_data = user_states.get(user_id)
     if not state_data or "file_info" not in state_data:
-        return await query.answer("❌ Error: No upload process found.", show_alert=True)
-    
-    file_info = state_data["file_info"]
-    status_msg = state_data.get("status_msg") or query.message
-    await safe_edit_message(status_msg, "🚀 " + to_bold_sans("Starting Upload Now..."))
-    await start_upload_task(status_msg, file_info, user_id=query.from_user.id)
-
-@app.on_callback_query(filters.regex("^(add_description|add_tags|add_thumbnail)_(fb|yt)$"))
-async def add_metadata_cb(_, query):
-    user_id = query.from_user.id
-    action, platform = query.data.split("_")
-    
-    state_data = user_states.get(user_id)
-    if not state_data or 'file_info' not in state_data:
         return await query.answer("❌ Error: State lost, please start over.", show_alert=True)
+    
+    parts = data.split("_")
+    step = parts[0]
+    choice = parts[1]
 
-    if action == 'add_description':
-        user_states[user_id]['action'] = f'waiting_for_{platform}_description'
-        await safe_edit_message(query.message, "📄 " + to_bold_sans("Please Send The Description."))
-    elif action == 'add_tags':
-        user_states[user_id]['action'] = 'waiting_for_yt_tags'
-        await safe_edit_message(query.message, "🏷️ " + to_bold_sans("Please Send Comma-separated Tags."))
-    elif action == 'add_thumbnail':
-        user_states[user_id]['action'] = 'waiting_for_yt_thumbnail'
-        await safe_edit_message(query.message, "🖼️ " + to_bold_sans("Please Send The Thumbnail Image."))
+    if step == "thumbnail":
+        if choice == "custom":
+            state_data['action'] = 'waiting_for_thumbnail'
+            await safe_edit_message(query.message, "🖼️ " + to_bold_sans("Please Send The Thumbnail Image."))
+        elif choice == "auto":
+            state_data['file_info']['thumbnail_path'] = "auto" # Signal for auto-generation
+            await process_upload_step(query)
+    elif step == "visibility":
+        state_data['file_info']['visibility'] = choice
+        await process_upload_step(query)
+    elif step == "publish":
+        if choice == "now":
+            state_data['file_info']['schedule_time'] = None
+            await process_upload_step(query)
+        elif choice == "schedule":
+            state_data['action'] = 'waiting_for_schedule_time'
+            await safe_edit_message(
+                query.message,
+                "⏰ " + to_bold_sans("Send Schedule Time (UTC)") + "\n\n"
+                "Format: `YYYY-MM-DD HH:MM`\n"
+                f"Current UTC time: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')}`"
+            )
 
-# --- Premium & Payment Callbacks (Largely Unchanged) ---
+# --- Premium & Payment Callbacks ---
 @app.on_callback_query(filters.regex("^buypypremium$"))
 async def buypypremium_cb(_, query):
     user_id = query.from_user.id
@@ -1519,6 +1604,7 @@ async def global_settings_panel_cb(_, query):
         "⚙️ **" + to_bold_sans("Global Bot Settings") + "**\n\n"
         f"**📢 Special Event:** `{global_settings.get('special_event_toggle', False)}`\n"
         f"**Max concurrent uploads:** `{global_settings.get('max_concurrent_uploads')}`\n"
+        f"**Max file size (MB):** `{global_settings.get('max_file_size_mb')}`\n"
     )
     await safe_edit_message(query.message, settings_text, reply_markup=get_admin_global_settings_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -1529,6 +1615,7 @@ async def back_to_cb(_, query):
     user_id = query.from_user.id
     await _save_user_data(user_id, {"last_active": datetime.utcnow()})
     
+    # Clean up state when going back
     await task_tracker.cancel_all_user_tasks(user_id)
     if user_id in user_states: del user_states[user_id]
         
@@ -1556,7 +1643,7 @@ async def activate_trial_cb(_, query):
     platform = query.data.split("_")[-1]
     
     if await is_premium_for_platform(user_id, platform):
-        return await query.answer(f"Your {platform.capitalize()} trial is already active!", show_alert=True)
+        return await query.answer(f"You already have an active premium/trial for {platform.capitalize()}!", show_alert=True)
 
     premium_until = datetime.utcnow() + timedelta(hours=6)
     user_data = await _get_user_data(user_id) or {}
@@ -1582,95 +1669,17 @@ async def activate_trial_cb(_, query):
     await query.message.reply(welcome_msg, reply_markup=get_main_keyboard(user_id, premium_platforms), parse_mode=enums.ParseMode.MARKDOWN)
     await query.message.delete()
 
-# ... (Other admin callbacks are preserved below) ...
-@app.on_callback_query(filters.regex("^toggle_special_event$"))
-async def toggle_special_event_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required", show_alert=True)
-    new_status = not global_settings.get("special_event_toggle", False)
-    await _update_global_setting("special_event_toggle", new_status)
-    await query.answer(f"Special Event toggled {'ON' if new_status else 'OFF'}.", show_alert=True)
-    await global_settings_panel_cb(app, query)
-
-@app.on_callback_query(filters.regex("^set_event_title$"))
-async def set_event_title_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required.", show_alert=True)
-    user_states[query.from_user.id] = {"action": "waiting_for_event_title"}
-    await safe_edit_message(query.message, "✏️ " + to_bold_sans("Please Send The New Title For The Special Event."))
-
-@app.on_callback_query(filters.regex("^set_event_message$"))
-async def set_event_message_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required.", show_alert=True)
-    user_states[query.from_user.id] = {"action": "waiting_for_event_message"}
-    await safe_edit_message(query.message, "💬 " + to_bold_sans("Please Send The New Message For The Special Event."))
-
-@app.on_callback_query(filters.regex("^set_max_uploads$"))
-@with_user_lock
-async def set_max_uploads_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required", show_alert=True)
-    user_states[query.from_user.id] = {"action": "waiting_for_max_uploads"}
-    current_limit = global_settings.get("max_concurrent_uploads")
-    await safe_edit_message(
-        query.message,
-        to_bold_sans(f"Please Send The New Max Number Of Concurrent Uploads.\ncurrent Limit: `{current_limit}`"),
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
-
-@app.on_callback_query(filters.regex("^reset_stats$"))
-@with_user_lock
-async def reset_stats_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required", show_alert=True)
-    await safe_edit_message(query.message, "⚠️ **WARNING!** " + to_bold_sans("Are You Sure You Want To Reset All Upload Stats?"),
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, reset stats", callback_data="confirm_reset_stats")],
-            [InlineKeyboardButton("❌ No, cancel", callback_data="admin_panel")]
-        ]), parse_mode=enums.ParseMode.MARKDOWN)
-
-@app.on_callback_query(filters.regex("^confirm_reset_stats$"))
-@with_user_lock
-async def confirm_reset_stats_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required", show_alert=True)
-    if db is None: return await query.answer("⚠️ Database unavailable.", show_alert=True)
+@app.on_callback_query(filters.regex("^set_visibility_"))
+async def set_visibility_cb(_, query):
+    user_id = query.from_user.id
+    visibility = query.data.split("_")[-1]
     
-    result = await asyncio.to_thread(db.uploads.delete_many, {})
-    await query.answer(f"✅ All stats reset! Deleted {result.deleted_count} uploads.", show_alert=True)
-    await admin_panel_cb(app, query)
-    await send_log_to_channel(app, LOG_CHANNEL, f"📊 Admin `{query.from_user.id}` has reset all bot upload stats.")
-
-@app.on_callback_query(filters.regex("^show_system_stats$"))
-async def show_system_stats_cb(_, query):
-    if not is_admin(query.from_user.id): return await query.answer("❌ Admin access required", show_alert=True)
-    try:
-        cpu_usage = psutil.cpu_percent(interval=1)
-        ram = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        system_stats_text = (
-            f"💻 **{to_bold_sans('System Stats')}**\n\n"
-            f"**CPU:** `{cpu_usage}%`\n"
-            f"**RAM:** `{ram.percent}%` (Used: `{ram.used / (1024**3):.2f}` GB / Total: `{ram.total / (1024**3):.2f}` GB)\n"
-            f"**Disk:** `{disk.percent}%` (Used: `{disk.used / (1024**3):.2f}` GB / Total: `{disk.total / (1024**3):.2f}` GB)\n\n"
-        )
-        gpu_info = ""
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu_info = "**GPU Info:**\n"
-                for i, gpu in enumerate(gpus):
-                    gpu_info += (
-                        f"  - **GPU {i}:** `{gpu.name}`\n"
-                        f"  - Load: `{gpu.load*100:.1f}%`, Temp: `{gpu.temperature}°C`\n"
-                    )
-        except Exception:
-            gpu_info = "Could not retrieve GPU info."
-            
-        system_stats_text += gpu_info
-        await safe_edit_message(
-            query.message, system_stats_text,
-            reply_markup=get_admin_global_settings_markup(),
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        await query.answer("❌ Failed to retrieve system stats.", show_alert=True)
-        logger.error(f"Error retrieving system stats: {e}")
+    settings = await get_user_settings(user_id)
+    settings["visibility_youtube"] = visibility
+    await save_user_settings(user_id, settings)
+    
+    await query.answer(f"✅ Default YouTube visibility set to {visibility}.", show_alert=True)
+    await safe_edit_message(query.message, "⚙️ " + to_bold_sans("Configure YouTube Settings:"), reply_markup=get_youtube_settings_markup())
 
 @app.on_callback_query(filters.regex("^select_fb_page_"))
 async def select_fb_page_cb(_, query):
@@ -1688,8 +1697,7 @@ async def select_fb_page_cb(_, query):
     session_data = {
         'id': page['id'],
         'name': page['name'],
-        'access_token': page['access_token'],
-        'app_id': state_data['app_id'] # Store for potential future use
+        'access_token': page['access_token']
     }
     await save_platform_session(user_id, "facebook", session_data)
 
@@ -1700,66 +1708,74 @@ async def select_fb_page_cb(_, query):
     await safe_edit_message(query.message, f"✅ " + to_bold_sans(f"Facebook Login Successful For Page: {page['name']}!"))
     await send_log_to_channel(app, LOG_CHANNEL, f"📝 New Facebook Login: User `{user_id}`, Page: `{page['name']}`")
     if user_id in user_states: del user_states[user_id]
-
-
-@app.on_callback_query(filters.regex("^set_visibility_"))
-async def set_visibility_cb(_, query):
-    user_id = query.from_user.id
-    visibility = query.data.split("_")[-1]
-    
-    settings = await get_user_settings(user_id)
-    settings["visibility_youtube"] = visibility
-    await save_user_settings(user_id, settings)
-    
-    await query.answer(f"✅ Default YouTube visibility set to {visibility}.", show_alert=True)
-    await safe_edit_message(query.message, "⚙️ " + to_bold_sans("Configure YouTube Settings:"), reply_markup=get_youtube_settings_markup())
-
-
 # ===================================================================
 # ======================== MEDIA HANDLERS ===========================
 # ===================================================================
 
-async def _deferred_download_and_show_options(msg, file_info):
-    """Downloads the media and then shows the final upload options."""
-    user_id = msg.from_user.id
-    
-    processing_msg = await msg.reply("⏳ " + to_bold_sans("Starting Download..."))
-    file_info["processing_msg"] = processing_msg
-    
-    try:
-        start_time = time.time()
-        last_update_time = [0]
-        task_tracker.create_task(monitor_progress_task(msg.chat.id, processing_msg.id, processing_msg), user_id=user_id, task_name="progress_monitor")
-        
-        file_info["downloaded_path"] = await app.download_media(
-            file_info["original_media_msg"],
-            progress=progress_callback_threaded,
-            progress_args=("Download", processing_msg.id, msg.chat.id, start_time, last_update_time)
-        )
-        
-        task_tracker.cancel_user_task(user_id, "progress_monitor")
+async def process_upload_step(msg_or_query):
+    """Central function to handle the step-by-step upload process."""
+    if hasattr(msg_or_query, 'from_user'): # Is a query
+        user_id = msg_or_query.from_user.id
+        status_msg = msg_or_query.message
+    else: # Is a message
+        user_id = msg_or_query.from_user.id
+        state = user_states.get(user_id, {})
+        status_msg = state.get('status_msg', msg_or_query)
 
-        title_preview = file_info.get('custom_title') or '*(Using Default Title)*'
-        if len(title_preview) > 100:
-            title_preview = title_preview[:100] + "..."
-            
-        await safe_edit_message(
-            processing_msg,
-            "📝 " + to_bold_sans("Title Ready. Choose Options Or Upload:") + f"\n\n**Preview:** `{title_preview}`",
-            reply_markup=get_upload_options_markup(file_info['platform']),
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-        user_states[user_id] = {"action": "waiting_for_upload_options", "file_info": file_info, "status_msg": processing_msg}
-        task_tracker.create_task(safe_task_wrapper(timeout_task(user_id, processing_msg.id)), user_id=user_id, task_name="timeout")
+    state_data = user_states[user_id]
+    file_info = state_data["file_info"]
+    platform = state_data["platform"]
+    user_settings = await get_user_settings(user_id)
 
-    except asyncio.CancelledError:
-        logger.info(f"Deferred download cancelled by user {user_id}.")
-        cleanup_temp_files([file_info.get("downloaded_path")])
-    except Exception as e:
-        logger.error(f"Error during deferred file download for user {user_id}: {e}", exc_info=True)
-        await safe_edit_message(processing_msg, f"❌ " + to_bold_sans(f"Download Failed: {e}"))
-        cleanup_temp_files([file_info.get("downloaded_path")])
-        if user_id in user_states: del user_states[user_id]
+    # Determine the current step based on what's missing in file_info
+    if "title" not in file_info:
+        state_data["action"] = "waiting_for_title"
+        default_title = user_settings.get(f'title_{platform}') or user_settings.get(f'caption_{platform}')
+        prompt = to_bold_sans("Media Received. First, Send Your Title.") + "\n\n"
+        prompt += "• " + to_bold_sans("Send Text Now") + "\n"
+        if default_title:
+            prompt += f"• Or use `/skip` to use your default: `{default_title[:50]}`"
+        else:
+            prompt += "• Or use `/skip` for no title."
+        await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+    elif "description" not in file_info:
+        state_data["action"] = "waiting_for_description"
+        default_desc = user_settings.get(f'description_{platform}')
+        prompt = to_bold_sans("Next, Send Your Description.") + "\n\n"
+        if default_desc:
+            prompt += f"• Or use `/skip` to use your default: `{default_desc[:50]}`"
+        else:
+            prompt += "• Or use `/skip` for no description."
+        await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+    elif platform == 'youtube' and "tags" not in file_info:
+        state_data["action"] = "waiting_for_tags"
+        default_tags = user_settings.get(f'tags_{platform}')
+        prompt = to_bold_sans("Now, Send Comma-separated Tags.") + "\n\n"
+        if default_tags:
+            prompt += f"• Or use `/skip` to use your default: `{default_tags[:50]}`"
+        else:
+            prompt += "• Or use `/skip` for no tags."
+        await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+    elif "thumbnail_path" not in file_info:
+        # This step is only for videos
+        is_video = file_info['original_media_msg'].video or (file_info['original_media_msg'].document and 'video' in file_info['original_media_msg'].document.mime_type)
+        if not is_video:
+            file_info['thumbnail_path'] = None # Skip for photos
+            await process_upload_step(msg_or_query)
+            return
+        state_data["action"] = "waiting_for_thumbnail_choice"
+        await safe_edit_message(status_msg, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
+    elif "visibility" not in file_info:
+        state_data["action"] = "waiting_for_visibility_choice"
+        await safe_edit_message(status_msg, to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
+    elif "schedule_time" not in file_info:
+        state_data["action"] = "waiting_for_publish_choice"
+        await safe_edit_message(status_msg, to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+    else:
+        # All info gathered, start the final upload
+        state_data["action"] = "finalizing"
+        await start_upload_task(status_msg, file_info, user_id)
+
 
 @app.on_message(filters.media & filters.private)
 @with_user_lock
@@ -1768,33 +1784,30 @@ async def handle_media_upload(_, msg):
     await _save_user_data(user_id, {"last_active": datetime.utcnow()})
     state_data = user_states.get(user_id, {})
 
+    # Handle admin settings media (e.g., QR code)
     if is_admin(user_id) and state_data and state_data.get("action") == "waiting_for_google_play_qr" and msg.photo:
-        # This is for the admin payment settings panel
         new_payment_settings = global_settings.get("payment_settings", {})
         new_payment_settings["google_play_qr_file_id"] = msg.photo.file_id
         await _update_global_setting("payment_settings", new_payment_settings)
         if user_id in user_states: del user_states[user_id]
         return await msg.reply("✅ " + to_bold_sans("Google Pay QR Code Image Saved!"), reply_markup=payment_settings_markup)
 
-    # Check for thumbnail upload during YouTube flow
-    if state_data and state_data.get("action") == 'waiting_for_yt_thumbnail':
+    # Handle thumbnail upload during the flow
+    if state_data and state_data.get("action") == 'waiting_for_thumbnail':
         if not msg.photo:
             return await msg.reply("❌ " + to_bold_sans("Please send an image file for the thumbnail."))
         
         status_msg = await msg.reply("🖼️ " + to_bold_sans("Downloading thumbnail..."))
         thumb_path = await app.download_media(msg.photo)
         state_data['file_info']['thumbnail_path'] = thumb_path
-        user_states[user_id]['action'] = "waiting_for_upload_options"
-        await status_msg.edit_text("✅ " + to_bold_sans("Thumbnail Set! Choose Next Option Or Upload."))
+        await status_msg.delete()
+        await process_upload_step(msg) # Move to next step
         return
 
+    # Main media handler for starting an upload
     action = state_data.get("action")
-    valid_actions = [
-        "waiting_for_facebook_post", "waiting_for_facebook_video", "waiting_for_facebook_reel",
-        "waiting_for_youtube_video", "waiting_for_youtube_short"
-    ]
-    if not action or action not in valid_actions:
-        return await msg.reply("❌ " + to_bold_sans("Please Use One Of The Upload Buttons First."))
+    if not action or action != "waiting_for_media":
+        return
 
     media = msg.video or msg.photo or msg.document
     if not media: return await msg.reply("❌ " + to_bold_sans("Unsupported Media Type."))
@@ -1803,18 +1816,32 @@ async def handle_media_upload(_, msg):
         if user_id in user_states: del user_states[user_id]
         return await msg.reply(f"❌ " + to_bold_sans(f"File Size Exceeds The Limit Of `{MAX_FILE_SIZE_BYTES / (1024 * 1024):.0f}` Mb."))
 
-    file_info = {
-        "platform": state_data["platform"],
-        "upload_type": state_data["upload_type"],
-        "original_media_msg": msg
-    }
-    
-    user_states[user_id] = {"action": "waiting_for_title", "file_info": file_info}
-    await msg.reply(
-        to_bold_sans("Media Received. First, Send Your Title.") + "\n\n" +
-        "• " + to_bold_sans("Send Text Now") + "\n" +
-        "• Or use `/skip` to use your default title."
-    )
+    # Download the file immediately
+    status_msg = await msg.reply("⏳ " + to_bold_sans("Starting Download..."))
+    state_data['status_msg'] = status_msg
+    try:
+        start_time = time.time()
+        last_update_time = [0]
+        task_tracker.create_task(monitor_progress_task(msg.chat.id, status_msg.id, status_msg), user_id=user_id, task_name="progress_monitor")
+        
+        downloaded_path = await app.download_media(
+            msg,
+            progress=download_progress_callback,
+            progress_args=("Download", status_msg.id, msg.chat.id, start_time, last_update_time)
+        )
+        
+        task_tracker.cancel_user_task(user_id, "progress_monitor")
+
+        state_data["file_info"] = {
+            "original_media_msg": msg,
+            "downloaded_path": downloaded_path
+        }
+        await process_upload_step(msg) # Start the step-by-step process
+
+    except Exception as e:
+        logger.error(f"Error during file download for user {user_id}: {e}", exc_info=True)
+        await safe_edit_message(status_msg, f"❌ " + to_bold_sans(f"Download Failed: {e}"))
+        if user_id in user_states: del user_states[user_id]
 
 
 # ===================================================================
@@ -1829,15 +1856,13 @@ async def start_upload_task(msg, file_info, user_id):
     )
 
 async def process_and_upload(msg, file_info, user_id):
-    platform = file_info["platform"]
-    upload_type = file_info["upload_type"]
-    processing_msg = file_info.get("processing_msg") or msg
+    platform = user_states[user_id]["platform"]
+    upload_type = user_states[user_id]["upload_type"]
+    processing_msg = user_states[user_id].get("status_msg") or msg
     
-    task_tracker.cancel_user_task(user_id, "timeout")
-
     async with upload_semaphore:
         logger.info(f"Semaphore acquired for user {user_id}. Starting upload to {platform}.")
-        files_to_clean = [file_info.get("downloaded_path"), file_info.get("thumbnail_path")]
+        files_to_clean = [file_info.get("downloaded_path"), file_info.get("processed_path"), file_info.get("thumbnail_path")]
         try:
             user_settings = await get_user_settings(user_id)
             
@@ -1845,48 +1870,54 @@ async def process_and_upload(msg, file_info, user_id):
             if not path or not os.path.exists(path):
                 raise FileNotFoundError("Downloaded file path is missing or invalid.")
             
-            # --- Video conversion check ---
+            # --- Video processing ---
             is_video = file_info['original_media_msg'].video or (file_info['original_media_msg'].document and 'video' in file_info['original_media_msg'].document.mime_type)
             upload_path = path
-            if is_video and await asyncio.to_thread(needs_conversion, path):
+            if is_video:
                 await safe_edit_message(processing_msg, "⚙️ " + to_bold_sans("Processing Video... This May Take A Moment."))
-                fixed_path = path.rsplit(".", 1)[0] + "_fixed.mp4"
-                converted_path = await asyncio.to_thread(fix_video_format, path, fixed_path)
-                files_to_clean.append(converted_path)
-                upload_path = converted_path
+                processed_path = path.rsplit(".", 1)[0] + "_processed.mp4"
+                upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
+                file_info['processed_path'] = upload_path
+            
+            # --- Thumbnail generation ---
+            if file_info.get("thumbnail_path") == "auto":
+                await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
+                thumb_output_path = path + ".jpg"
+                generated_thumb = await asyncio.to_thread(generate_thumbnail, upload_path, thumb_output_path)
+                file_info["thumbnail_path"] = generated_thumb
+                files_to_clean.append(generated_thumb)
 
-            await safe_edit_message(processing_msg, "⬆️ " + to_bold_sans(f"Uploading To {platform.capitalize()}... Please Wait."))
-
+            _upload_progress['status'] = 'uploading'
+            task_tracker.create_task(monitor_progress_task(user_id, processing_msg.id, processing_msg), user_id, "upload_monitor")
+            
             # --- Platform-specific upload logic ---
             url, media_id = "N/A", "N/A"
-            final_title = file_info.get("custom_title") if file_info.get("custom_title") is not None else user_settings.get(f"title_{platform}", user_settings.get(f"caption_{platform}", ""))
+            final_title = file_info.get("title") or user_settings.get(f"title_{platform}") or user_settings.get(f"caption_{platform}") or "Untitled"
             
             if platform == "facebook":
                 session = await get_active_session(user_id, 'facebook')
                 if not session: raise ConnectionError("Facebook session not found. Please /fblogin.")
                 page_id = session['id']
                 token = session['access_token']
-                description = file_info.get("description", "")
+                description = final_title + "\n\n" + file_info.get("description", "")
                 
                 if upload_type == 'post':
-                    # TODO: Implement Facebook photo post
                     with open(upload_path, 'rb') as f:
                         post_url = f"https://graph.facebook.com/{page_id}/photos"
-                        payload = {'access_token': token, 'caption': final_title + "\n\n" + description}
+                        payload = {'access_token': token, 'caption': description}
                         files = {'source': f}
-                        r = requests.post(post_url, data=payload, files=files)
+                        r = requests.post(post_url, data=payload, files=files, timeout=600)
                         r.raise_for_status()
                         post_id = r.json()['post_id']
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
                 else: # video or reel
-                    # TODO: Implement resumable video upload for robustness
                     endpoint = 'videos' if upload_type == 'video' else 'video_reels'
                     upload_url = f"https://graph-video.facebook.com/{page_id}/{endpoint}"
                     with open(upload_path, 'rb') as f:
-                        params = {'access_token': token, 'description': final_title + "\n\n" + description}
+                        params = {'access_token': token, 'description': description}
                         files = {'source': f}
-                        r = requests.post(upload_url, data=params, files=files, timeout=600)
+                        r = requests.post(upload_url, data=params, files=files, timeout=1800) # 30 min timeout
                         r.raise_for_status()
                         video_id = r.json()['id']
                         url = f"https://facebook.com/{video_id}"
@@ -1899,7 +1930,7 @@ async def process_and_upload(msg, file_info, user_id):
                 creds = Credentials.from_authorized_user_info(json.loads(session['credentials_json']))
                 if creds.expired and creds.refresh_token:
                     try:
-                        creds.refresh(requests.Request())
+                        creds.refresh(Request())
                         session['credentials_json'] = creds.to_json()
                         await save_platform_session(user_id, 'youtube', {'id': session['id'], 'name': session['name'], 'credentials_json': session['credentials_json']})
                     except RefreshError as e:
@@ -1907,26 +1938,28 @@ async def process_and_upload(msg, file_info, user_id):
 
                 youtube = build('youtube', 'v3', credentials=creds)
                 
-                description = file_info.get("description", user_settings.get("description_youtube", ""))
                 tags = file_info.get("tags", user_settings.get("tags_youtube", "")).split(',')
-                visibility = user_settings.get("visibility_youtube", "private")
+                visibility = file_info.get("visibility", user_settings.get("visibility_youtube", "private"))
                 thumbnail = file_info.get("thumbnail_path")
+                schedule_time = file_info.get("schedule_time")
 
                 body = {
                     "snippet": {
                         "title": final_title,
-                        "description": description,
+                        "description": file_info.get("description", user_settings.get("description_youtube", "")),
                         "tags": [tag.strip() for tag in tags if tag.strip()]
                     },
                     "status": {
-                        "privacyStatus": visibility
+                        "privacyStatus": "private" if schedule_time else visibility,
+                        "selfDeclaredMadeForKids": False
                     }
                 }
-                
+                if schedule_time:
+                    body["status"]["publishAt"] = schedule_time
+
                 media_file = MediaFileUpload(upload_path, chunksize=-1, resumable=True)
                 request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media_file)
                 
-                # TODO: Implement progress monitoring for resumable uploads
                 response = None
                 while response is None:
                     status, response = await asyncio.to_thread(request.next_chunk)
@@ -1936,10 +1969,13 @@ async def process_and_upload(msg, file_info, user_id):
                 media_id = response['id']
                 url = f"https://youtu.be/{media_id}"
 
-                if thumbnail:
-                    await asyncio.to_thread(youtube.thumbnails().set(videoId=media_id, media_body=MediaFileUpload(thumbnail)).execute)
+                if thumbnail and os.path.exists(thumbnail):
+                    await asyncio.to_thread(
+                        youtube.thumbnails().set(videoId=media_id, media_body=MediaFileUpload(thumbnail)).execute
+                    )
 
-
+            _upload_progress['status'] = 'complete'
+            task_tracker.cancel_user_task(user_id, "upload_monitor")
             if db is not None:
                 await asyncio.to_thread(db.uploads.insert_one, {
                     "user_id": user_id, "media_id": str(media_id),
@@ -1949,10 +1985,13 @@ async def process_and_upload(msg, file_info, user_id):
 
             log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n" \
                       f"👤 User: `{user_id}`\n🔗 URL: {url}\n📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
-            await safe_edit_message(processing_msg, f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}", parse_mode=None)
+            success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
+            if file_info.get('schedule_time'):
+                success_msg += f"\n\n⏰ Scheduled for: `{file_info['schedule_time']}`"
+            await safe_edit_message(processing_msg, success_msg, parse_mode=None)
             await send_log_to_channel(app, LOG_CHANNEL, log_msg)
 
-        except (ConnectionError, RefreshError, requests.RequestException, FileNotFoundError) as e:
+        except (ConnectionError, RefreshError, requests.RequestException, FileNotFoundError, ValueError) as e:
             error_msg = f"❌ " + to_bold_sans(f"Upload Failed: {e}")
             await safe_edit_message(processing_msg, error_msg)
             logger.error(f"Upload error for {user_id}: {e}")
@@ -1963,38 +2002,38 @@ async def process_and_upload(msg, file_info, user_id):
         finally:
             cleanup_temp_files(files_to_clean)
             if user_id in user_states: del user_states[user_id]
+            _upload_progress.clear()
             logger.info(f"Semaphore released for user {user_id}.")
 
-async def timeout_task(user_id, message_id):
-    await asyncio.sleep(900) # 15 minutes
-    if user_id in user_states:
-        state = user_states.pop(user_id)
-        logger.info(f"Task for user {user_id} timed out and was canceled. State was: {state.get('action')}")
-        try:
-            await app.edit_message_text(
-                chat_id=user_id, message_id=message_id,
-                text="⚠️ " + to_bold_sans("Timeout! The Operation Was Canceled Due To Inactivity.")
-            )
-            # Cleanup any downloaded files if timeout happens
-            file_info = state.get('file_info', {})
-            cleanup_temp_files([file_info.get("downloaded_path"), file_info.get("thumbnail_path")])
-        except Exception as e:
-            logger.warning(f"Could not send timeout message to user {user_id}: {e}")
-
-# === HTTP Server for Health Checks ===
-class HealthHandler(BaseHTTPRequestHandler):
+# === HTTP Server for OAuth and Health Checks ===
+class OAuthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
+        self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Bot is running")
-    def do_HEAD(self):
-        self.send_response(200)
+        
+        query_components = parse_qs(urlparse(self.path).query)
+        state = query_components.get('state', [None])[0]
+        
+        if state:
+            html_content = """
+            <html>
+                <head><title>Authentication Successful</title></head>
+                <body>
+                    <h1>✅ Authentication Successful!</h1>
+                    <p>You can close this window and return to Telegram.</p>
+                    <p>Please copy the full URL from your browser's address bar and paste it back to the bot.</p>
+                </body>
+            </html>
+            """
+            self.wfile.write(html_content.encode('utf-8'))
+        else:
+            self.wfile.write(b"Bot is running. This is the OAuth redirect endpoint.")
 
 def run_server():
     try:
-        server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
-        logger.info("HTTP health check server started on port 8080.")
+        server = HTTPServer(('0.0.0.0', PORT), OAuthHandler)
+        logger.info(f"HTTP OAuth/health server started on port {PORT}.")
         server.serve_forever()
     except Exception as e:
         logger.error(f"HTTP server failed: {e}")
@@ -2007,7 +2046,7 @@ async def send_log_to_channel(client, channel_id, text):
         await client.send_message(channel_id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Failed to log to channel {channel_id}: {e}")
-        valid_log_channel = False
+        valid_log_channel = False # Stop trying if it fails once
 
 # ===================================================================
 # ======================== BOT STARTUP ============================
@@ -2018,7 +2057,7 @@ async def start_bot():
     try:
         mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         mongo.admin.command('ping')
-        db = mongo.NowTok # Use a relevant DB name
+        db = mongo.UploaderBotDB # Use a relevant DB name
         logger.info("✅ Connected to MongoDB successfully.")
         
         settings_from_db = await asyncio.to_thread(db.settings.find_one, {"_id": "global_settings"}) or {}
@@ -2033,10 +2072,11 @@ async def start_bot():
         global_settings = DEFAULT_GLOBAL_SETTINGS.copy()
         merge_dicts(global_settings, settings_from_db)
 
+        # Ensure the settings in DB are up-to-date with defaults
         await asyncio.to_thread(db.settings.update_one, {"_id": "global_settings"}, {"$set": global_settings}, upsert=True)
         logger.info("Global settings loaded and synchronized.")
     except Exception as e:
-        logger.critical(f"❌ DATABASE SETUP FAILED: {e}. Running in degraded mode.")
+        logger.critical(f"❌ DATABASE SETUP FAILED: {e}. Running in degraded mode (no data persistence).")
         db = None
         global_settings = DEFAULT_GLOBAL_SETTINGS
 
@@ -2044,6 +2084,7 @@ async def start_bot():
     upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
     MAX_FILE_SIZE_BYTES = global_settings.get("max_file_size_mb") * 1024 * 1024
 
+    # Run the HTTP server in a separate thread
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
     
@@ -2056,7 +2097,7 @@ async def start_bot():
             await app.send_message(LOG_CHANNEL, "✅ **" + to_bold_sans("Bot Is Now Online And Running!") + "**", parse_mode=enums.ParseMode.MARKDOWN)
             valid_log_channel = True
         except Exception as e:
-            logger.error(f"Could not log to channel {LOG_CHANNEL}. Invalid or bot isn't admin. Error: {e}")
+            logger.error(f"Could not log to channel {LOG_CHANNEL}. Invalid ID or bot isn't an admin. Error: {e}")
             valid_log_channel = False
 
     logger.info("Bot is now online! Waiting for tasks...")
