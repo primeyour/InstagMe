@@ -21,12 +21,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # MongoDB
-from pymongo import MongoClient
+from pymongo import MongoClient, DESCENDING
 from pymongo.errors import OperationFailure
 
 # Pyrogram (Telegram Bot)
 from pyrogram import Client, filters, enums, idle
-from pyrogram.errors import UserNotParticipant, FloodWait
+from pyrogram.errors import UserNotParticipant, FloodWait, UserIsBlocked, BotBlocked
 from pyrogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -178,7 +178,8 @@ DEFAULT_GLOBAL_SETTINGS = {
     "special_event_title": "🎉 Special Event!",
     "special_event_message": "Enjoy our special event features!",
     "max_concurrent_uploads": 15,
-    "max_file_size_mb": 500, # Increased default limit
+    "max_file_size_mb": 1000, # New default
+    "allow_multiple_logins": False, # New setting
     "payment_settings": {
         "google_play_qr_file_id": "",
         "upi": "", "usdt": "", "btc": "", "others": "", "custom_buttons": {}
@@ -198,6 +199,7 @@ valid_log_channel = False
 
 # Pyrogram Client
 app = Client("upload_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+BOT_ID = 0 # Will be fetched on startup
 
 # --- Task Management ---
 class TaskTracker:
@@ -327,7 +329,7 @@ def get_main_keyboard(user_id, premium_platforms):
         insert_index = 1 if fb_buttons else 0
         buttons.insert(insert_index, yt_buttons)
 
-    buttons.append([KeyboardButton("⭐ ᴩʀᴇᴍɪᴜᴍ")]) # Removed /premiumdetails from button
+    buttons.append([KeyboardButton("⭐ ᴩʀᴇᴍɪᴜᴍ"), KeyboardButton("/premiumdetails")])
     if is_admin(user_id):
         buttons.append([KeyboardButton("🛠 ᴀᴅᴍɪɴ ᴩᴀɴᴇʟ"), KeyboardButton("🔄 ʀᴇꜱᴛᴀʀᴛ ʙᴏᴛ")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, selective=True)
@@ -389,15 +391,18 @@ admin_markup = InlineKeyboardMarkup([
 
 def get_admin_global_settings_markup():
     event_status = "ON" if global_settings.get("special_event_toggle") else "OFF"
+    multiple_logins_status = "Allowed" if global_settings.get("allow_multiple_logins") else "Blocked"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"📢 Special Event ({event_status})", callback_data="toggle_special_event")],
         [InlineKeyboardButton("✏️ Set Event Title", callback_data="set_event_title")],
         [InlineKeyboardButton("💬 Set Event Message", callback_data="set_event_message")],
-        [InlineKeyboardButton("ᴍᴀx ᴜᴩʟᴏᴀᴅ ᴜꜱᴇʀꜱ", callback_data="set_max_uploads")],
-        [InlineKeyboardButton("ʀᴇꜱᴇᴛ ꜱᴛᴀᴛꜱ", callback_data="reset_stats")],
-        [InlineKeyboardButton("ꜱʜᴏᴡ ꜱyꜱᴛᴇᴍ ꜱᴛᴀᴛꜱ", callback_data="show_system_stats")],
-        [InlineKeyboardButton("💰 ᴩᴀyᴍᴇɴᴛ ꜱᴇᴛᴛɪɴɢꜱ", callback_data="payment_settings_panel")],
-        [InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ᴀᴅᴍɪɴ", callback_data="admin_panel")]
+        [InlineKeyboardButton("⏫ Set Max Uploads", callback_data="set_max_uploads")],
+        [InlineKeyboardButton("🗂️ Set Max File Size (MB)", callback_data="set_max_file_size")],
+        [InlineKeyboardButton(f"👥 Multiple Logins ({multiple_logins_status})", callback_data="toggle_multiple_logins")],
+        [InlineKeyboardButton("🗑️ Reset All Stats", callback_data="reset_stats")],
+        [InlineKeyboardButton("💻 Show System Stats", callback_data="show_system_stats")],
+        [InlineKeyboardButton("💰 Payment Settings", callback_data="payment_settings_panel")],
+        [InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]
     ])
 
 payment_settings_markup = InlineKeyboardMarkup([
@@ -464,8 +469,9 @@ def get_payment_methods_markup():
     return InlineKeyboardMarkup(payment_buttons)
 
 def get_progress_markup():
+    # Buttons now use normal text as requested
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ", callback_data="cancel_upload")]
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
     ])
 
 # NEW: Unified markup for the entire upload flow
@@ -488,7 +494,7 @@ def get_upload_flow_markup(platform, step):
             [InlineKeyboardButton("⏰ ꜱᴄʜᴇᴅᴜʟᴇ ʟᴀᴛᴇʀ", callback_data="upload_flow_publish_schedule")]
         ])
 
-    buttons.append([InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ", callback_data="cancel_upload")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")])
     return InlineKeyboardMarkup(buttons)
 
 # ===================================================================
@@ -548,6 +554,10 @@ async def is_premium_for_platform(user_id, platform):
     premium_type = platform_premium.get("type")
     premium_until = platform_premium.get("until")
 
+    # DATETIME FIX: Make naive datetimes from DB aware before comparing
+    if premium_until and isinstance(premium_until, datetime) and premium_until.tzinfo is None:
+        premium_until = premium_until.replace(tzinfo=timezone.utc)
+
     if premium_type == "lifetime":
         return True
 
@@ -569,7 +579,12 @@ async def is_premium_for_platform(user_id, platform):
 
 async def save_platform_session(user_id, platform, session_data):
     if db is None: return
-    # session_data must contain a unique 'id' and a 'name'
+    
+    allow_multiple = global_settings.get("allow_multiple_logins", False)
+    if not allow_multiple:
+        # Delete all other sessions for this platform to enforce single login
+        await asyncio.to_thread(db.sessions.delete_many, {"user_id": user_id, "platform": platform})
+
     account_id = session_data['id']
     await asyncio.to_thread(
         db.sessions.update_one,
@@ -837,9 +852,15 @@ async def start(_, msg):
             has_any_premium = True
             p_data = user.get("premium", {}).get(platform, {})
             p_expiry = p_data.get("until")
+
+            # DATETIME FIX: Make naive datetimes from DB aware before comparing
+            if p_expiry and isinstance(p_expiry, datetime) and p_expiry.tzinfo is None:
+                p_expiry = p_expiry.replace(tzinfo=timezone.utc)
+
             if p_expiry:
                 remaining = p_expiry - datetime.now(timezone.utc)
-                premium_details_text += f"⭐ {platform.capitalize()} premium expires in: `{remaining.days} days, {remaining.seconds // 3600} hours`.\n"
+                if remaining.total_seconds() > 0:
+                    premium_details_text += f"⭐ {platform.capitalize()} premium expires in: `{remaining.days} days, {remaining.seconds // 3600} hours`.\n"
             elif p_data.get("type") == "lifetime":
                 premium_details_text += f"⭐ {platform.capitalize()} premium: **Lifetime**\n"
 
@@ -851,7 +872,7 @@ async def start(_, msg):
             "✅ Ultra-fast uploading & High Quality\n"
             "✅ No file size limit & unlimited uploads\n"
             "✅ Facebook & YouTube Support\n\n"
-            "👤 Contact Admin → [Admin Tom](https://t.me/CjjTom) to get premium\n"
+            "👤 Contact Admin to get premium\n"
             f"🆔 Your ID: `{user_id}`"
         )
     welcome_msg += premium_details_text
@@ -914,27 +935,33 @@ async def premium_details_cmd(_, msg):
             platform_premium = user.get("premium", {}).get(platform, {})
             premium_type = platform_premium.get("type")
             premium_until = platform_premium.get("until")
+
+            # DATETIME FIX: Make naive datetimes from DB aware before comparing
+            if premium_until and isinstance(premium_until, datetime) and premium_until.tzinfo is None:
+                premium_until = premium_until.replace(tzinfo=timezone.utc)
+
             status_text += f"**{platform.capitalize()} Premium:** "
             if premium_type == "lifetime":
                 status_text += "🎉 **Lifetime!**\n"
             elif premium_until:
                 remaining_time = premium_until - datetime.now(timezone.utc)
-                days, rem = divmod(remaining_time.total_seconds(), 86400)
-                hours, rem = divmod(rem, 3600)
-                minutes, _ = divmod(rem, 60)
-                status_text += (
-                    f"`{premium_type.replace('_', ' ').title()}` expires on: "
-                    f"`{premium_until.strftime('%Y-%m-%d %H:%M')} UTC`\n"
-                    f"Time Remaining: `{int(days)}d, {int(hours)}h, {int(minutes)}m`\n"
-                )
+                if remaining_time.total_seconds() > 0:
+                    days, rem = divmod(remaining_time.total_seconds(), 86400)
+                    hours, rem = divmod(rem, 3600)
+                    minutes, _ = divmod(rem, 60)
+                    status_text += (
+                        f"`{premium_type.replace('_', ' ').title()}` expires on: "
+                        f"`{premium_until.strftime('%Y-%m-%d %H:%M')} UTC`\n"
+                        f"Time Remaining: `{int(days)}d, {int(hours)}h, {int(minutes)}m`\n"
+                    )
             status_text += "\n"
     
     if not has_premium_any:
-        status_text = "😔 " + to_bold_sans("You Have No Active Premium.") + "\n\n" + "Contact **[Admin Tom](https://t.me/CjjTom)** to buy a plan."
+        status_text = "😔 " + to_bold_sans("You Have No Active Premium.") + "\n\n" + "Contact **Admin** to buy a plan."
 
     await msg.reply(status_text, parse_mode=enums.ParseMode.MARKDOWN)
 
-@app.on_message(filters.command("skip") & filters.private)
+@app.on_message(filters.command("skip"))
 @with_user_lock
 async def handle_skip_command(_, msg):
     user_id = msg.from_user.id
@@ -992,6 +1019,20 @@ async def show_stats(_, msg):
     await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     if db is None: return await msg.reply("⚠️ " + to_bold_sans("Database Is Currently Unavailable."))
     
+    # Show personal stats for regular users
+    if not is_admin(user_id):
+        user_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': user_id})
+        stats_text = (
+            f"📊 **{to_bold_sans('Your Statistics:')}**\n\n"
+            f"📈 **Total Uploads:** `{user_uploads}`\n"
+        )
+        for p in PREMIUM_PLATFORMS:
+            platform_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': user_id, 'platform': p})
+            stats_text += f"    - {p.capitalize()}: `{platform_uploads}`\n"
+        await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
+        return
+
+    # --- Admin Stats ---
     total_users = await asyncio.to_thread(db.users.count_documents, {})
     
     # Efficiently count premium users with an aggregation pipeline
@@ -1046,7 +1087,13 @@ async def show_stats(_, msg):
     for p in PREMIUM_PLATFORMS:
         stats_text += f"    - {p.capitalize()}: `{await asyncio.to_thread(db.uploads.count_documents, {'platform': p})}`\n"
 
-    await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
+    stats_text += f"\n**Events**\n📢 Special Event Status: `{'ON' if global_settings.get('special_event_toggle') else 'OFF'}`"
+    
+    # This check is needed because the function can be called from a callback, which might not have a .reply method
+    if hasattr(msg, 'reply_markup'):
+        await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
+    else: # It's a mock message from a callback
+        await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
 
 
 @app.on_message(filters.regex("^(📘 FB ᴩᴏꜱᴛ|📘 FB ᴠɪᴅᴇᴏ|📘 FB ʀᴇᴇʟꜱ|▶️ YT ᴠɪᴅᴇᴏ|🟥 YT ꜱʜᴏʀᴛꜱ)"))
@@ -1324,10 +1371,13 @@ async def handle_text_input(_, msg):
         
         for user in users:
             try:
-                if user["_id"] == ADMIN_ID: continue
+                if user["_id"] == ADMIN_ID or user["_id"] == BOT_ID: continue
                 await app.send_message(user["_id"], broadcast_text, parse_mode=enums.ParseMode.MARKDOWN)
                 sent_count += 1
                 await asyncio.sleep(0.1)
+            except (UserIsBlocked, BotBlocked):
+                failed_count += 1
+                logger.warning(f"User {user['_id']} has blocked the bot. Skipping.")
             except Exception as e:
                 failed_count += 1
                 logger.error(f"Failed to send broadcast to user {user['_id']}: {e}")
@@ -1370,8 +1420,23 @@ async def handle_text_input(_, msg):
             await _update_global_setting("max_concurrent_uploads", new_limit)
             global upload_semaphore
             upload_semaphore = asyncio.Semaphore(new_limit)
-            await msg.reply(f"✅ " + to_bold_sans(f"Max Concurrent Uploads Set To `{new_limit}`."), reply_markup=get_admin_global_settings_markup())
+            await msg.reply(f"✅ " + to_bold_sans(f"Max Concurrent Uploads Set To `{new_limit}`."))
             if user_id in user_states: del user_states[user_id]
+            await show_global_settings_panel(msg)
+        except ValueError:
+            await msg.reply("❌ " + to_bold_sans("Invalid Input. Please Send A Valid Number."))
+
+    elif action == "waiting_for_max_file_size":
+        if not is_admin(user_id): return
+        try:
+            new_limit = int(msg.text)
+            if new_limit <= 0: return await msg.reply("❌ " + to_bold_sans("Limit Must Be A Positive Integer."))
+            await _update_global_setting("max_file_size_mb", new_limit)
+            global MAX_FILE_SIZE_BYTES
+            MAX_FILE_SIZE_BYTES = new_limit * 1024 * 1024
+            await msg.reply(f"✅ " + to_bold_sans(f"Max File Size Set To `{new_limit}` MB."))
+            if user_id in user_states: del user_states[user_id]
+            await show_global_settings_panel(msg)
         except ValueError:
             await msg.reply("❌ " + to_bold_sans("Invalid Input. Please Send A Valid Number."))
 
@@ -1379,8 +1444,9 @@ async def handle_text_input(_, msg):
         if not is_admin(user_id): return
         setting_key = "special_event_title" if action == "waiting_for_event_title" else "special_event_message"
         await _update_global_setting(setting_key, msg.text)
-        await msg.reply(f"✅ " + to_bold_sans(f"Special Event `{setting_key.split('_')[-1]}` Updated!"), reply_markup=get_admin_global_settings_markup())
+        await msg.reply(f"✅ " + to_bold_sans(f"Special Event `{setting_key.split('_')[-1]}` Updated!"))
         if user_id in user_states: del user_states[user_id]
+        await show_global_settings_panel(msg)
 
     elif action.startswith("waiting_for_payment_details_"):
         if not is_admin(user_id): return
@@ -1429,7 +1495,7 @@ async def manage_accounts_cb(_, query):
     platform = "facebook" if "fb" in query.data else "youtube"
     
     sessions = await load_platform_sessions(user_id, platform)
-    logged_in_accounts = {s['account_id']: s['session_data']['name'] for s in sessions}
+    logged_in_accounts = {s['session_data']['id']: s['session_data']['name'] for s in sessions}
     
     if not logged_in_accounts:
         await query.answer(f"You have no {platform.capitalize()} accounts logged in. Let's add one.", show_alert=True)
@@ -1635,7 +1701,7 @@ async def show_payment_qr_google_play_cb(_, query):
         return
     
     caption_text = "**" + to_bold_sans("Scan & Pay") + "**\n\n" + \
-                   "Send a screenshot to **[Admin Tom](https://t.me/CjjTom)** for activation."
+                   "Send a screenshot to the Admin for activation."
     
     await query.message.reply_photo(
         photo=qr_file_id,
@@ -1651,7 +1717,7 @@ async def show_payment_details_cb(_, query):
     text = (
         f"**{to_bold_sans(f'{method.upper()} Payment Details')}**\n\n"
         f"`{payment_details}`\n\n"
-        f"Contact **[Admin Tom](https://t.me/CjjTom)** with a screenshot for activation."
+        f"Contact the Admin with a screenshot for activation."
     )
     await safe_edit_message(query.message, text, reply_markup=get_payment_methods_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -1662,7 +1728,7 @@ async def show_custom_payment_cb(_, query):
     text = (
         f"**{to_bold_sans(f'{button_name.upper()} Payment Details')}**\n\n"
         f"`{payment_details}`\n\n"
-        f"Contact **[Admin Tom](https://t.me/CjjTom)** with a screenshot for activation."
+        f"Contact the Admin with a screenshot for activation."
     )
     await safe_edit_message(query.message, text, reply_markup=get_payment_methods_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -1670,7 +1736,7 @@ async def show_custom_payment_cb(_, query):
 async def buy_now_cb(_, query):
     text = (
         f"**{to_bold_sans('Purchase Confirmation')}**\n\n"
-        f"Please contact **[Admin Tom](https://t.me/CjjTom)** to complete the payment."
+        f"Please contact the Admin to complete the payment."
     )
     await safe_edit_message(query.message, text, parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -1714,15 +1780,15 @@ async def admin_panel_actions_cb(_, query):
         await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message you want to broadcast to all users."))
     
     elif action == "admin_stats_panel":
-        # Re-using the message object from the query to call the stats function
         class MockMsg:
-            def __init__(self, msg):
-                self.chat = msg.chat
-                self.id = msg.id
+            def __init__(self, q):
+                self.from_user = q.from_user
+                self.chat = q.message.chat
+                self.id = q.message.id
             async def reply(self, text, **kwargs):
                 await safe_edit_message(query.message, text, **kwargs)
         
-        await show_stats(app, MockMsg(query.message))
+        await show_stats(app, MockMsg(query))
 
 async def show_user_details(message, target_user_id):
     """Helper function to fetch and display user details for the admin."""
@@ -1732,9 +1798,28 @@ async def show_user_details(message, target_user_id):
 
     details_text = f"👤 **Details for User ID:** `{target_user_id}`\n"
     details_text += f"**Username:** @{user_data.get('username', 'N/A')}\n"
-    details_text += f"**Joined:** {user_data.get('added_at', 'N/A').strftime('%Y-%m-%d')}\n"
-    details_text += f"**Last Active:** {user_data.get('last_active', 'N/A').strftime('%Y-%m-%d %H:%M')}\n\n"
     
+    joined_at = user_data.get('added_at', 'N/A')
+    if isinstance(joined_at, datetime):
+        details_text += f"**Joined:** {joined_at.strftime('%Y-%m-%d')}\n"
+    else:
+        details_text += f"**Joined:** {joined_at}\n"
+        
+    last_active = user_data.get('last_active', 'N/A')
+    if isinstance(last_active, datetime):
+         details_text += f"**Last Active:** {last_active.strftime('%Y-%m-%d %H:%M')}\n\n"
+    else:
+        details_text += f"**Last Active:** {last_active}\n\n"
+
+    # Fetch upload stats
+    total_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': target_user_id})
+    last_upload = await asyncio.to_thread(db.uploads.find_one, {'user_id': target_user_id}, sort=[('timestamp', DESCENDING)])
+    details_text += f"**Uploads:**\n- Total: `{total_uploads}`\n"
+    if last_upload:
+        details_text += f"- Last Upload: `{last_upload.get('title', 'N/A')}` on `{last_upload['timestamp'].strftime('%Y-%m-%d')}`\n\n"
+    else:
+        details_text += "- Last Upload: `None`\n\n"
+
     details_text += "**Premium Status:**\n"
     has_any_premium = False
     for platform in PREMIUM_PLATFORMS:
@@ -1744,15 +1829,32 @@ async def show_user_details(message, target_user_id):
             p_type = p_data.get("type", "N/A").replace("_", " ").title()
             p_until = p_data.get("until")
             details_text += f"- **{platform.capitalize()}:** Active (`{p_type}`)\n"
-            if p_until:
+
+            if p_until and isinstance(p_until, datetime):
+                if p_until.tzinfo is None: p_until = p_until.replace(tzinfo=timezone.utc)
                 details_text += f"  - Expires: `{p_until.strftime('%Y-%m-%d %H:%M UTC')}`\n"
     if not has_any_premium:
         details_text += "  - No active premium subscriptions.\n"
 
     await message.reply(details_text, parse_mode=enums.ParseMode.MARKDOWN)
 
+async def show_global_settings_panel(message_or_query):
+    """Helper function to display the global settings panel."""
+    if hasattr(message_or_query, 'message'): # It's a query
+        message = message_or_query.message
+    else: # It's a message
+        message = message_or_query
 
-@app.on_callback_query(filters.regex("^global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel$"))
+    settings_text = (
+        "⚙️ **" + to_bold_sans("Global Bot Settings") + "**\n\n"
+        f"**📢 Special Event:** `{global_settings.get('special_event_toggle', False)}`\n"
+        f"**⏫ Max Concurrent Uploads:** `{global_settings.get('max_concurrent_uploads')}`\n"
+        f"**🗂️ Max File Size:** `{global_settings.get('max_file_size_mb')}` MB\n"
+        f"**👥 Multiple Logins:** `{'Allowed' if global_settings.get('allow_multiple_logins') else 'Blocked'}`"
+    )
+    await safe_edit_message(message, settings_text, reply_markup=get_admin_global_settings_markup(), parse_mode=enums.ParseMode.MARKDOWN)
+
+@app.on_callback_query(filters.regex("^(global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|set_max_file_size|toggle_multiple_logins|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel)$"))
 async def global_settings_actions_cb(_, query):
     user_id = query.from_user.id
     if not is_admin(user_id):
@@ -1761,13 +1863,19 @@ async def global_settings_actions_cb(_, query):
     action = query.data
     
     if action == "global_settings_panel":
-        await global_settings_panel_cb(app, query) # Re-use existing function to show panel
+        await show_global_settings_panel(query)
     
     elif action == "toggle_special_event":
         current_status = global_settings.get("special_event_toggle", False)
         await _update_global_setting("special_event_toggle", not current_status)
         await query.answer(f"Special event turned {'OFF' if current_status else 'ON'}")
-        await global_settings_panel_cb(app, query) # Refresh panel
+        await show_global_settings_panel(query)
+
+    elif action == "toggle_multiple_logins":
+        current_status = global_settings.get("allow_multiple_logins", False)
+        await _update_global_setting("allow_multiple_logins", not current_status)
+        await query.answer(f"Multiple logins {'Blocked' if current_status else 'Allowed'}")
+        await show_global_settings_panel(query)
 
     elif action == "set_event_title":
         user_states[user_id] = {"action": "waiting_for_event_title"}
@@ -1779,7 +1887,11 @@ async def global_settings_actions_cb(_, query):
 
     elif action == "set_max_uploads":
         user_states[user_id] = {"action": "waiting_for_max_uploads"}
-        await safe_edit_message(query.message, "🔢 " + to_bold_sans(f"Current limit is {MAX_CONCURRENT_UPLOADS}. Send the new number for max concurrent uploads."))
+        await safe_edit_message(query.message, "⏫ " + to_bold_sans(f"Current limit is {MAX_CONCURRENT_UPLOADS}. Send the new number for max concurrent uploads."))
+
+    elif action == "set_max_file_size":
+        user_states[user_id] = {"action": "waiting_for_max_file_size"}
+        await safe_edit_message(query.message, "🗂️ " + to_bold_sans(f"Current limit is {global_settings.get('max_file_size_mb')} MB. Send the new number for max file size in MB."))
 
     elif action == "reset_stats":
         markup = InlineKeyboardMarkup([
@@ -1793,7 +1905,7 @@ async def global_settings_actions_cb(_, query):
         await asyncio.to_thread(db.uploads.delete_many, {})
         await query.answer("All upload stats have been reset.", show_alert=True)
         await send_log_to_channel(app, LOG_CHANNEL, f"🗑️ Admin `{user_id}` reset all upload stats.")
-        await global_settings_panel_cb(app, query) # Refresh panel
+        await show_global_settings_panel(query)
 
     elif action == "show_system_stats":
         cpu = psutil.cpu_percent(interval=1)
@@ -1832,11 +1944,15 @@ async def back_to_cb(_, query):
     elif data == "back_to_settings":
         await safe_edit_message(query.message, "⚙️ " + to_bold_sans("Settings Panel"), reply_markup=get_main_settings_markup())
     elif data == "back_to_admin":
-        await admin_panel_cb(app, query)
+        await admin_panel_actions_cb(app, query)
     elif data == "back_to_premium_plans":
-        await buypypremium_cb(app, query)
+        state_data = user_states.get(user_id, {})
+        if is_admin(user_id) and state_data.get("action") == "select_premium_plan_for_platforms":
+            await safe_edit_message(query.message, "➡️ " + to_bold_sans("Please choose a plan to grant:"), reply_markup=get_premium_plan_markup(user_id))
+        else:
+            await buypypremium_cb(app, query)
     elif data == "back_to_global":
-        await global_settings_panel_cb(app, query)
+        await show_global_settings_panel(query)
 
 # --- Trial Activation ---
 @app.on_callback_query(filters.regex("^activate_trial_"))
@@ -1915,29 +2031,29 @@ async def process_upload_step(msg_or_query):
         state_data["action"] = "waiting_for_title"
         default_title = user_settings.get(f'title_{platform}') or user_settings.get(f'caption_{platform}')
         prompt = to_bold_sans("Media Received. First, Send Your Title.") + "\n\n"
-        prompt += "• " + to_bold_sans("Send Text Now") + "\n"
+        prompt += "• " + "Send Text Now" + "\n" # Normal text
         if default_title:
-            prompt += f"• Or use `/skip` to use your default: `{default_title[:50]}`"
+            prompt += f"• Or use /skip to use your default: `{default_title[:50]}`"
         else:
-            prompt += "• Or use `/skip` for no title."
+            prompt += "• Or use /skip for no title."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
     elif "description" not in file_info:
         state_data["action"] = "waiting_for_description"
         default_desc = user_settings.get(f'description_{platform}')
         prompt = to_bold_sans("Next, Send Your Description.") + "\n\n"
         if default_desc:
-            prompt += f"• Or use `/skip` to use your default: `{default_desc[:50]}`"
+            prompt += f"• Or use /skip to use your default: `{default_desc[:50]}`"
         else:
-            prompt += "• Or use `/skip` for no description."
+            prompt += "• Or use /skip for no description."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
     elif platform == 'youtube' and "tags" not in file_info:
         state_data["action"] = "waiting_for_tags"
         default_tags = user_settings.get(f'tags_{platform}')
         prompt = to_bold_sans("Now, Send Comma-separated Tags.") + "\n\n"
         if default_tags:
-            prompt += f"• Or use `/skip` to use your default: `{default_tags[:50]}`"
+            prompt += f"• Or use /skip to use your default: `{default_tags[:50]}`"
         else:
-            prompt += "• Or use `/skip` for no tags."
+            prompt += "• Or use /skip for no tags."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
     elif "thumbnail_path" not in file_info:
         # This step is only for videos
@@ -2238,7 +2354,7 @@ async def send_log_to_channel(client, channel_id, text):
 # ======================== BOT STARTUP ============================
 # ===================================================================
 async def start_bot():
-    global mongo, db, global_settings, upload_semaphore, MAX_CONCURRENT_UPLOADS, MAX_FILE_SIZE_BYTES, task_tracker, valid_log_channel
+    global mongo, db, global_settings, upload_semaphore, MAX_CONCURRENT_UPLOADS, MAX_FILE_SIZE_BYTES, task_tracker, valid_log_channel, BOT_ID
 
     try:
         mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -2275,6 +2391,8 @@ async def start_bot():
     server_thread.start()
     
     await app.start()
+    me = await app.get_me()
+    BOT_ID = me.id
     
     task_tracker.loop = asyncio.get_running_loop()
 
@@ -2286,7 +2404,7 @@ async def start_bot():
             logger.error(f"Could not log to channel {LOG_CHANNEL}. Invalid ID or bot isn't an admin. Error: {e}")
             valid_log_channel = False
 
-    logger.info("Bot is now online! Waiting for tasks...")
+    logger.info(f"Bot is now online! ID: {BOT_ID}. Waiting for tasks...")
     await idle()
 
     logger.info("Shutting down...")
