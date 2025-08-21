@@ -182,7 +182,8 @@ DEFAULT_GLOBAL_SETTINGS = {
     "allow_multiple_logins": False, # New setting
     "payment_settings": {
         "google_play_qr_file_id": "",
-        "upi": "", "usdt": "", "btc": "", "others": "", "custom_buttons": {}
+        "upi": "", "usdt": "", "btc": "", "others": "", "custom_buttons": {},
+        "instructions": "After paying, please send the transaction ID or a screenshot of your payment."
     }
 }
 
@@ -407,6 +408,7 @@ def get_admin_global_settings_markup():
 
 payment_settings_markup = InlineKeyboardMarkup([
     [InlineKeyboardButton("🆕 ᴄʀᴇᴀᴛᴇ ᴩᴀyᴍᴇɴᴛ ʙᴜᴛᴛᴏɴ", callback_data="create_custom_payment_button")],
+    [InlineKeyboardButton("✍️ Set Instructions", callback_data="set_payment_instructions")],
     [InlineKeyboardButton("ɢᴏᴏɢʟᴇ ᴩʟᴀy ǫʀ ᴄᴏᴅᴇ", callback_data="set_payment_google_play_qr")],
     [InlineKeyboardButton("ᴜᴩɪ", callback_data="set_payment_upi")],
     [InlineKeyboardButton("ᴜꜱᴅᴛ", callback_data="set_payment_usdt")],
@@ -465,6 +467,7 @@ def get_payment_methods_markup():
     for btn_name in settings.get("custom_buttons", {}):
         payment_buttons.append([InlineKeyboardButton(btn_name.upper(), callback_data=f"show_custom_payment_{btn_name}")])
 
+    payment_buttons.append([InlineKeyboardButton("🧾 I've Paid / Submit Proof", callback_data="submit_payment_proof")])
     payment_buttons.append([InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ᴩʀᴇᴍɪᴜᴍ ᴩʟᴀɴꜱ", callback_data="back_to_premium_plans")])
     return InlineKeyboardMarkup(payment_buttons)
 
@@ -1357,7 +1360,8 @@ async def handle_text_input(_, msg):
         except ValueError:
             await msg.reply("❌ " + to_bold_sans("Invalid format. Please use `YYYY-MM-DD HH:MM` in UTC."))
 
-# --- Admin Flow ---
+
+    # --- Admin Flow ---
     elif action == "waiting_for_broadcast_message":
         if not is_admin(user_id): return
         broadcast_text = msg.text
@@ -1368,14 +1372,13 @@ async def handle_text_input(_, msg):
         sent_count, failed_count = 0, 0
         status_msg = await msg.reply(f"📢 {to_bold_sans('Starting Broadcast...')}\nMessage:\n{broadcast_text}")
         
-        # മാറ്റം വരുത്തിയത് ഈ ലൂപ്പിനകത്താണ്
         for user in users:
             try:
                 if user["_id"] == ADMIN_ID or user["_id"] == BOT_ID: continue
                 await app.send_message(user["_id"], broadcast_text, parse_mode=enums.ParseMode.MARKDOWN)
                 sent_count += 1
                 await asyncio.sleep(0.1)
-            except UserIsBlocked: # <-- ഇതാണ് മാറ്റം വരുത്തിയ ലൈൻ
+            except UserIsBlocked:
                 failed_count += 1
                 logger.warning(f"User {user['_id']} has blocked the bot. Skipping.")
             except Exception as e:
@@ -1457,6 +1460,14 @@ async def handle_text_input(_, msg):
         await msg.reply(f"✅ " + to_bold_sans(f"Payment Details For **{payment_method.upper()}** Updated."), reply_markup=payment_settings_markup, parse_mode=enums.ParseMode.MARKDOWN)
         if user_id in user_states: del user_states[user_id]
 
+    elif action == "waiting_for_payment_instructions":
+        if not is_admin(user_id): return
+        new_payment_settings = global_settings.get("payment_settings", {})
+        new_payment_settings["instructions"] = msg.text
+        await _update_global_setting("payment_settings", new_payment_settings)
+        await msg.reply(f"✅ " + to_bold_sans("Payment Instructions Updated."), reply_markup=payment_settings_markup)
+        if user_id in user_states: del user_states[user_id]
+
     elif action == "waiting_for_custom_button_name":
         if not is_admin(user_id): return
         user_states[user_id]['button_name'] = msg.text.strip()
@@ -1474,6 +1485,17 @@ async def handle_text_input(_, msg):
         await _update_global_setting("payment_settings", payment_settings)
         await msg.reply(f"✅ " + to_bold_sans(f"Payment Button `{button_name}` Created."), reply_markup=payment_settings_markup)
         if user_id in user_states: del user_states[user_id]
+
+    elif action == "waiting_for_payment_proof":
+        if 'payment_proof_message' in user_states[user_id]:
+            # This means the bot has already asked for proof and this is the user's reply
+            await msg.forward(ADMIN_ID)
+            await app.send_message(
+                ADMIN_ID, 
+                f"👆 Payment proof from user: `{user_id}` (@{msg.from_user.username or 'N/A'})"
+            )
+            await msg.reply("✅ Your proof has been sent to the admin for verification. Please wait for confirmation.")
+            if user_id in user_states: del user_states[user_id]
 
 
 # ===================================================================
@@ -1559,7 +1581,7 @@ async def logout_account_cb(_, query):
     if user_settings.get(f"active_{platform}_id") == acc_id_to_logout:
         sessions = await load_platform_sessions(user_id, platform)
         # Set the active account to the next available one, or None
-        user_settings[f"active_{platform}_id"] = sessions[0]['account_id'] if sessions else None
+        user_settings[f"active_{platform}_id"] = sessions[0]['session_data']['id'] if sessions else None
         await save_user_settings(user_id, user_settings)
     
     await query.answer(f"✅ Logged out successfully.", show_alert=True)
@@ -1693,6 +1715,14 @@ async def show_payment_methods_cb(_, query):
     payment_methods_text += to_bold_sans("Choose Your Preferred Method To Proceed With Payment.")
     await safe_edit_message(query.message, payment_methods_text, reply_markup=get_payment_methods_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
+@app.on_callback_query(filters.regex("^submit_payment_proof$"))
+async def submit_payment_proof_cb(_, query):
+    user_id = query.from_user.id
+    instructions = global_settings.get("payment_settings", {}).get("instructions")
+    user_states[user_id] = {"action": "waiting_for_payment_proof"}
+    await query.answer()
+    await safe_edit_message(query.message, f"🧾 **Submit Payment Proof**\n\n{instructions}")
+
 @app.on_callback_query(filters.regex("^show_payment_qr_google_play$"))
 async def show_payment_qr_google_play_cb(_, query):
     qr_file_id = global_settings.get("payment_settings", {}).get("google_play_qr_file_id")
@@ -1780,6 +1810,7 @@ async def admin_panel_actions_cb(_, query):
         await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message you want to broadcast to all users."))
     
     elif action == "admin_stats_panel":
+        # MOCKMSG FIX: Pass the query object to create a compliant mock message
         class MockMsg:
             def __init__(self, q):
                 self.from_user = q.from_user
@@ -1854,7 +1885,7 @@ async def show_global_settings_panel(message_or_query):
     )
     await safe_edit_message(message, settings_text, reply_markup=get_admin_global_settings_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
-@app.on_callback_query(filters.regex("^(global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|set_max_file_size|toggle_multiple_logins|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel)$"))
+@app.on_callback_query(filters.regex("^(global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|set_max_file_size|set_payment_instructions|toggle_multiple_logins|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel)$"))
 async def global_settings_actions_cb(_, query):
     user_id = query.from_user.id
     if not is_admin(user_id):
@@ -1892,6 +1923,10 @@ async def global_settings_actions_cb(_, query):
     elif action == "set_max_file_size":
         user_states[user_id] = {"action": "waiting_for_max_file_size"}
         await safe_edit_message(query.message, "🗂️ " + to_bold_sans(f"Current limit is {global_settings.get('max_file_size_mb')} MB. Send the new number for max file size in MB."))
+
+    elif action == "set_payment_instructions":
+        user_states[user_id] = {"action": "waiting_for_payment_instructions"}
+        await safe_edit_message(query.message, "✍️ " + to_bold_sans("Please send the new payment instructions for users."))
 
     elif action == "reset_stats":
         markup = InlineKeyboardMarkup([
@@ -2026,6 +2061,14 @@ async def process_upload_step(msg_or_query):
     platform = state_data["platform"]
     user_settings = await get_user_settings(user_id)
 
+    # Check for short video eligibility
+    short_info = ""
+    if platform == 'youtube' and 'title' not in file_info:
+        metadata = get_video_metadata(file_info['downloaded_path'])
+        duration = float(metadata.get('format', {}).get('duration', '61'))
+        if duration < 60:
+            short_info = "\n\nℹ️ This video is under 60 seconds and may be published as a YouTube Short if it has a vertical aspect ratio."
+
     # Determine the current step based on what's missing in file_info
     if "title" not in file_info:
         state_data["action"] = "waiting_for_title"
@@ -2036,6 +2079,7 @@ async def process_upload_step(msg_or_query):
             prompt += f"• Or use /skip to use your default: `{default_title[:50]}`"
         else:
             prompt += "• Or use /skip for no title."
+        prompt += short_info
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
     elif "description" not in file_info:
         state_data["action"] = "waiting_for_description"
@@ -2065,6 +2109,11 @@ async def process_upload_step(msg_or_query):
         state_data["action"] = "waiting_for_thumbnail_choice"
         await safe_edit_message(status_msg, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
     elif "visibility" not in file_info:
+        # Facebook doesn't have a simple visibility toggle via API for pages, so we skip it.
+        if platform == 'facebook':
+            file_info['visibility'] = 'public' # Default
+            await process_upload_step(msg_or_query)
+            return
         state_data["action"] = "waiting_for_visibility_choice"
         await safe_edit_message(status_msg, to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
     elif "schedule_time" not in file_info:
@@ -2083,11 +2132,22 @@ async def handle_media_upload(_, msg):
     await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     state_data = user_states.get(user_id, {})
 
+    # Handle payment proof submission
+    if state_data and state_data.get("action") == "waiting_for_payment_proof":
+        await msg.forward(ADMIN_ID)
+        await app.send_message(
+            ADMIN_ID, 
+            f"👆 Payment proof from user: `{user_id}` (@{msg.from_user.username or 'N/A'})"
+        )
+        await msg.reply("✅ Your proof has been sent to the admin for verification. Please wait for confirmation.")
+        if user_id in user_states: del user_states[user_id]
+        return
+
     # Handle admin settings media (e.g., QR code)
     if is_admin(user_id) and state_data and state_data.get("action") == "waiting_for_google_play_qr" and msg.photo:
-        new_payment_settings = global_settings.get("payment_settings", {})
-        new_payment_settings["google_play_qr_file_id"] = msg.photo.file_id
-        await _update_global_setting("payment_settings", new_payment_settings)
+        payment_settings = global_settings.get("payment_settings", {})
+        payment_settings["google_play_qr_file_id"] = msg.photo.file_id
+        await _update_global_setting("payment_settings", payment_settings)
         if user_id in user_states: del user_states[user_id]
         return await msg.reply("✅ " + to_bold_sans("Google Pay QR Code Image Saved!"), reply_markup=payment_settings_markup)
 
