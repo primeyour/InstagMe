@@ -1502,6 +1502,34 @@ async def handle_text_input(_, msg):
 # =================== CALLBACK QUERY HANDLERS =======================
 # ===================================================================
 
+# NEW CALLBACK HANDLER FOR PLATFORM SELECTION
+@app.on_callback_query(filters.regex("^select_platform_"))
+async def select_platform_for_premium_cb(_, query):
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return await query.answer("Admin only.", show_alert=True)
+
+    state_data = user_states.get(user_id)
+    if not state_data or state_data.get("action") != "select_platforms_for_premium":
+        return await query.answer("Error: Invalid state. Please start again.", show_alert=True)
+        
+    platform = query.data.split("select_platform_")[1]
+    
+    # Toggle the selection status for the platform
+    selected_platforms = state_data.get("selected_platforms", {})
+    selected_platforms[platform] = not selected_platforms.get(platform, False)
+    state_data["selected_platforms"] = selected_platforms
+    
+    # Edit the message to show the updated selection with checkmarks
+    await safe_edit_message(
+        query.message,
+        text=f"✅ User Id `{state_data.get('target_user_id')}`. Select Platforms For Premium:",
+        reply_markup=get_platform_selection_markup(user_id, selected_platforms)
+    )
+    
+    # Answer the query to stop the loading animation on the button
+    await query.answer()
+
 @app.on_callback_query(filters.regex("^hub_settings_"))
 async def hub_settings_cb(_, query):
     platform = query.data.split("_")[-1]
