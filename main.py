@@ -327,7 +327,7 @@ def get_main_keyboard(user_id, premium_platforms):
         insert_index = 1 if fb_buttons else 0
         buttons.insert(insert_index, yt_buttons)
 
-    buttons.append([KeyboardButton("⭐ ᴩʀᴇᴍɪᴜᴍ"), KeyboardButton("/premiumdetails")])
+    buttons.append([KeyboardButton("⭐ ᴩʀᴇᴍɪᴜᴍ")]) # Removed /premiumdetails from button
     if is_admin(user_id):
         buttons.append([KeyboardButton("🛠 ᴀᴅᴍɪɴ ᴩᴀɴᴇʟ"), KeyboardButton("🔄 ʀᴇꜱᴛᴀʀᴛ ʙᴏᴛ")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, selective=True)
@@ -375,7 +375,7 @@ async def get_account_markup(user_id, platform, logged_in_accounts):
 def get_logout_confirm_markup(platform, account_id, account_name):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Yes, Logout {account_name}", callback_data=f"logout_acc_{platform}_{account_id}")],
-        [InlineKeyboardButton("❌ No, Cancel", callback_data=f"manage_{platform}_accounts")]
+        [InlineKeyboardButton("❌ No, Cancel", callback_data=f"manage_{'fb' if platform == 'facebook' else 'yt'}_accounts")]
     ])
 
 admin_markup = InlineKeyboardMarkup([
@@ -423,8 +423,10 @@ def get_platform_selection_markup(user_id, current_selection=None):
 
 def get_premium_plan_markup(user_id):
     buttons = []
+    # Don't show trial plan for manual granting or buying
     for key, value in PREMIUM_PLANS.items():
-        buttons.append([InlineKeyboardButton(f"{key.replace('_', ' ').title()}", callback_data=f"show_plan_details_{key}")])
+        if key != "6_hour_trial":
+            buttons.append([InlineKeyboardButton(f"{key.replace('_', ' ').title()}", callback_data=f"show_plan_details_{key}")])
     buttons.append([InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="back_to_main_menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -932,35 +934,6 @@ async def premium_details_cmd(_, msg):
 
     await msg.reply(status_text, parse_mode=enums.ParseMode.MARKDOWN)
 
-@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
-async def broadcast_cmd(_, msg):
-    if db is None:
-        return await msg.reply("⚠️ " + to_bold_sans("Database Is Unavailable."))
-    if len(msg.text.split(maxsplit=1)) < 2:
-        return await msg.reply("Usage: `/broadcast <your message>`", parse_mode=enums.ParseMode.MARKDOWN)
-    
-    broadcast_message = msg.text.split(maxsplit=1)[1]
-    users_cursor = await asyncio.to_thread(db.users.find, {})
-    users = await asyncio.to_thread(list, users_cursor)
-    sent_count, failed_count = 0, 0
-    status_msg = await msg.reply("📢 " + to_bold_sans("Starting Broadcast..."))
-    
-    for user in users:
-        try:
-            if user["_id"] == ADMIN_ID: continue
-            await app.send_message(user["_id"], broadcast_message, parse_mode=enums.ParseMode.MARKDOWN)
-            sent_count += 1
-            await asyncio.sleep(0.1) # Small delay to avoid hitting API limits
-        except Exception as e:
-            failed_count += 1
-            logger.error(f"Failed to send broadcast to user {user['_id']}: {e}")
-            
-    await status_msg.edit_text(f"✅ **Broadcast finished!**\nSent to `{sent_count}` users, failed for `{failed_count}` users.")
-    await send_log_to_channel(app, LOG_CHANNEL,
-        f"📢 Broadcast by admin `{msg.from_user.id}`\n"
-        f"Sent: `{sent_count}`, Failed: `{failed_count}`"
-    )
-
 @app.on_message(filters.command("skip") & filters.private)
 @with_user_lock
 async def handle_skip_command(_, msg):
@@ -1339,6 +1312,32 @@ async def handle_text_input(_, msg):
 
 
     # --- Admin Flow ---
+    elif action == "waiting_for_broadcast_message":
+        if not is_admin(user_id): return
+        broadcast_text = msg.text
+        if user_id in user_states: del user_states[user_id]
+        
+        users_cursor = await asyncio.to_thread(db.users.find, {})
+        users = await asyncio.to_thread(list, users_cursor)
+        sent_count, failed_count = 0, 0
+        status_msg = await msg.reply(f"📢 {to_bold_sans('Starting Broadcast...')}\nMessage:\n{broadcast_text}")
+        
+        for user in users:
+            try:
+                if user["_id"] == ADMIN_ID: continue
+                await app.send_message(user["_id"], broadcast_text, parse_mode=enums.ParseMode.MARKDOWN)
+                sent_count += 1
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Failed to send broadcast to user {user['_id']}: {e}")
+                
+        await status_msg.edit_text(f"✅ **Broadcast finished!**\nSent to `{sent_count}` users, failed for `{failed_count}` users.")
+        await send_log_to_channel(app, LOG_CHANNEL,
+            f"📢 Broadcast by admin `{msg.from_user.id}`\n"
+            f"Sent: `{sent_count}`, Failed: `{failed_count}`"
+        )
+
     elif action == "waiting_for_target_user_id_premium_management":
         if not is_admin(user_id): return
         try:
@@ -1434,14 +1433,19 @@ async def manage_accounts_cb(_, query):
     
     if not logged_in_accounts:
         await query.answer(f"You have no {platform.capitalize()} accounts logged in. Let's add one.", show_alert=True)
-        # This will trigger the login flow
-        # We simulate a new callback query object to call the handler directly
-        class MockQuery:
-            def __init__(self, user, message, data):
+        # We simulate a message object to call the handler directly
+        class MockMessage:
+            def __init__(self, user, chat):
                 self.from_user = user
-                self.message = message
-                self.data = data
-        await add_account_cb(app, MockQuery(query.from_user, query.message, f'add_account_{platform}'))
+                self.chat = chat
+            async def reply(self, *args, **kwargs):
+                return await app.send_message(self.chat.id, *args, **kwargs)
+
+        if platform == 'facebook':
+            await facebook_login_cmd_new(app, MockMessage(query.from_user, query.message.chat))
+        elif platform == 'youtube':
+            await youtube_login_cmd_new(app, MockMessage(query.from_user, query.message.chat))
+        await query.message.delete()
         return
 
     await safe_edit_message(query.message, "👤 " + to_bold_sans(f"Select Your Active {platform.capitalize()} Account"),
@@ -1510,10 +1514,18 @@ async def add_account_cb(_, query):
     
     # We now trigger the new login flows using commands
     await query.message.delete()
+
+    class MockMessage: # Create a mock message object to pass to the command handlers
+        def __init__(self, user, chat):
+            self.from_user = user
+            self.chat = chat
+        async def reply(self, *args, **kwargs):
+            return await app.send_message(self.chat.id, *args, **kwargs)
+
     if platform == 'facebook':
-        await facebook_login_cmd_new(app, query.message)
+        await facebook_login_cmd_new(app, MockMessage(query.from_user, query.message.chat))
     elif platform == 'youtube':
-        await youtube_login_cmd_new(app, query.message)
+        await youtube_login_cmd_new(app, MockMessage(query.from_user, query.message.chat))
 
 
 # --- General Callbacks ---
@@ -1662,30 +1674,141 @@ async def buy_now_cb(_, query):
     )
     await safe_edit_message(query.message, text, parse_mode=enums.ParseMode.MARKDOWN)
 
-# --- Admin Panel Callbacks ---
-@app.on_callback_query(filters.regex("^admin_panel$"))
-async def admin_panel_cb(_, query):
-    if not is_admin(query.from_user.id):
-        return await query.answer("❌ Admin access required", show_alert=True)
-    await safe_edit_message(
-        query.message,
-        "🛠 " + to_bold_sans("Welcome To The Admin Panel!"),
-        reply_markup=admin_markup,
-        parse_mode=enums.ParseMode.MARKDOWN
-    )
-
-@app.on_callback_query(filters.regex("^global_settings_panel$"))
-async def global_settings_panel_cb(_, query):
-    if not is_admin(query.from_user.id):
+# --- Admin Panel Callbacks (ALL NEW AND FIXED) ---
+@app.on_callback_query(filters.regex("^(admin_panel|users_list|admin_user_details|manage_premium|broadcast_message|admin_stats_panel)$"))
+async def admin_panel_actions_cb(_, query):
+    user_id = query.from_user.id
+    if not is_admin(user_id):
         return await query.answer("❌ Admin access required", show_alert=True)
     
-    settings_text = (
-        "⚙️ **" + to_bold_sans("Global Bot Settings") + "**\n\n"
-        f"**📢 Special Event:** `{global_settings.get('special_event_toggle', False)}`\n"
-        f"**Max concurrent uploads:** `{global_settings.get('max_concurrent_uploads')}`\n"
-        f"**Max file size (MB):** `{global_settings.get('max_file_size_mb')}`\n"
-    )
-    await safe_edit_message(query.message, settings_text, reply_markup=get_admin_global_settings_markup(), parse_mode=enums.ParseMode.MARKDOWN)
+    action = query.data
+
+    if action == "admin_panel":
+        await safe_edit_message(
+            query.message,
+            "🛠 " + to_bold_sans("Welcome To The Admin Panel!"),
+            reply_markup=admin_markup,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    elif action == "users_list":
+        if db is None: return await query.answer("DB connection failed.", show_alert=True)
+        await query.answer("Fetching users...")
+        users = await asyncio.to_thread(list, db.users.find({}))
+        user_list_text = f"👥 **Total Users: {len(users)}**\n\n"
+        for i, user in enumerate(users[:50]): # Limit to 50 to avoid message overflow
+            user_list_text += f"`{user['_id']}` - @{user.get('username', 'N/A')}\n"
+        if len(users) > 50:
+            user_list_text += "\n...and more."
+        await safe_edit_message(query.message, user_list_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
+
+    elif action == "admin_user_details":
+        user_states[user_id] = {"action": "waiting_for_user_id_for_details"}
+        await safe_edit_message(query.message, "👤 " + to_bold_sans("Please send the User ID to get their details."))
+    
+    elif action == "manage_premium":
+        user_states[user_id] = {"action": "waiting_for_target_user_id_premium_management"}
+        await safe_edit_message(query.message, "➕ " + to_bold_sans("Please send the User ID to manage their premium subscription."))
+
+    elif action == "broadcast_message":
+        user_states[user_id] = {"action": "waiting_for_broadcast_message"}
+        await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message you want to broadcast to all users."))
+    
+    elif action == "admin_stats_panel":
+        # Re-using the message object from the query to call the stats function
+        class MockMsg:
+            def __init__(self, msg):
+                self.chat = msg.chat
+                self.id = msg.id
+            async def reply(self, text, **kwargs):
+                await safe_edit_message(query.message, text, **kwargs)
+        
+        await show_stats(app, MockMsg(query.message))
+
+async def show_user_details(message, target_user_id):
+    """Helper function to fetch and display user details for the admin."""
+    user_data = await _get_user_data(target_user_id)
+    if not user_data:
+        return await message.reply("❌ User not found in the database.")
+
+    details_text = f"👤 **Details for User ID:** `{target_user_id}`\n"
+    details_text += f"**Username:** @{user_data.get('username', 'N/A')}\n"
+    details_text += f"**Joined:** {user_data.get('added_at', 'N/A').strftime('%Y-%m-%d')}\n"
+    details_text += f"**Last Active:** {user_data.get('last_active', 'N/A').strftime('%Y-%m-%d %H:%M')}\n\n"
+    
+    details_text += "**Premium Status:**\n"
+    has_any_premium = False
+    for platform in PREMIUM_PLATFORMS:
+        if await is_premium_for_platform(target_user_id, platform):
+            has_any_premium = True
+            p_data = user_data.get("premium", {}).get(platform, {})
+            p_type = p_data.get("type", "N/A").replace("_", " ").title()
+            p_until = p_data.get("until")
+            details_text += f"- **{platform.capitalize()}:** Active (`{p_type}`)\n"
+            if p_until:
+                details_text += f"  - Expires: `{p_until.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+    if not has_any_premium:
+        details_text += "  - No active premium subscriptions.\n"
+
+    await message.reply(details_text, parse_mode=enums.ParseMode.MARKDOWN)
+
+
+@app.on_callback_query(filters.regex("^global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel$"))
+async def global_settings_actions_cb(_, query):
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return await query.answer("❌ Admin access required", show_alert=True)
+        
+    action = query.data
+    
+    if action == "global_settings_panel":
+        await global_settings_panel_cb(app, query) # Re-use existing function to show panel
+    
+    elif action == "toggle_special_event":
+        current_status = global_settings.get("special_event_toggle", False)
+        await _update_global_setting("special_event_toggle", not current_status)
+        await query.answer(f"Special event turned {'OFF' if current_status else 'ON'}")
+        await global_settings_panel_cb(app, query) # Refresh panel
+
+    elif action == "set_event_title":
+        user_states[user_id] = {"action": "waiting_for_event_title"}
+        await safe_edit_message(query.message, "✏️ " + to_bold_sans("Please send the new title for the special event."))
+        
+    elif action == "set_event_message":
+        user_states[user_id] = {"action": "waiting_for_event_message"}
+        await safe_edit_message(query.message, "💬 " + to_bold_sans("Please send the new message for the special event."))
+
+    elif action == "set_max_uploads":
+        user_states[user_id] = {"action": "waiting_for_max_uploads"}
+        await safe_edit_message(query.message, "🔢 " + to_bold_sans(f"Current limit is {MAX_CONCURRENT_UPLOADS}. Send the new number for max concurrent uploads."))
+
+    elif action == "reset_stats":
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, Reset All Stats", callback_data="confirm_reset_stats")],
+            [InlineKeyboardButton("❌ No, Cancel", callback_data="global_settings_panel")]
+        ])
+        await safe_edit_message(query.message, "⚠️ " + to_bold_sans("Are you sure? This will delete all upload records permanently."), reply_markup=markup)
+
+    elif action == "confirm_reset_stats":
+        if db is None: return await query.answer("DB connection failed.", show_alert=True)
+        await asyncio.to_thread(db.uploads.delete_many, {})
+        await query.answer("All upload stats have been reset.", show_alert=True)
+        await send_log_to_channel(app, LOG_CHANNEL, f"🗑️ Admin `{user_id}` reset all upload stats.")
+        await global_settings_panel_cb(app, query) # Refresh panel
+
+    elif action == "show_system_stats":
+        cpu = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        stats_text = (
+            f"💻 **{to_bold_sans('System Statistics')}**\n\n"
+            f"**CPU:** `{cpu}%`\n"
+            f"**RAM:** `{ram.percent}%` (Used: {ram.used / (1024**3):.2f} GB)\n"
+            f"**Disk:** `{disk.percent}%` (Used: {disk.used / (1024**3):.2f} GB / {disk.total / (1024**3):.2f} GB)"
+        )
+        await safe_edit_message(query.message, stats_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Settings", callback_data="global_settings_panel")]]))
+    
+    elif action == "payment_settings_panel":
+        await safe_edit_message(query.message, "💰 " + to_bold_sans("Manage Payment Settings:"), reply_markup=payment_settings_markup)
 
 # --- Back Callbacks ---
 @app.on_callback_query(filters.regex("^back_to_"))
