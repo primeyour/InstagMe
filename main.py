@@ -26,7 +26,7 @@ from pymongo.errors import OperationFailure
 
 # Pyrogram (Telegram Bot)
 from pyrogram import Client, filters, enums, idle
-from pyrogram.errors import UserNotParticipant, FloodWait, UserIsBlocked, BotBlocked
+from pyrogram.errors import UserNotParticipant, FloodWait, UserIsBlocked,
 from pyrogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -1357,8 +1357,7 @@ async def handle_text_input(_, msg):
         except ValueError:
             await msg.reply("❌ " + to_bold_sans("Invalid format. Please use `YYYY-MM-DD HH:MM` in UTC."))
 
-
-    # --- Admin Flow ---
+# --- Admin Flow ---
     elif action == "waiting_for_broadcast_message":
         if not is_admin(user_id): return
         broadcast_text = msg.text
@@ -1369,13 +1368,14 @@ async def handle_text_input(_, msg):
         sent_count, failed_count = 0, 0
         status_msg = await msg.reply(f"📢 {to_bold_sans('Starting Broadcast...')}\nMessage:\n{broadcast_text}")
         
+        # മാറ്റം വരുത്തിയത് ഈ ലൂപ്പിനകത്താണ്
         for user in users:
             try:
                 if user["_id"] == ADMIN_ID or user["_id"] == BOT_ID: continue
                 await app.send_message(user["_id"], broadcast_text, parse_mode=enums.ParseMode.MARKDOWN)
                 sent_count += 1
                 await asyncio.sleep(0.1)
-            except (UserIsBlocked, BotBlocked):
+            except UserIsBlocked: # <-- ഇതാണ് മാറ്റം വരുത്തിയ ലൈൻ
                 failed_count += 1
                 logger.warning(f"User {user['_id']} has blocked the bot. Skipping.")
             except Exception as e:
