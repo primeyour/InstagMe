@@ -1526,6 +1526,91 @@ async def select_platform_for_premium_cb(_, query):
         text=f"✅ User Id `{state_data.get('target_user_id')}`. Select Platforms For Premium:",
         reply_markup=get_platform_selection_markup(user_id, selected_platforms)
     )
+
+@app.on_callback_query(filters.regex("^confirm_platform_selection$"))
+async def confirm_platform_selection_cb(_, query):
+    user_id = query.from_user.id
+    if not is_admin(user_id): return await query.answer("❌ Admin access required", show_alert=True)
+    
+    state_data = user_states.get(user_id)
+    if not isinstance(state_data, dict) or state_data.get("action") != "select_platforms_for_premium":
+        return await query.answer("Error: State lost. Please restart.", show_alert=True)
+        
+    selected_platforms = [p for p, selected in state_data.get("selected_platforms", {}).items() if selected]
+    if not selected_platforms:
+        return await query.answer("Please select at least one platform!", show_alert=True)
+        
+    state_data["action"] = "select_premium_plan_for_platforms"
+    state_data["final_selected_platforms"] = selected_platforms
+    user_states[user_id] = state_data
+    
+    await safe_edit_message(
+        query.message,
+        f"✅ Platforms Selected: `{', '.join(p.capitalize() for p in selected_platforms)}`.\n\nNow, select a premium plan for user `{state_data['target_user_id']}`:",
+        reply_markup=get_premium_plan_markup(user_id),
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
+
+@app.on_callback_query(filters.regex("^grant_plan_"))
+async def grant_plan_cb(_, query):
+    user_id = query.from_user.id
+    if not is_admin(user_id): return await query.answer("❌ Admin access required", show_alert=True)
+    if db is None: return await query.answer("⚠️ Database unavailable.", show_alert=True)
+    
+    state_data = user_states.get(user_id)
+    if not isinstance(state_data, dict) or state_data.get("action") != "select_premium_plan_for_platforms":
+        return await query.answer("❌ Error: State lost. Please start over.", show_alert=True)
+        
+    target_user_id = state_data["target_user_id"]
+    selected_platforms = state_data["final_selected_platforms"]
+    premium_plan_key = query.data.split("grant_plan_")[1]
+    
+    plan_details = PREMIUM_PLANS.get(premium_plan_key)
+    if not plan_details:
+        return await query.answer("Invalid premium plan selected.", show_alert=True)
+    
+    target_user_data = await _get_user_data(target_user_id) or {"_id": target_user_id, "premium": {}}
+    premium_data = target_user_data.get("premium", {})
+    
+    for platform in selected_platforms:
+        new_premium_until = None
+        if plan_details["duration"] is not None:
+            new_premium_until = datetime.now(timezone.utc) + plan_details["duration"]
+        
+        platform_premium_data = {
+            "type": premium_plan_key, "added_by": user_id, "added_at": datetime.now(timezone.utc), "status": "active"
+        }
+        if new_premium_until:
+            platform_premium_data["until"] = new_premium_until
+        
+        premium_data[platform] = platform_premium_data
+    
+    await _save_user_data(target_user_id, {"premium": premium_data})
+    
+    admin_confirm_text = f"✅ Premium granted to user `{target_user_id}` for:\n"
+    user_msg_text = "🎉 **Congratulations!** 🎉\n\nYou have been granted premium access for:\n"
+    
+    for platform in selected_platforms:
+        p_data = premium_data.get(platform, {})
+        line = f"**{platform.capitalize()}**: `{p_data.get('type', 'N/A').replace('_', ' ').title()}`"
+        if p_data.get("until"):
+            line += f" (Expires: `{p_data['until'].strftime('%Y-%m-%d %H:%M')}` UTC)"
+        admin_confirm_text += f"- {line}\n"
+        user_msg_text += f"- {line}\n"
+    
+    user_msg_text += "\nEnjoy your new features! ✨"
+    
+    await safe_edit_message(query.message, admin_confirm_text, reply_markup=admin_markup, parse_mode=enums.ParseMode.MARKDOWN)
+    await query.answer("Premium granted!", show_alert=False)
+    if user_id in user_states: del user_states[user_id]
+        
+    try:
+        await app.send_message(target_user_id, user_msg_text, parse_mode=enums.ParseMode.MARKDOWN)
+        await send_log_to_channel(app, LOG_CHANNEL,
+            f"💰 Premium granted to `{target_user_id}` by admin `{user_id}`.\nPlatforms: `{', '.join(selected_platforms)}`, Plan: `{premium_plan_key}`"
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify user {target_user_id} about premium: {e}")
     
     # Answer the query to stop the loading animation on the button
     await query.answer()
