@@ -38,7 +38,6 @@ from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
 # System Utilities
 import psutil
-import GPUtil
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
