@@ -5,7 +5,7 @@ import threading
 import logging
 import subprocess
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import signal
 from functools import wraps, partial
@@ -550,11 +550,11 @@ async def is_premium_for_platform(user_id, platform):
         return True
 
     # Ensure premium_until is a datetime object before comparison
-    if premium_until and isinstance(premium_until, datetime) and premium_until > datetime.utcnow():
+    if premium_until and isinstance(premium_until, datetime) and premium_until > datetime.now(timezone.utc):
         return True
 
     # If premium has expired, update the status in the DB
-    if premium_type and premium_until and premium_until <= datetime.utcnow():
+    if premium_type and premium_until and premium_until <= datetime.now(timezone.utc):
         await asyncio.to_thread(
             db.users.update_one,
             {"_id": user_id},
@@ -574,7 +574,7 @@ async def save_platform_session(user_id, platform, session_data):
         {"user_id": user_id, "platform": platform, "account_id": account_id},
         {"$set": {
             "session_data": session_data,
-            "logged_in_at": datetime.utcnow()
+            "logged_in_at": datetime.now(timezone.utc)
         }},
         upsert=True
     )
@@ -799,7 +799,7 @@ async def start(_, msg):
     if is_new_user:
         await _save_user_data(user_id, {
             "_id": user_id, "premium": {}, "added_by": "self_start", 
-            "added_at": datetime.utcnow(), "username": msg.from_user.username
+            "added_at": datetime.now(timezone.utc), "username": msg.from_user.username
         })
         logger.info(f"New user {user_id} added to database via start command.")
         await send_log_to_channel(app, LOG_CHANNEL, f"🌟 New user started bot: `{user_id}` (`{msg.from_user.username or 'N/A'}`)")
@@ -817,7 +817,7 @@ async def start(_, msg):
         return
     else:
         # Update user info on every start
-        await _save_user_data(user_id, {"last_active": datetime.utcnow(), "username": msg.from_user.username})
+        await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc), "username": msg.from_user.username})
 
     event_toggle = global_settings.get("special_event_toggle", False)
     if event_toggle:
@@ -836,10 +836,10 @@ async def start(_, msg):
             p_data = user.get("premium", {}).get(platform, {})
             p_expiry = p_data.get("until")
             if p_expiry:
-                remaining = p_expiry - datetime.utcnow()
+                remaining = p_expiry - datetime.now(timezone.utc)
                 premium_details_text += f"⭐ {platform.capitalize()} premium expires in: `{remaining.days} days, {remaining.seconds // 3600} hours`.\n"
             elif p_data.get("type") == "lifetime":
-                 premium_details_text += f"⭐ {platform.capitalize()} premium: **Lifetime**\n"
+                premium_details_text += f"⭐ {platform.capitalize()} premium: **Lifetime**\n"
 
 
     if not has_any_premium:
@@ -859,43 +859,34 @@ async def start(_, msg):
 async def restart_cmd(_, msg):
     await restart_bot(msg)
 
+# NEW FACEBOOK LOGIN FLOW
 @app.on_message(filters.command(["fblogin", "flogin"]))
 @with_user_lock
-async def facebook_login_cmd(_, msg):
+async def facebook_login_cmd_new(_, msg):
     user_id = msg.from_user.id
     if not await is_premium_for_platform(user_id, "facebook"):
         return await msg.reply("❌ " + to_bold_sans("Facebook Premium Access Is Required. Use /premiumplan To Upgrade."))
     
-    # Start the Facebook login flow
-    user_states[user_id] = {"action": "waiting_for_fb_token"}
-    await msg.reply(
-        "🔑 " + to_bold_sans("Please Send Your Long-lived Facebook Page Access Token.") + "\n\n"
-        "This token must have `pages_show_list` and `pages_manage_posts` permissions."
-    )
+    user_states[user_id] = {"action": "waiting_for_fb_app_secret", "platform": "facebook"}
+    await msg.reply("🔑 " + to_bold_sans("Please Enter Your Facebook App Secret."))
 
+# NEW YOUTUBE LOGIN FLOW
 @app.on_message(filters.command(["ytlogin", "ylogin"]))
 @with_user_lock
-async def youtube_login_cmd(_, msg):
+async def youtube_login_cmd_new(_, msg):
     user_id = msg.from_user.id
     if not await is_premium_for_platform(user_id, "youtube"):
         return await msg.reply("❌ " + to_bold_sans("YouTube Premium Access Is Required. Use /premiumplan To Upgrade."))
-    
-    user_states[user_id] = {"action": "waiting_for_yt_client_secrets_json"}
-    await msg.reply(
-        "🤫 " + to_bold_sans("Please Send Your Google OAuth `client_secrets.json` File.") + "\n\n"
-        "1. Go to the [Google Cloud Console](https://console.cloud.google.com/apis/credentials).\n"
-        "2. Create or select a project.\n"
-        "3. Go to **Credentials**, click **+ CREATE CREDENTIALS**, and choose **OAuth client ID**.\n"
-        "4. Select **Desktop app** as the application type.\n"
-        "5. Download the JSON file and send it here.",
-        disable_web_page_preview=True
-    )
+        
+    user_states[user_id] = {"action": "waiting_for_yt_client_id", "platform": "youtube"}
+    await msg.reply("🔑 " + to_bold_sans("Please Enter Your Google OAuth `client_id`."))
+
 
 @app.on_message(filters.command(["buypypremium", "premiumplan"]))
 @app.on_message(filters.regex("⭐ ᴩʀᴇᴍɪᴜᴍ"))
 async def show_premium_options(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     premium_plans_text = (
         "⭐ " + to_bold_sans("Upgrade To Premium!") + " ⭐\n\n"
         + to_bold_sans("Unlock Full Features And Upload Unlimited Content Without Restrictions.") + "\n\n"
@@ -906,7 +897,7 @@ async def show_premium_options(_, msg):
 @app.on_message(filters.command("premiumdetails"))
 async def premium_details_cmd(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     user = await _get_user_data(user_id)
     if not user:
         return await msg.reply(to_bold_sans("You Are Not Registered. Please Use /start."))
@@ -925,7 +916,7 @@ async def premium_details_cmd(_, msg):
             if premium_type == "lifetime":
                 status_text += "🎉 **Lifetime!**\n"
             elif premium_until:
-                remaining_time = premium_until - datetime.utcnow()
+                remaining_time = premium_until - datetime.now(timezone.utc)
                 days, rem = divmod(remaining_time.total_seconds(), 86400)
                 hours, rem = divmod(rem, 3600)
                 minutes, _ = divmod(rem, 60)
@@ -1000,7 +991,7 @@ async def restart_button_handler(_, msg):
 @app.on_message(filters.regex("⚙️ ꜱᴇᴛᴛɪɴɢꜱ"))
 async def settings_menu(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     
     has_premium_any = await is_premium_for_platform(user_id, "facebook") or \
                       await is_premium_for_platform(user_id, "youtube")
@@ -1025,7 +1016,7 @@ async def admin_panel_button_handler(_, msg):
 @with_user_lock
 async def show_stats(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     if db is None: return await msg.reply("⚠️ " + to_bold_sans("Database Is Currently Unavailable."))
     
     total_users = await asyncio.to_thread(db.users.count_documents, {})
@@ -1036,12 +1027,12 @@ async def show_stats(_, msg):
             "is_premium": {"$or": [
                 {"$or": [
                     {"$eq": [f"$premium.{p}.type", "lifetime"]},
-                    {"$gt": [f"$premium.{p}.until", datetime.utcnow()]}
+                    {"$gt": [f"$premium.{p}.until", datetime.now(timezone.utc)]}
                 ]} for p in PREMIUM_PLATFORMS
             ]},
             "platforms": {p: {"$or": [
                 {"$eq": [f"$premium.{p}.type", "lifetime"]},
-                {"$gt": [f"$premium.{p}.until", datetime.utcnow()]}
+                {"$gt": [f"$premium.{p}.until", datetime.now(timezone.utc)]}
             ]} for p in PREMIUM_PLATFORMS}
         }},
         {"$group": {
@@ -1089,7 +1080,7 @@ async def show_stats(_, msg):
 @with_user_lock
 async def initiate_upload(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
 
     type_map = {
         "📘 FB ᴩᴏꜱᴛ": ("facebook", "post"),
@@ -1128,60 +1119,135 @@ async def initiate_upload(_, msg):
 async def handle_text_input(_, msg):
     user_id = msg.from_user.id
     state_data = user_states.get(user_id)
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
 
     if not state_data:
         return # Ignore random text if user is not in a specific state
 
     action = state_data.get("action")
 
-    # --- Login Flows ---
-    if action == "waiting_for_fb_token":
+    # --- NEW Login Flows ---
+    if action == "waiting_for_fb_app_secret":
+        state_data["app_secret"] = msg.text.strip()
+        state_data["action"] = "waiting_for_fb_app_id"
+        await msg.reply("🔑 " + to_bold_sans("Please Enter Your Facebook App ID."))
+    
+    elif action == "waiting_for_fb_app_id":
+        state_data["app_id"] = msg.text.strip()
+        state_data["action"] = "waiting_for_fb_page_token"
+        await msg.reply(
+            "🔑 " + to_bold_sans("Please Enter Your Facebook Page API Token.") + "\n\n"
+            + "This is a **Page Access Token**, not a User Token.\n"
+            + "You can get it from the [Facebook Developer Dashboard](https://developers.facebook.com/tools/explorer/).",
+            disable_web_page_preview=True
+        )
+        
+    elif action == "waiting_for_fb_page_token":
         token = msg.text.strip()
-        login_msg = await msg.reply("🔐 " + to_bold_sans("Validating Token And Fetching Pages..."))
+        login_msg = await msg.reply("🔐 " + to_bold_sans("Validating Token And Fetching Page details..."))
         
         try:
-            url = f"https://graph.facebook.com/v18.0/me/accounts?access_token={token}"
+            url = f"https://graph.facebook.com/v18.0/me?access_token={token}&fields=id,name"
             response = requests.get(url)
             response.raise_for_status()
-            pages = response.json().get('data', [])
-            
-            if not pages:
-                return await safe_edit_message(login_msg, "❌ " + to_bold_sans("No Pages Found For This Token. Ensure It Has `pages_show_list` And `pages_manage_posts` Permissions."))
+            page_data = response.json()
+            page_id = page_data.get('id')
+            page_name = page_data.get('name')
 
-            user_states[user_id]['token'] = token
-            user_states[user_id]['pages'] = pages
-            user_states[user_id]['action'] = 'selecting_fb_page'
-            
-            buttons = [[InlineKeyboardButton(page['name'], callback_data=f"select_fb_page_{page['id']}")] for page in pages]
-            await safe_edit_message(login_msg, "📄 " + to_bold_sans("Select The Page You Want To Use:"), reply_markup=InlineKeyboardMarkup(buttons))
+            if not page_id or not page_name:
+                 return await safe_edit_message(login_msg, "❌ " + to_bold_sans("Invalid Page Token. Could not fetch Page ID and Name."))
 
+            session_data = {
+                'id': page_id,
+                'name': page_name,
+                'access_token': token
+            }
+            await save_platform_session(user_id, "facebook", session_data)
+            
+            user_settings = await get_user_settings(user_id)
+            user_settings["active_facebook_id"] = page_id
+            await save_user_settings(user_id, user_settings)
+            
+            await safe_edit_message(login_msg, 
+                f"✅ {to_bold_sans('Successfully login!')}\n\n"
+                f"**Name:** `{page_name}`\n"
+                f"**ID:** `{page_id}`"
+            )
+            await send_log_to_channel(app, LOG_CHANNEL, f"📝 New Facebook Login: User `{user_id}`, Page: `{page_name}`")
+        
         except requests.RequestException as e:
             await safe_edit_message(login_msg, f"❌ " + to_bold_sans(f"Login Failed: Invalid token or API error. {e}"))
+        finally:
+            if user_id in user_states: del user_states[user_id]
+            
+    elif action == "waiting_for_yt_client_id":
+        state_data["client_id"] = msg.text.strip()
+        state_data["action"] = "waiting_for_yt_client_secret"
+        await msg.reply("🔑 " + to_bold_sans("Please Enter Your Google OAuth `client_secret`."))
+    
+    elif action == "waiting_for_yt_client_secret":
+        state_data["client_secret"] = msg.text.strip()
+        try:
+            client_config = {
+                "web": {
+                    "client_id": state_data["client_id"],
+                    "client_secret": state_data["client_secret"],
+                    "redirect_uris": [REDIRECT_URI],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token"
+                }
+            }
+            flow = Flow.from_client_config(
+                client_config,
+                scopes=['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube'],
+                redirect_uri=REDIRECT_URI
+            )
+            auth_url, state = flow.authorization_url(access_type='offline', prompt='consent')
+            oauth_flows[state] = flow
+            state_data["oauth_state"] = state
+            state_data["action"] = "waiting_for_yt_auth_code"
+
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔗 Google OAuth Link", url=auth_url)],
+                [InlineKeyboardButton("✅ I have the code", callback_data="yt_code_received")]
+            ])
+            await msg.reply(
+                "⬇️ " + to_bold_sans("Click the link below, allow access, and copy the code from the URL.") + "\n\n"
+                "After allowing, you'll be redirected to a page. Copy the **full URL** of that page and send it back to me, or just the `code` parameter value.",
+                reply_markup=markup
+            )
+        except Exception as e:
+            await msg.reply(f"❌ " + to_bold_sans(f"Failed to generate auth URL. Check your Client ID/Secret. Error: {e}"))
             if user_id in user_states: del user_states[user_id]
 
-    elif action == "waiting_for_yt_auth_url":
-        # User pastes the final URL from the browser after authenticating
-        redirect_response = msg.text.strip()
-        state = parse_qs(urlparse(redirect_response).query).get('state', [None])[0]
+    elif action == "waiting_for_yt_auth_code":
+        auth_code_or_url = msg.text.strip()
+        auth_msg = await msg.reply("🔐 " + to_bold_sans("Exchanging code for tokens... please wait"))
         
+        state = state_data.get("oauth_state")
         if not state or state not in oauth_flows:
-            return await msg.reply("❌ " + to_bold_sans("Invalid or expired authentication link. Please try /ytlogin again."))
+            return await safe_edit_message(auth_msg, "❌ " + to_bold_sans("Invalid or expired authentication session. Please try /ytlogin again."))
 
         flow = oauth_flows[state]
         try:
-            await asyncio.to_thread(flow.fetch_token, authorization_response=redirect_response)
+            # Check if the user pasted the full URL or just the code
+            if "localhost" in auth_code_or_url or "code=" in auth_code_or_url:
+                await asyncio.to_thread(flow.fetch_token, authorization_response=auth_code_or_url)
+            else:
+                await asyncio.to_thread(flow.fetch_token, code=auth_code_or_url)
+            
             credentials = flow.credentials
             
             youtube = build('youtube', 'v3', credentials=credentials)
-            channels_response = await asyncio.to_thread(youtube.channels().list(part='snippet', mine=True).execute)
+            channels_response = await asyncio.to_thread(youtube.channels().list(part='snippet,contentDetails', mine=True).execute)
             
             if not channels_response.get('items'):
-                return await msg.reply("❌ " + to_bold_sans("No YouTube Channel Found For This Account."))
+                return await safe_edit_message(auth_msg, "❌ " + to_bold_sans("No YouTube Channel Found For This Account."))
             
             channel = channels_response['items'][0]
             channel_id = channel['id']
             channel_name = channel['snippet']['title']
+            uploads_playlist_id = channel['contentDetails']['relatedPlaylists']['uploads']
             
             session_data = {
                 'id': channel_id,
@@ -1194,10 +1260,20 @@ async def handle_text_input(_, msg):
             user_settings["active_youtube_id"] = channel_id
             await save_user_settings(user_id, user_settings)
             
-            await msg.reply(f"✅ " + to_bold_sans(f"YouTube Login Successful For Channel: {channel_name}!"))
+            await safe_edit_message(
+                auth_msg, 
+                f"✅ {to_bold_sans('Successfully login!')}\n\n"
+                f"**Channel Title:** `{channel_name}`\n"
+                f"**Channel ID:** `{channel_id}`\n"
+                f"**Uploads Playlist:** `{uploads_playlist_id}`"
+            )
             await send_log_to_channel(app, LOG_CHANNEL, f"📝 New YouTube Login: User `{user_id}`, Channel: `{channel_name}`")
         except Exception as e:
-            await msg.reply(f"❌ " + to_bold_sans(f"Login Failed. Please Try /ytlogin Again. Error: {e}"))
+            await safe_edit_message(auth_msg, 
+                f"❌ {to_bold_sans('Login Failed.')}\n"
+                f"Error: `{e}`\n\n"
+                "**Note:** If you see 'Access blocked' or '401 invalid_client', make sure your app is **Published** in Google Cloud Console, and you have added your Google account email as a **Test User** in the OAuth Consent Screen settings."
+            )
             logger.error(f"YouTube token exchange failed for {user_id}: {e}")
         finally:
             if state in oauth_flows: del oauth_flows[state]
@@ -1249,12 +1325,14 @@ async def handle_text_input(_, msg):
     elif action == "waiting_for_schedule_time":
         try:
             # Expecting format like "YYYY-MM-DD HH:MM"
-            schedule_time_utc = datetime.fromisoformat(msg.text.strip())
-            if schedule_time_utc <= datetime.utcnow():
+            dt_naive = datetime.strptime(msg.text.strip(), "%Y-%m-%d %H:%M")
+            schedule_time_utc = dt_naive.replace(tzinfo=timezone.utc)
+            
+            if schedule_time_utc <= datetime.now(timezone.utc):
                 return await msg.reply("❌ " + to_bold_sans("Scheduled time must be in the future."))
             
             # YouTube API requires ISO 8601 format with 'Z' for UTC
-            state_data['file_info']['schedule_time'] = schedule_time_utc.isoformat() + "Z"
+            state_data['file_info']['schedule_time'] = schedule_time_utc.isoformat().replace("+00:00", "Z")
             await process_upload_step(msg)
         except ValueError:
             await msg.reply("❌ " + to_bold_sans("Invalid format. Please use `YYYY-MM-DD HH:MM` in UTC."))
@@ -1386,7 +1464,7 @@ async def select_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
-    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{platform}_accounts'))
+    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^confirm_logout_"))
 async def confirm_logout_cb(_, query):
@@ -1420,7 +1498,7 @@ async def logout_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
-    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{platform}_accounts'))
+    await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^add_account_"))
 async def add_account_cb(_, query):
@@ -1430,12 +1508,13 @@ async def add_account_cb(_, query):
     if not await is_premium_for_platform(user_id, platform) and not is_admin(user_id):
         return await query.answer("❌ This is a premium feature.", show_alert=True)
     
-    if platform == "facebook":
-        user_states[user_id] = {"action": "waiting_for_fb_token"}
-        await safe_edit_message(query.message, "🔑 " + to_bold_sans("Please Send Your Facebook Page Access Token."))
-    elif platform == "youtube":
-        user_states[user_id] = {"action": "waiting_for_yt_client_secrets_json"}
-        await safe_edit_message(query.message, "🤫 " + to_bold_sans("Please Send Your Google OAuth `client_secrets.json` File."))
+    # We now trigger the new login flows using commands
+    await query.message.delete()
+    if platform == 'facebook':
+        await facebook_login_cmd_new(app, query.message)
+    elif platform == 'youtube':
+        await youtube_login_cmd_new(app, query.message)
+
 
 # --- General Callbacks ---
 @app.on_callback_query(filters.regex("^cancel_upload$"))
@@ -1489,14 +1568,14 @@ async def upload_flow_cb(_, query):
                 query.message,
                 "⏰ " + to_bold_sans("Send Schedule Time (UTC)") + "\n\n"
                 "Format: `YYYY-MM-DD HH:MM`\n"
-                f"Current UTC time: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')}`"
+                f"Current UTC time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}`"
             )
 
 # --- Premium & Payment Callbacks ---
 @app.on_callback_query(filters.regex("^buypypremium$"))
 async def buypypremium_cb(_, query):
     user_id = query.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     
     premium_plans_text = (
         "⭐ " + to_bold_sans("Upgrade To Premium!") + " ⭐\n\n"
@@ -1613,7 +1692,7 @@ async def global_settings_panel_cb(_, query):
 async def back_to_cb(_, query):
     data = query.data
     user_id = query.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     
     # Clean up state when going back
     await task_tracker.cancel_all_user_tasks(user_id)
@@ -1645,12 +1724,12 @@ async def activate_trial_cb(_, query):
     if await is_premium_for_platform(user_id, platform):
         return await query.answer(f"You already have an active premium/trial for {platform.capitalize()}!", show_alert=True)
 
-    premium_until = datetime.utcnow() + timedelta(hours=6)
+    premium_until = datetime.now(timezone.utc) + timedelta(hours=6)
     user_data = await _get_user_data(user_id) or {}
     user_premium_data = user_data.get("premium", {})
     user_premium_data[platform] = {
         "type": "6_hour_trial", "added_by": "callback_trial",
-        "added_at": datetime.utcnow(), "until": premium_until,
+        "added_at": datetime.now(timezone.utc), "until": premium_until,
         "status": "active"
     }
     await _save_user_data(user_id, {"premium": user_premium_data})
@@ -1681,33 +1760,14 @@ async def set_visibility_cb(_, query):
     await query.answer(f"✅ Default YouTube visibility set to {visibility}.", show_alert=True)
     await safe_edit_message(query.message, "⚙️ " + to_bold_sans("Configure YouTube Settings:"), reply_markup=get_youtube_settings_markup())
 
-@app.on_callback_query(filters.regex("^select_fb_page_"))
-async def select_fb_page_cb(_, query):
+@app.on_callback_query(filters.regex("^yt_code_received$"))
+async def yt_code_received_cb(_, query):
     user_id = query.from_user.id
-    state_data = user_states.get(user_id, {})
-    if not state_data or state_data.get('action') != 'selecting_fb_page':
-        return await query.answer("❌ Error: State lost. Please /fblogin again.", show_alert=True)
+    user_states[user_id]["action"] = "waiting_for_yt_auth_code"
+    await query.answer("OK, now send me the code or URL.", show_alert=True)
+    await safe_edit_message(query.message, "🔑 " + to_bold_sans("Please paste the verification code or the full redirect URL here:"))
 
-    page_id = query.data.split("_")[-1]
-    page = next((p for p in state_data['pages'] if p['id'] == page_id), None)
-    
-    if not page:
-        return await query.answer("❌ Error: Invalid page selected.", show_alert=True)
 
-    session_data = {
-        'id': page['id'],
-        'name': page['name'],
-        'access_token': page['access_token']
-    }
-    await save_platform_session(user_id, "facebook", session_data)
-
-    user_settings = await get_user_settings(user_id)
-    user_settings["active_facebook_id"] = page['id']
-    await save_user_settings(user_id, user_settings)
-    
-    await safe_edit_message(query.message, f"✅ " + to_bold_sans(f"Facebook Login Successful For Page: {page['name']}!"))
-    await send_log_to_channel(app, LOG_CHANNEL, f"📝 New Facebook Login: User `{user_id}`, Page: `{page['name']}`")
-    if user_id in user_states: del user_states[user_id]
 # ===================================================================
 # ======================== MEDIA HANDLERS ===========================
 # ===================================================================
@@ -1781,7 +1841,7 @@ async def process_upload_step(msg_or_query):
 @with_user_lock
 async def handle_media_upload(_, msg):
     user_id = msg.from_user.id
-    await _save_user_data(user_id, {"last_active": datetime.utcnow()})
+    await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     state_data = user_states.get(user_id, {})
 
     # Handle admin settings media (e.g., QR code)
@@ -1932,7 +1992,10 @@ async def process_and_upload(msg, file_info, user_id):
                     try:
                         creds.refresh(Request())
                         session['credentials_json'] = creds.to_json()
-                        await save_platform_session(user_id, 'youtube', {'id': session['id'], 'name': session['name'], 'credentials_json': session['credentials_json']})
+                        # Re-save the refreshed credentials
+                        active_session = await get_active_session(user_id, 'youtube')
+                        active_session['credentials_json'] = creds.to_json()
+                        await save_platform_session(user_id, "youtube", active_session)
                     except RefreshError as e:
                         raise ConnectionError(f"YouTube token expired and failed to refresh. Please /ytlogin again. Error: {e}")
 
@@ -1979,12 +2042,12 @@ async def process_and_upload(msg, file_info, user_id):
             if db is not None:
                 await asyncio.to_thread(db.uploads.insert_one, {
                     "user_id": user_id, "media_id": str(media_id),
-                    "platform": platform, "upload_type": upload_type, "timestamp": datetime.utcnow(),
+                    "platform": platform, "upload_type": upload_type, "timestamp": datetime.now(timezone.utc),
                     "url": url, "title": final_title
                 })
 
             log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n" \
-                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
             success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
             if file_info.get('schedule_time'):
                 success_msg += f"\n\n⏰ Scheduled for: `{file_info['schedule_time']}`"
