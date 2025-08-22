@@ -184,7 +184,8 @@ DEFAULT_GLOBAL_SETTINGS = {
         "google_play_qr_file_id": "",
         "upi": "", "usdt": "", "btc": "", "others": "", "custom_buttons": {},
         "instructions": "After paying, please send the transaction ID or a screenshot of your payment."
-    }
+    },
+    "last_weekly_report": None
 }
 
 # --- Global State & DB Management ---
@@ -891,7 +892,7 @@ async def restart_cmd(_, msg):
 async def facebook_login_cmd_new(_, msg):
     user_id = msg.from_user.id
     if not await is_premium_for_platform(user_id, "facebook"):
-        return await msg.reply("❌ " + to_bold_sans("Facebook Premium Access Is Required. Use /premiumplan To Upgrade."))
+        return await msg.reply("❌ " + to_bold_sans("Facebook Premium Access Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
     user_states[user_id] = {"action": "waiting_for_fb_app_secret", "platform": "facebook"}
     await msg.reply("🔑 " + to_bold_sans("Please Enter Your Facebook App Secret."))
@@ -902,7 +903,7 @@ async def facebook_login_cmd_new(_, msg):
 async def youtube_login_cmd_new(_, msg):
     user_id = msg.from_user.id
     if not await is_premium_for_platform(user_id, "youtube"):
-        return await msg.reply("❌ " + to_bold_sans("YouTube Premium Access Is Required. Use /premiumplan To Upgrade."))
+        return await msg.reply("❌ " + to_bold_sans("YouTube Premium Access Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
         
     user_states[user_id] = {"action": "waiting_for_yt_client_id", "platform": "youtube"}
     await msg.reply("🔑 " + to_bold_sans("Please Enter Your Google OAuth `client_id`."))
@@ -982,6 +983,45 @@ async def handle_skip_command(_, msg):
     elif action == 'waiting_for_tags':
         state_data["file_info"]["tags"] = "" # Use empty tags
         await process_upload_step(msg)
+        
+# NEW: Leaderboard command
+@app.on_message(filters.command("leaderboard"))
+async def leaderboard_cmd(_, msg):
+    if db is None:
+        return await msg.reply("⚠️ " + to_bold_sans("Database is currently unavailable."))
+
+    pipeline = [
+        {"$group": {"_id": "$user_id", "upload_count": {"$sum": 1}}},
+        {"$sort": {"upload_count": -1}},
+        {"$limit": 5}
+    ]
+    
+    try:
+        leaderboard_data = await asyncio.to_thread(list, db.uploads.aggregate(pipeline))
+        
+        if not leaderboard_data:
+            return await msg.reply("🏆 " + to_bold_sans("Leaderboard is empty. No uploads recorded yet!"))
+            
+        leaderboard_text = "🏆 **" + to_bold_sans("Top 5 Uploaders") + "** 🏆\n\n"
+        
+        for i, user in enumerate(leaderboard_data):
+            user_id = user['_id']
+            upload_count = user['upload_count']
+            
+            try:
+                user_info = await app.get_users(user_id)
+                user_name = user_info.first_name
+            except Exception:
+                user_name = f"User ID: {user_id}"
+
+            leaderboard_text += f"**{i+1}.** {user_name} - `{upload_count}` uploads\n"
+            
+        await msg.reply(leaderboard_text, parse_mode=enums.ParseMode.MARKDOWN)
+
+    except OperationFailure as e:
+        logger.error(f"Leaderboard aggregation failed: {e}")
+        await msg.reply("⚠️ " + to_bold_sans("Could not fetch the leaderboard."))
+
 
 # ===================================================================
 # ======================== REGEX HANDLERS ===========================
@@ -1000,7 +1040,7 @@ async def settings_menu(_, msg):
                       await is_premium_for_platform(user_id, "youtube")
     
     if not is_admin(user_id) and not has_premium_any:
-        return await msg.reply("❌ " + to_bold_sans("Premium Required To Access Settings. Use /premiumplan To Upgrade."))
+        return await msg.reply("❌ " + to_bold_sans("Premium Required To Access Settings. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
     await msg.reply(
         "⚙️ " + to_bold_sans("Configure Your Upload Settings:"),
@@ -1119,7 +1159,7 @@ async def initiate_upload(_, msg):
 
     sessions = await load_platform_sessions(user_id, platform)
     if not sessions:
-        return await msg.reply(f"❌ " + to_bold_sans(f"Please Login To {platform.capitalize()} First Using /{platform[0]}login"), parse_mode=enums.ParseMode.MARKDOWN)
+        return await msg.reply(f"❌ " + to_bold_sans(f"Please Login To {platform.capitalize()} First Using `/{platform[0]}login`"), parse_mode=enums.ParseMode.MARKDOWN)
     
     action = f"waiting_for_media"
     user_states[user_id] = {
@@ -1178,7 +1218,7 @@ async def handle_text_input(_, msg):
             page_name = page_data.get('name')
 
             if not page_id or not page_name:
-                 return await safe_edit_message(login_msg, "❌ " + to_bold_sans("Invalid Page Token. Could not fetch Page ID and Name."))
+                return await safe_edit_message(login_msg, "❌ " + to_bold_sans("Invalid Page Token. Could not fetch Page ID and Name."))
 
             session_data = {
                 'id': page_id,
@@ -1364,32 +1404,19 @@ async def handle_text_input(_, msg):
     # --- Admin Flow ---
     elif action == "waiting_for_broadcast_message":
         if not is_admin(user_id): return
-        broadcast_text = msg.text
+        
+        # New broadcast logic to handle media and buttons
+        if msg.text:
+            await broadcast_message(msg, text=msg.text, reply_markup=msg.reply_markup)
+        elif msg.photo:
+            await broadcast_message(msg, photo=msg.photo.file_id, caption=msg.caption, reply_markup=msg.reply_markup)
+        elif msg.video:
+            await broadcast_message(msg, video=msg.video.file_id, caption=msg.caption, reply_markup=msg.reply_markup)
+        else:
+            await msg.reply("Unsupported broadcast format. Please send text, photo, or video.")
+            
         if user_id in user_states: del user_states[user_id]
-        
-        users_cursor = await asyncio.to_thread(db.users.find, {})
-        users = await asyncio.to_thread(list, users_cursor)
-        sent_count, failed_count = 0, 0
-        status_msg = await msg.reply(f"📢 {to_bold_sans('Starting Broadcast...')}\nMessage:\n{broadcast_text}")
-        
-        for user in users:
-            try:
-                if user["_id"] == ADMIN_ID or user["_id"] == BOT_ID: continue
-                await app.send_message(user["_id"], broadcast_text, parse_mode=enums.ParseMode.MARKDOWN)
-                sent_count += 1
-                await asyncio.sleep(0.1)
-            except UserIsBlocked:
-                failed_count += 1
-                logger.warning(f"User {user['_id']} has blocked the bot. Skipping.")
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"Failed to send broadcast to user {user['_id']}: {e}")
-                
-        await status_msg.edit_text(f"✅ **Broadcast finished!**\nSent to `{sent_count}` users, failed for `{failed_count}` users.")
-        await send_log_to_channel(app, LOG_CHANNEL,
-            f"📢 Broadcast by admin `{msg.from_user.id}`\n"
-            f"Sent: `{sent_count}`, Failed: `{failed_count}`"
-        )
+
 
     elif action == "waiting_for_target_user_id_premium_management":
         if not is_admin(user_id): return
@@ -1920,7 +1947,7 @@ async def admin_panel_actions_cb(_, query):
 
     elif action == "broadcast_message":
         user_states[user_id] = {"action": "waiting_for_broadcast_message"}
-        await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message you want to broadcast to all users."))
+        await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message (text, photo, or video) you want to broadcast to all users."))
     
     elif action == "admin_stats_panel":
         # MOCKMSG FIX: Pass the query object to create a compliant mock message
@@ -1951,7 +1978,7 @@ async def show_user_details(message, target_user_id):
         
     last_active = user_data.get('last_active', 'N/A')
     if isinstance(last_active, datetime):
-         details_text += f"**Last Active:** {last_active.strftime('%Y-%m-%d %H:%M')}\n\n"
+        details_text += f"**Last Active:** {last_active.strftime('%Y-%m-%d %H:%M')}\n\n"
     else:
         details_text += f"**Last Active:** {last_active}\n\n"
 
@@ -1998,7 +2025,7 @@ async def show_global_settings_panel(message_or_query):
     )
     await safe_edit_message(message, settings_text, reply_markup=get_admin_global_settings_markup(), parse_mode=enums.ParseMode.MARKDOWN)
 
-@app.on_callback_query(filters.regex("^(global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|set_max_file_size|set_payment_instructions|toggle_multiple_logins|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel)$"))
+@app.on_callback_query(filters.regex("^(global_settings_panel|toggle_special_event|set_event_title|set_event_message|set_max_uploads|set_max_file_size|set_payment_instructions|toggle_multiple_logins|reset_stats|show_system_stats|confirm_reset_stats|payment_settings_panel|create_custom_payment_button|set_payment_google_play_qr|set_payment_upi|set_payment_usdt|set_payment_btc|set_payment_others)$"))
 async def global_settings_actions_cb(_, query):
     user_id = query.from_user.id
     if not is_admin(user_id):
@@ -2069,6 +2096,20 @@ async def global_settings_actions_cb(_, query):
     
     elif action == "payment_settings_panel":
         await safe_edit_message(query.message, "💰 " + to_bold_sans("Manage Payment Settings:"), reply_markup=payment_settings_markup)
+
+    elif action == "create_custom_payment_button":
+        user_states[user_id] = {"action": "waiting_for_custom_button_name"}
+        await query.message.edit("🆕 " + to_bold_sans("Enter the name for the new payment button (e.g., PayPal)."))
+
+    elif action == "set_payment_google_play_qr":
+        user_states[user_id] = {"action": "waiting_for_google_play_qr"}
+        await query.message.edit("🖼️ " + to_bold_sans("Please send the QR code image for Google Play."))
+
+    elif action in ["set_payment_upi", "set_payment_usdt", "set_payment_btc", "set_payment_others"]:
+        method = action.split("set_payment_")[1]
+        user_states[user_id] = {"action": f"waiting_for_payment_details_{method}"}
+        await query.message.edit(f"✍️ " + to_bold_sans(f"Please send the payment details for {method.upper()}."))
+
 
 # --- Back Callbacks ---
 @app.on_callback_query(filters.regex("^back_to_"))
@@ -2578,6 +2619,7 @@ async def start_bot():
             valid_log_channel = False
 
     logger.info(f"Bot is now online! ID: {BOT_ID}. Waiting for tasks...")
+    task_tracker.create_task(weekly_report_scheduler())
     await idle()
 
     logger.info("Shutting down...")
@@ -2586,6 +2628,98 @@ async def start_bot():
     if mongo:
         mongo.close()
     logger.info("Bot has been shut down gracefully.")
+    
+# NEW: Enhanced broadcast function
+async def broadcast_message(admin_msg, text=None, photo=None, video=None, reply_markup=None):
+    if db is None:
+        return await admin_msg.reply("DB connection failed, cannot get user list.")
+
+    users_cursor = await asyncio.to_thread(db.users.find, {})
+    users = await asyncio.to_thread(list, users_cursor)
+    sent_count, failed_count = 0, 0
+    status_msg = await admin_msg.reply(f"📢 {to_bold_sans('Starting Broadcast...')}")
+    
+    for user in users:
+        try:
+            user_id = user["_id"]
+            if user_id == ADMIN_ID or user_id == BOT_ID:
+                continue
+            
+            if text:
+                await app.send_message(user_id, text, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
+            elif photo:
+                await app.send_photo(user_id, photo, caption=text, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
+            elif video:
+                await app.send_video(user_id, video, caption=text, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
+                
+            sent_count += 1
+            await asyncio.sleep(0.1)
+        except UserIsBlocked:
+            failed_count += 1
+            logger.warning(f"User {user_id} has blocked the bot. Skipping.")
+        except Exception as e:
+            failed_count += 1
+            logger.error(f"Failed to send broadcast to user {user_id}: {e}")
+            
+    await status_msg.edit_text(f"✅ **Broadcast finished!**\nSent to `{sent_count}` users, failed for `{failed_count}` users.")
+    await send_log_to_channel(app, LOG_CHANNEL,
+        f"📢 Broadcast by admin `{admin_msg.from_user.id}`\n"
+        f"Sent: `{sent_count}`, Failed: `{failed_count}`"
+    )
+
+# NEW: Weekly analytics report scheduler
+async def weekly_report_scheduler():
+    while not shutdown_event.is_set():
+        now = datetime.now(timezone.utc)
+        last_report_str = global_settings.get("last_weekly_report")
+        
+        if last_report_str:
+            last_report_time = datetime.fromisoformat(last_report_str)
+            if now - last_report_time < timedelta(days=7):
+                await asyncio.sleep(3600) # Check every hour
+                continue
+
+        await send_weekly_report()
+        await _update_global_setting("last_weekly_report", now.isoformat())
+        
+        # Sleep for a day after sending the report
+        await asyncio.sleep(86400)
+
+async def send_weekly_report():
+    if db is None or not valid_log_channel:
+        return
+
+    one_week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+
+    new_users = await asyncio.to_thread(db.users.count_documents, {"added_at": {"$gte": one_week_ago}})
+    total_uploads_week = await asyncio.to_thread(db.uploads.count_documents, {"timestamp": {"$gte": one_week_ago}})
+    
+    pipeline = [
+        {"$match": {"premium.facebook.added_at": {"$gte": one_week_ago}}},
+        {"$count": "new_premium_fb"}
+    ]
+    new_premium_fb = await asyncio.to_thread(list, db.users.aggregate(pipeline))
+    new_premium_fb_count = new_premium_fb[0]['new_premium_fb'] if new_premium_fb else 0
+    
+    pipeline = [
+        {"$match": {"premium.youtube.added_at": {"$gte": one_week_ago}}},
+        {"$count": "new_premium_yt"}
+    ]
+    new_premium_yt = await asyncio.to_thread(list, db.users.aggregate(pipeline))
+    new_premium_yt_count = new_premium_yt[0]['new_premium_yt'] if new_premium_yt else 0
+
+    report_text = (
+        "📊 **" + to_bold_sans("Weekly Analytics Report") + "** 📊\n\n"
+        f"📅 **Period:** {one_week_ago.strftime('%Y-%m-%d')} to {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n\n"
+        f"**New Users:** `{new_users}`\n"
+        f"**Total Uploads This Week:** `{total_uploads_week}`\n"
+        f"**New Premium Members:**\n"
+        f"  - Facebook: `{new_premium_fb_count}`\n"
+        f"  - YouTube: `{new_premium_yt_count}`\n"
+    )
+
+    await send_log_to_channel(app, LOG_CHANNEL, report_text)
+
 
 if __name__ == "__main__":
     task_tracker = TaskTracker()
