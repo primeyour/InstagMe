@@ -15,5 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of your bot's code
 COPY . .
 
-# Command to run your bot
-CMD ["bash", "start.sh"]
+# Command to run your bot directly with python
+CMD ["python", "main.py"]
