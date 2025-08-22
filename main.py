@@ -2395,7 +2395,7 @@ async def process_and_upload(msg, file_info, user_id):
             # --- Thumbnail generation ---
             if file_info.get("thumbnail_path") == "auto":
                 await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
-                thumb_output_path = path + ".jpg"
+                thumb_output_path = upload_path + ".jpg" # CORRECTED LINE
                 generated_thumb = await asyncio.to_thread(generate_thumbnail, upload_path, thumb_output_path)
                 file_info["thumbnail_path"] = generated_thumb
                 files_to_clean.append(generated_thumb)
@@ -2410,31 +2410,77 @@ async def process_and_upload(msg, file_info, user_id):
             if platform == "facebook":
                 session = await get_active_session(user_id, 'facebook')
                 if not session: raise ConnectionError("Facebook session not found. Please /fblogin.")
+                
                 page_id = session['id']
                 token = session['access_token']
-                description = final_title + "\n\n" + file_info.get("description", "")
-                
+                final_description = final_title + "\n\n" + file_info.get("description", "")
+
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
                         post_url = f"https://graph.facebook.com/{page_id}/photos"
-                        payload = {'access_token': token, 'caption': description}
+                        payload = {'access_token': token, 'caption': final_description}
                         files = {'source': f}
                         r = requests.post(post_url, data=payload, files=files, timeout=600)
                         r.raise_for_status()
-                        post_id = r.json()['post_id']
+                        post_id = r.json().get('post_id', r.json().get('id', 'N/A'))
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
-                else: # video or reel
-                    endpoint = 'videos' if upload_type == 'video' else 'video_reels'
-                    upload_url = f"https://graph-video.facebook.com/{page_id}/{endpoint}"
+                
+                elif upload_type == 'video':
+                    upload_url = f"https://graph-video.facebook.com/{page_id}/videos"
                     with open(upload_path, 'rb') as f:
-                        params = {'access_token': token, 'description': description}
+                        params = {'access_token': token, 'description': final_description}
                         files = {'source': f}
-                        r = requests.post(upload_url, data=params, files=files, timeout=1800) # 30 min timeout
+                        r = requests.post(upload_url, data=params, files=files, timeout=1800)
                         r.raise_for_status()
                         video_id = r.json()['id']
                         url = f"https://facebook.com/{video_id}"
                         media_id = video_id
+
+                elif upload_type == 'reel':
+                    # Step 1: Initialize the upload
+                    init_url = f"https://graph-video.facebook.com/{page_id}/video_reels"
+                    init_params = {
+                        'upload_phase': 'start',
+                        'access_token': token,
+                    }
+                    init_r = requests.post(init_url, data=init_params)
+                    init_r.raise_for_status()
+                    upload_data = init_r.json()
+                    video_id = upload_data['video_id']
+                    upload_url = upload_data['upload_url']
+                    
+                    # Step 2: Upload the video file
+                    file_size = os.path.getsize(upload_path)
+                    upload_headers = {
+                        'Authorization': f'OAuth {token}',
+                        'file_size': str(file_size)
+                    }
+                    with open(upload_path, 'rb') as f:
+                        upload_r = requests.post(upload_url, headers=upload_headers, data=f)
+                        upload_r.raise_for_status()
+
+                    # Step 3: Finish the upload and publish
+                    finish_params = {
+                        'access_token': token,
+                        'video_id': video_id,
+                        'upload_phase': 'finish',
+                        'video_state': 'PUBLISHED',
+                        'description': final_description,
+                    }
+                    
+                    # Loop to check publishing status
+                    for _ in range(10): # Try for a while
+                        await asyncio.sleep(10) # Wait for processing
+                        finish_r = requests.post(init_url, data=finish_params)
+                        if finish_r.status_code == 200 and finish_r.json().get('success'):
+                            logger.info(f"Reel {video_id} published successfully.")
+                            break
+                    else:
+                        raise Exception("Reel publishing timed out or failed.")
+                        
+                    url = f"https://www.facebook.com/reel/{video_id}"
+                    media_id = video_id
             
             elif platform == "youtube":
                 session = await get_active_session(user_id, 'youtube')
