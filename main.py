@@ -2199,13 +2199,13 @@ async def yt_code_received_cb(_, query):
 # ===================================================================
 # ======================== MEDIA HANDLERS ===========================
 # ===================================================================
-
 async def process_upload_step(msg_or_query):
     """Central function to handle the step-by-step upload process."""
-    if hasattr(msg_or_query, 'from_user'): # Is a query
+    # This is a more reliable check for a CallbackQuery
+    if hasattr(msg_or_query, 'message') and msg_or_query.message:
         user_id = msg_or_query.from_user.id
         status_msg = msg_or_query.message
-    else: # Is a message
+    else:  # It's a Message object
         user_id = msg_or_query.from_user.id
         state = user_states.get(user_id, {})
         status_msg = state.get('status_msg', msg_or_query)
