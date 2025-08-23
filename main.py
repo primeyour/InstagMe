@@ -2639,7 +2639,6 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             if not path or not os.path.exists(path):
                 raise FileNotFoundError("Downloaded file path is missing or invalid.")
 
-            # CORRECTED AND SIMPLIFIED is_video CHECK
             msg_obj = file_info.get('original_media_msg')
             is_video = msg_obj and (msg_obj.video or (msg_obj.document and 'video' in (msg_obj.document.mime_type or '')))
 
@@ -2650,7 +2649,6 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
                 files_to_clean.append(processed_path)
             
-            # As requested, thumbnail generation is now ONLY for YouTube
             if platform == 'youtube' and file_info.get("thumbnail_path") == "auto":
                 await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
                 thumb_output_path = upload_path + ".jpg"
@@ -2670,7 +2668,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 
                 page_id = session['id']
                 token = session['access_token']
-                final_description = (file_info.get("description", "") or final_title) # Use title as desc if empty
+                final_description = (file_info.get("description", "") or final_title)
 
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
@@ -2689,8 +2687,10 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 elif upload_type == 'video':
                     file_size = os.path.getsize(upload_path)
                     init_url = f"https://graph-video.facebook.com/v18.0/{page_id}/videos"
-                    init_data = {'access_token': token, 'upload_phase': 'start', 'file_size': file_size}
-                    init_response = requests.post(init_url, data=init_data)
+                    
+                    init_params = {'access_token': token}
+                    init_data = {'upload_phase': 'start', 'file_size': file_size}
+                    init_response = requests.post(init_url, params=init_params, data=init_data) # CORRECTED LINE
                     init_response.raise_for_status()
                     init_data = init_response.json()
                     if not isinstance(init_data, dict):
@@ -2704,12 +2704,13 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
                         upload_response.raise_for_status()
                         
-                    finish_data = {'access_token': token, 'upload_phase': 'finish', 'description': final_description}
+                    finish_params = {'access_token': token}
+                    finish_data = {'upload_phase': 'finish', 'description': final_description}
                     
                     for i in range(15):
                         logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
                         await asyncio.sleep(10)
-                        publish_response = requests.post(init_url, data={'video_id': video_id, **finish_data})
+                        publish_response = requests.post(init_url, params=finish_params, data=finish_data) # CORRECTED LINE
                         if publish_response.status_code == 200:
                             p_json = publish_response.json()
                             if isinstance(p_json, dict) and p_json.get('success'):
@@ -2723,8 +2724,10 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
 
                 elif upload_type == 'reel':
                     init_url = f"https://graph.facebook.com/v18.0/{page_id}/video_reels"
-                    init_data = {'upload_phase': 'start', 'access_token': token}
-                    init_response = requests.post(init_url, data=init_data)
+                    
+                    init_params = {'access_token': token}
+                    init_data = {'upload_phase': 'start'}
+                    init_response = requests.post(init_url, params=init_params, data=init_data) # CORRECTED LINE
                     init_response.raise_for_status()
                     upload_data = init_response.json()
                     if not isinstance(upload_data, dict):
@@ -2756,8 +2759,9 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     else:
                         raise Exception("Facebook Reel processing timed out.")
 
-                    publish_data = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
-                    publish_response = requests.post(init_url, data=publish_data)
+                    publish_params = {'access_token': token}
+                    publish_data = {'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
+                    publish_response = requests.post(init_url, params=publish_params, data=publish_data) # CORRECTED LINE
                     publish_response.raise_for_status()
                     media_id = video_id
                     url = f"https://www.facebook.com/reel/{video_id}"
