@@ -2407,21 +2407,26 @@ async def process_upload_step(msg_or_query):
         if duration < 60:
             short_info = "\n\nℹ️ This video is under 60 seconds and may be published as a YouTube Short if it has a vertical aspect ratio."
 
-    # BUG FIX: Simplified Reels Flow
+    # BUG FIX: Simplified Reels Flow (Corrected Logic)
     if upload_type == "reel":
         if "title" not in file_info:
             state_data["action"] = "waiting_for_title"
+            default_caption = user_settings.get(f'caption_{platform}')
             prompt = to_bold_sans("Reel Received. Please Send Your Caption.")
-            await safe_edit_message(status_msg, prompt)
-        else:
-            # Skip all other steps for Reels
+            if default_caption:
+                prompt += f"\n\nOr use /skip to use your default: `{default_caption[:50]}`"
+            await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+            return # ടൈറ്റിൽ ചോദിച്ച ശേഷം ഇവിടെ നിർത്തണം
+
+        elif "schedule_time" not in file_info:
+            # ടൈറ്റിൽ കിട്ടിക്കഴിഞ്ഞാൽ പബ്ലിഷ് ഓപ്ഷൻ കാണിക്കുക
             file_info['description'] = ""
             file_info['tags'] = ""
             file_info['thumbnail_path'] = None
             file_info['visibility'] = 'public'
             state_data["action"] = "waiting_for_publish_choice"
             await safe_edit_message(status_msg, to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
-        return
+            return # ഓപ്ഷൻ കാണിച്ച ശേഷം ഇവിടെയും നിർത്തണം
 
 
     # Determine the current step based on what's missing in file_info
