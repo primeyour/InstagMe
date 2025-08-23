@@ -2700,56 +2700,112 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         media_id = post_id
                 
                 elif upload_type == 'video':
-                    upload_url = f"https://graph-video.facebook.com/{page_id}/videos"
-                    with open(upload_path, 'rb') as f:
-                        params = {'access_token': token, 'description': final_description}
-                        files = {'source': f}
-                        r = requests.post(upload_url, data=params, files=files, timeout=1800)
-                        r.raise_for_status()
-                        video_id = r.json()['id']
-                        url = f"https://facebook.com/{video_id}"
-                        media_id = video_id
-
-                # BUG FIX: Corrected Reels API Flow
-                elif upload_type == 'reel':
+                    # This new robust method is similar to Reels to prevent incomplete uploads
+                    file_size = os.path.getsize(upload_path)
+                    
                     # Step 1: Initialize the upload session
+                    init_url = f"https://graph-video.facebook.com/v18.0/{page_id}/videos"
+                    init_params = {
+                        'access_token': token,
+                        'upload_phase': 'start',
+                        'file_size': file_size
+                    }
+                    init_response = requests.post(init_url, params=init_params)
+                    init_response.raise_for_status()
+                    init_data = init_response.json()
+                    
+                    video_id = init_data['video_id']
+                    upload_session_url = init_data['upload_url']
+
+                    # Step 2: Upload the video file
+                    upload_headers = {'Authorization': f'OAuth {token}'}
+                    with open(upload_path, 'rb') as f:
+                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
+                        upload_response.raise_for_status()
+                        
+                    # Step 3: Finish the upload by publishing the video
+                    finish_params = {
+                        'access_token': token,
+                        'upload_phase': 'finish',
+                        'description': final_description,
+                    }
+                    
+                    # Wait a moment for processing before finishing
+                    await asyncio.sleep(15)
+                    
+                    publish_response = requests.post(f"https://graph-video.facebook.com/v18.0/{video_id}", params=finish_params)
+                    
+                    # Poll until the video is ready if the first attempt fails
+                    for _ in range(12): # Try for 2 minutes
+                        if publish_response.json().get('success'):
+                            break
+                        await asyncio.sleep(10)
+                        publish_response = requests.post(f"https://graph-video.facebook.com/v18.0/{video_id}", params=finish_params)
+                    
+                    publish_response.raise_for_status()
+
+                    media_id = video_id
+                    url = f"https://facebook.com/{video_id}"
+
+                # BUG FIX: Corrected Reels API Flow (More Robust Version)
+                elif upload_type == 'reel':
+                    # Step 1: Initialize the upload session to get an upload URL
                     init_url = f"https://graph.facebook.com/v18.0/{page_id}/video_reels"
-                    init_params = {'upload_phase': 'start', 'access_token': token}
-                    init_r = requests.post(init_url, params=init_params)
-                    init_r.raise_for_status()
-                    upload_data = init_r.json()
+                    init_params = {
+                        'upload_phase': 'start',
+                        'access_token': token
+                    }
+                    init_response = requests.post(init_url, params=init_params)
+                    init_response.raise_for_status()
+                    upload_data = init_response.json()
+                    
                     video_id = upload_data['video_id']
                     upload_session_url = upload_data['upload_url']
-                    
-                    # Step 2: Upload the video file to the session URL
-                    file_size = os.path.getsize(upload_path)
-                    upload_headers = {'Authorization': f'OAuth {token}', 'offset': '0', 'file_size': str(file_size)}
-                    with open(upload_path, 'rb') as f:
-                        upload_r = requests.post(upload_session_url, headers=upload_headers, data=f)
-                        upload_r.raise_for_status()
 
-                    # Step 3: Publish the reel
+                    # Step 2: Upload the actual video file to the session URL received from Step 1
+                    file_size = os.path.getsize(upload_path)
+                    upload_headers = {
+                        'Authorization': f'OAuth {token}',
+                        'offset': '0',
+                        'file_size': str(file_size)
+                    }
+                    with open(upload_path, 'rb') as f:
+                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
+                        upload_response.raise_for_status()
+
+                    # Step 3: Wait for Facebook to process the video and then publish it.
+                    # This is the most critical step. We will poll the video status.
                     status_check_url = f"https://graph.facebook.com/v18.0/{video_id}"
-                    publish_url = f"https://graph.facebook.com/v18.0/{page_id}/video_reels"
+                    status_params = {
+                        'access_token': token,
+                        'fields': 'status'
+                    }
+                    
+                    # Wait up to 2 minutes for Facebook to finish processing
+                    for _ in range(12): # Try 12 times with 10 seconds wait
+                        await asyncio.sleep(10)
+                        status_response = requests.get(status_check_url, params=status_params)
+                        status_data = status_response.json()
+                        video_status = status_data.get('status', {}).get('video_status')
+                        
+                        if video_status == 'ready':
+                            logger.info(f"Video {video_id} is processed and ready to be published.")
+                            break
+                        else:
+                            logger.info(f"Waiting for video processing... current status: {video_status}")
+                    else:
+                        raise Exception("Facebook video processing timed out after 2 minutes.")
+
+                    # Final Step: Publish the processed video
                     publish_params = {
                         'access_token': token,
                         'video_id': video_id,
                         'upload_phase': 'finish',
-                        'video_state': 'PUBLISHED',
                         'description': final_title,
                     }
-                    
-                    for _ in range(15): # Poll for up to 2.5 minutes
-                        await asyncio.sleep(10)
-                        status_r = requests.get(status_check_url, params={'access_token': token, 'fields': 'status'})
-                        status_data = status_r.json()
-                        if status_data.get('status', {}).get('uploading_phase', {}).get('status') == 'ready':
-                            break
-                    else:
-                        raise Exception("Reel processing timed out.")
+                    publish_response = requests.post(init_url, params=publish_params)
+                    publish_response.raise_for_status()
 
-                    publish_r = requests.post(publish_url, params=publish_params)
-                    publish_r.raise_for_status()
                     media_id = video_id
                     url = f"https://www.facebook.com/reel/{video_id}"
             
