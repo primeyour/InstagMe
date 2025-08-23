@@ -2492,14 +2492,257 @@ async def start_upload_task(msg, file_info, user_id):
     )
 
 async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_id=None):
-    # This is a placeholder for the corrected function.
-    # The actual implementation should be copied from the detailed explanation provided in the previous turn.
-    # This placeholder is to ensure the code structure is maintained.
-    logger.error("Placeholder process_and_upload called. Replace with the fully corrected version.")
-    processing_msg = msg
-    if from_schedule:
-        processing_msg = await app.send_message(user_id, "Processing scheduled task (placeholder)...")
-    await safe_edit_message(processing_msg, "❌ This function is a placeholder and needs to be replaced with the final version.")
+    platform, upload_type, processing_msg = None, None, None
+    if not from_schedule:
+        state_data = user_states.get(user_id)
+        if not state_data:
+            logger.error(f"State not found for user {user_id} during direct upload.")
+            if msg:
+                await safe_reply(msg, "❌ " + to_bold_sans("An error occurred. Please start the process again."))
+            return
+        platform = state_data["platform"]
+        upload_type = state_data["upload_type"]
+        processing_msg = state_data.get("status_msg") or msg
+    else: # Scheduled job
+        if db is None:
+            logger.error("Cannot process scheduled job: DB is not connected.")
+            return
+        job = await asyncio.to_thread(db.scheduled_jobs.find_one, {"_id": ObjectId(job_id)})
+        if not job:
+            logger.error(f"Scheduled job with ID {job_id} not found.")
+            return
+        platform = job['platform']
+        upload_type = job.get('upload_type', 'video')
+        processing_msg = await app.send_message(user_id, "⏳ " + to_bold_sans(f"Starting your scheduled {upload_type}..."))
+
+    async with upload_semaphore:
+        logger.info(f"Semaphore acquired for user {user_id}. Starting upload to {platform}.")
+        files_to_clean = [file_info.get("downloaded_path"), file_info.get("processed_path"), file_info.get("thumbnail_path")]
+        try:
+            user_settings = await get_user_settings(user_id)
+            
+            path = file_info.get("downloaded_path")
+            if not path or not os.path.exists(path):
+                raise FileNotFoundError("Downloaded file path is missing or invalid.")
+
+            msg_obj = file_info.get('original_media_msg')
+            is_video = msg_obj and (msg_obj.video or (msg_obj.document and 'video' in (msg_obj.document.mime_type or '')))
+
+            upload_path = path
+            if is_video:
+                await safe_edit_message(processing_msg, "⚙️ " + to_bold_sans("Checking video format..."))
+                if needs_conversion(path):
+                    await safe_edit_message(processing_msg, "⚙️ " + to_bold_sans("Converting video for compatibility..."))
+                    processed_path = path.rsplit(".", 1)[0] + "_processed.mp4"
+                    upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
+                    files_to_clean.append(processed_path)
+            
+            if platform == 'youtube' and is_video and file_info.get("thumbnail_path") == "auto":
+                await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
+                thumb_output_path = upload_path + ".jpg"
+                generated_thumb = await asyncio.to_thread(generate_thumbnail, upload_path, thumb_output_path)
+                file_info["thumbnail_path"] = generated_thumb
+                files_to_clean.append(generated_thumb)
+
+            _upload_progress['status'] = 'uploading'
+            task_tracker.create_task(monitor_progress_task(user_id, processing_msg.id, processing_msg), user_id, "upload_monitor")
+            
+            url, media_id = "N/A", "N/A"
+            final_title = file_info.get("title") or user_settings.get(f"title_{platform}") or user_settings.get(f"caption_{platform}") or "Untitled"
+            
+            if platform == "facebook":
+                session = await get_active_session(user_id, 'facebook')
+                if not session: raise ConnectionError("Facebook session not found. Please /fblogin.")
+                
+                page_id = session['id']
+                token = session['access_token']
+                final_description = (file_info.get("description", "") or final_title)
+
+                if upload_type == 'post':
+                    with open(upload_path, 'rb') as f:
+                        post_url = f"https://graph.facebook.com/{page_id}/photos"
+                        payload = {'access_token': token, 'caption': final_description}
+                        files = {'source': f}
+                        r = requests.post(post_url, data=payload, files=files, timeout=600)
+                        r.raise_for_status()
+                        post_data = r.json()
+                        if not isinstance(post_data, dict):
+                             raise ValueError(f"Facebook returned an invalid response for post: {r.text}")
+                        post_id = post_data.get('post_id', post_data.get('id', 'N/A'))
+                        url = f"https://facebook.com/{post_id}"
+                        media_id = post_id
+                
+                elif upload_type == 'video':
+                    file_size = os.path.getsize(upload_path)
+                    init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
+                    
+                    params = {'access_token': token, 'upload_phase': 'start', 'file_size': file_size}
+                    init_response = requests.post(init_url, params=params)
+                    init_response.raise_for_status()
+                    init_data = init_response.json()
+                    if not isinstance(init_data, dict):
+                        raise ValueError(f"Facebook returned an invalid response for video init: {init_response.text}")
+
+                    video_id = init_data['video_id']
+                    upload_session_url = init_data['upload_url']
+
+                    upload_headers = {'Authorization': f'OAuth {token}'}
+                    with open(upload_path, 'rb') as f:
+                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
+                        upload_response.raise_for_status()
+                        
+                    finish_params = {'access_token': token, 'upload_phase': 'finish', 'description': final_description}
+                    
+                    for i in range(15):
+                        logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
+                        await asyncio.sleep(10)
+                        publish_response = requests.post(init_url, params=finish_params)
+                        if publish_response.status_code == 200:
+                            p_json = publish_response.json()
+                            if isinstance(p_json, dict) and p_json.get('success'):
+                                logger.info(f"Video {video_id} published successfully.")
+                                break
+                    else:
+                        raise Exception("Facebook video publishing timed out or failed.")
+                        
+                    media_id = video_id
+                    url = f"https://facebook.com/{video_id}"
+
+                elif upload_type == 'reel':
+                    init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
+                    
+                    params = {'upload_phase': 'start', 'access_token': token}
+                    init_response = requests.post(init_url, params=params)
+                    init_response.raise_for_status()
+                    upload_data = init_response.json()
+                    if not isinstance(upload_data, dict):
+                        raise ValueError(f"Facebook returned an invalid response for reel init: {init_response.text}")
+                        
+                    video_id = upload_data['video_id']
+                    upload_session_url = upload_data['upload_url']
+
+                    file_size = os.path.getsize(upload_path)
+                    upload_headers = {'Authorization': f'OAuth {token}', 'offset': '0', 'file_size': str(file_size)}
+                    with open(upload_path, 'rb') as f:
+                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
+                        upload_response.raise_for_status()
+
+                    status_check_url = f"https://graph.facebook.com/v19.0/{video_id}"
+                    status_params = {'access_token': token, 'fields': 'status'}
+                    
+                    for _ in range(12):
+                        await asyncio.sleep(10)
+                        status_response = requests.get(status_check_url, params=status_params)
+                        status_data = status_response.json()
+                        if not isinstance(status_data, dict):
+                            logger.warning(f"Invalid status response from Facebook: {status_response.text}")
+                            continue
+                        video_status = status_data.get('status', {}).get('video_status')
+                        if video_status == 'ready':
+                            logger.info(f"Reel {video_id} is processed and ready.")
+                            break
+                    else:
+                        raise Exception("Facebook Reel processing timed out.")
+
+                    publish_params = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
+                    publish_response = requests.post(init_url, params=publish_params)
+                    publish_response.raise_for_status()
+                    media_id = video_id
+                    url = f"https://www.facebook.com/reel/{video_id}"
+            
+            elif platform == "youtube":
+                session = await get_active_session(user_id, 'youtube')
+                if not session: raise ConnectionError("YouTube session not found. Please /ytlogin.")
+                
+                creds = Credentials.from_authorized_user_info(json.loads(session['credentials_json']))
+                if creds.expired and creds.refresh_token:
+                    try:
+                        creds.refresh(Request())
+                        session['credentials_json'] = creds.to_json()
+                        await save_platform_session(user_id, "youtube", session)
+                    except RefreshError as e:
+                        raise ConnectionError(f"YouTube token expired and failed to refresh. Please /ytlogin again. Error: {e}")
+
+                youtube = build('youtube', 'v3', credentials=creds)
+                tags = (file_info.get("tags") or user_settings.get("tags_youtube", "")).split(',')
+                visibility = file_info.get("visibility") or user_settings.get("visibility_youtube", "private")
+                thumbnail = file_info.get("thumbnail_path")
+                schedule_time = file_info.get("schedule_time")
+
+                body = {
+                    "snippet": {
+                        "title": final_title,
+                        "description": file_info.get("description") or user_settings.get("description_youtube", ""),
+                        "tags": [tag.strip() for tag in tags if tag.strip()]
+                    },
+                    "status": {
+                        "privacyStatus": "private" if schedule_time else visibility,
+                        "selfDeclaredMadeForKids": False
+                    }
+                }
+                if schedule_time and isinstance(schedule_time, datetime):
+                    body["status"]["publishAt"] = schedule_time.isoformat().replace("+00:00", "Z")
+
+                media_file = MediaFileUpload(upload_path, chunksize=-1, resumable=True)
+                request = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media_file)
+                
+                response = None
+                while response is None:
+                    status, response = await asyncio.to_thread(request.next_chunk)
+                    if status:
+                        logger.info(f"Uploaded {int(status.progress() * 100)}%")
+                
+                media_id = response['id']
+                url = f"https://youtu.be/{media_id}"
+
+                if thumbnail and os.path.exists(thumbnail):
+                    await asyncio.to_thread(
+                        youtube.thumbnails().set(videoId=media_id, media_body=MediaFileUpload(thumbnail)).execute
+                    )
+
+            _upload_progress['status'] = 'complete'
+            task_tracker.cancel_user_task(user_id, "upload_monitor")
+            
+            if db is not None:
+                if not from_schedule:
+                    await asyncio.to_thread(db.uploads.insert_one, {
+                        "user_id": user_id, "media_id": str(media_id),
+                        "platform": platform, "upload_type": upload_type, "timestamp": datetime.now(timezone.utc),
+                        "url": url, "title": final_title
+                    })
+                else:
+                    await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "completed", "final_url": url}})
+                    await app.send_message(user_id, f"✅ **Scheduled Upload Complete!**\n\nYour {upload_type} '{final_title}' has been published:\n{url}")
+
+            log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n" \
+                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n" \
+                      f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+            success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
+            
+            await safe_edit_message(processing_msg, success_msg, parse_mode=None, reply_markup=None)
+            await send_log_to_channel(app, LOG_CHANNEL, log_msg)
+
+        except (ConnectionError, RefreshError, requests.RequestException, FileNotFoundError, ValueError) as e:
+            error_msg = f"❌ " + to_bold_sans(f"Upload Failed: {e}")
+            await safe_edit_message(processing_msg, error_msg, reply_markup=None)
+            if from_schedule and db is not None:
+                await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
+                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
+            logger.error(f"Upload error for {user_id}: {e}", exc_info=True)
+        except Exception as e:
+            error_msg = f"❌ " + to_bold_sans(f"An Unexpected Error Occurred: {str(e)}")
+            await safe_edit_message(processing_msg, error_msg, reply_markup=None)
+            if from_schedule and db is not None:
+                await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
+                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
+
+            logger.error(f"General upload failed for {user_id} on {platform}: {e}", exc_info=True)
+        finally:
+            cleanup_temp_files(files_to_clean)
+            if not from_schedule and user_id in user_states:
+                del user_states[user_id]
+            _upload_progress.clear()
+            logger.info(f"Semaphore released for user {user_id}.")
 
 # === HTTP Server for OAuth and Health Checks ===
 class OAuthHandler(BaseHTTPRequestHandler):
