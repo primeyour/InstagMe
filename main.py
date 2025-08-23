@@ -1,3 +1,5 @@
+### Full code without missing code details add new feature All problem fixd##
+
 import os
 import sys
 import asyncio
@@ -73,6 +75,7 @@ ADMIN_ID_STR = os.getenv("ADMIN_ID")
 # NEW: Required for the secure YouTube OAuth flow
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080")
 PORT_STR = os.getenv("PORT", "8080") # Port for the local redirect server
+STORAGE_CHANNEL_ID = -1002926109550 # As requested for scheduling
 
 # Validate required environment variables
 if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI]):
