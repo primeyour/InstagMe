@@ -2608,16 +2608,24 @@ async def start_upload_task(msg, file_info, user_id):
 async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_id=None):
     platform, upload_type, processing_msg = None, None, None
     if not from_schedule:
-        state_data = user_states[user_id]
+        state_data = user_states.get(user_id)
+        if not state_data:
+            logger.error(f"State not found for user {user_id} during direct upload.")
+            return
         platform = state_data["platform"]
         upload_type = state_data["upload_type"]
         processing_msg = state_data.get("status_msg") or msg
-    else:
+    else: # Scheduled job
+        if db is None:
+            logger.error("Cannot process scheduled job: DB is not connected.")
+            return
         job = await asyncio.to_thread(db.scheduled_jobs.find_one, {"_id": ObjectId(job_id)})
+        if not job:
+            logger.error(f"Scheduled job with ID {job_id} not found.")
+            return
         platform = job['platform']
         upload_type = job.get('upload_type', 'video')
         processing_msg = await app.send_message(user_id, "⏳ " + to_bold_sans(f"Starting your scheduled {upload_type}..."))
-
 
     async with upload_semaphore:
         logger.info(f"Semaphore acquired for user {user_id}. Starting upload to {platform}.")
@@ -2638,6 +2646,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
                 files_to_clean.append(processed_path)
             
+            # As requested, thumbnail generation is now ONLY for YouTube
             if platform == 'youtube' and file_info.get("thumbnail_path") == "auto":
                 await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
                 thumb_output_path = upload_path + ".jpg"
@@ -2657,7 +2666,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 
                 page_id = session['id']
                 token = session['access_token']
-                final_description = (file_info.get("title") or "") + "\n\n" + (file_info.get("description", "") or "")
+                final_description = (file_info.get("description", "") or final_title) # Use title as desc if empty
 
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
@@ -2666,7 +2675,10 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         files = {'source': f}
                         r = requests.post(post_url, data=payload, files=files, timeout=600)
                         r.raise_for_status()
-                        post_id = r.json().get('post_id', r.json().get('id', 'N/A'))
+                        post_data = r.json()
+                        if not isinstance(post_data, dict):
+                             raise ValueError(f"Facebook returned an invalid response for post: {r.text}")
+                        post_id = post_data.get('post_id', post_data.get('id', 'N/A'))
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
                 
@@ -2677,6 +2689,9 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     init_response = requests.post(init_url, data=init_data)
                     init_response.raise_for_status()
                     init_data = init_response.json()
+                    if not isinstance(init_data, dict):
+                        raise ValueError(f"Facebook returned an invalid response for video init: {init_response.text}")
+
                     video_id = init_data['video_id']
                     upload_session_url = init_data['upload_url']
 
@@ -2687,14 +2702,17 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         
                     finish_data = {'access_token': token, 'upload_phase': 'finish', 'description': final_description}
                     
-                    for _ in range(15): # Poll for up to 2.5 minutes
+                    for i in range(15):
+                        logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
                         await asyncio.sleep(10)
                         publish_response = requests.post(init_url, data={'video_id': video_id, **finish_data})
-                        if publish_response.status_code == 200 and publish_response.json().get('success'):
-                            logger.info(f"Video {video_id} published successfully.")
-                            break
+                        if publish_response.status_code == 200:
+                            p_json = publish_response.json()
+                            if isinstance(p_json, dict) and p_json.get('success'):
+                                logger.info(f"Video {video_id} published successfully.")
+                                break
                     else:
-                        raise Exception("Facebook video publishing timed out.")
+                        raise Exception("Facebook video publishing timed out or failed.")
                         
                     media_id = video_id
                     url = f"https://facebook.com/{video_id}"
@@ -2705,6 +2723,9 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     init_response = requests.post(init_url, data=init_data)
                     init_response.raise_for_status()
                     upload_data = init_response.json()
+                    if not isinstance(upload_data, dict):
+                        raise ValueError(f"Facebook returned an invalid response for reel init: {init_response.text}")
+                        
                     video_id = upload_data['video_id']
                     upload_session_url = upload_data['upload_url']
 
@@ -2721,6 +2742,9 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         await asyncio.sleep(10)
                         status_response = requests.get(status_check_url, params=status_params)
                         status_data = status_response.json()
+                        if not isinstance(status_data, dict):
+                            logger.warning(f"Invalid status response from Facebook: {status_response.text}")
+                            continue
                         video_status = status_data.get('status', {}).get('video_status')
                         if video_status == 'ready':
                             logger.info(f"Reel {video_id} is processed and ready.")
@@ -2735,6 +2759,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     url = f"https://www.facebook.com/reel/{video_id}"
             
             elif platform == "youtube":
+                # YouTube logic remains the same as it was working correctly.
                 session = await get_active_session(user_id, 'youtube')
                 if not session: raise ConnectionError("YouTube session not found. Please /ytlogin.")
                 
@@ -2803,19 +2828,19 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                       f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
             success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
             
-            await safe_edit_message(processing_msg, success_msg, parse_mode=None)
+            await safe_edit_message(processing_msg, success_msg, parse_mode=None, reply_markup=None)
             await send_log_to_channel(app, LOG_CHANNEL, log_msg)
 
         except (ConnectionError, RefreshError, requests.RequestException, FileNotFoundError, ValueError) as e:
             error_msg = f"❌ " + to_bold_sans(f"Upload Failed: {e}")
-            await safe_edit_message(processing_msg, error_msg)
+            await safe_edit_message(processing_msg, error_msg, reply_markup=None)
             if from_schedule and db is not None:
                 await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
                 await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
             logger.error(f"Upload error for {user_id}: {e}", exc_info=True)
         except Exception as e:
             error_msg = f"❌ " + to_bold_sans(f"An Unexpected Error Occurred: {str(e)}")
-            await safe_edit_message(processing_msg, error_msg)
+            await safe_edit_message(processing_msg, error_msg, reply_markup=None)
             if from_schedule and db is not None:
                 await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
                 await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
