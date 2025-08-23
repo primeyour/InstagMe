@@ -273,9 +273,9 @@ async def safe_task_wrapper(coro):
         await coro
     except asyncio.CancelledError:
         # This is expected, so we log it as a warning
-        logger.warning(f"Task {asyncio.current_task().get_name()} was cancelled.")
+        logger.warning(f"Task {getattr(asyncio.current_task(), 'get_name', lambda: 'N/A')()} was cancelled.")
     except Exception:
-        logger.exception(f"Unhandled exception in background task: {asyncio.current_task().get_name()}")
+        logger.exception(f"Unhandled exception in background task: {getattr(asyncio.current_task(), 'get_name', lambda: 'N/A')()}")
 
 
 # ===================================================================
@@ -1292,7 +1292,10 @@ async def handle_text_input(_, msg):
     # NEW: Auto-delete user's message if enabled
     user_settings = await get_user_settings(user_id)
     if user_settings.get("auto_delete_text", False):
-        await msg.delete()
+        try:
+            await msg.delete()
+        except Exception as e:
+            logger.warning(f"Could not delete user message: {e}")
 
 
     action = state_data.get("action")
@@ -2382,30 +2385,19 @@ async def toggle_auto_delete_cb(_, query):
 # ===================================================================
 async def process_upload_step(msg_or_query):
     """Central function to handle the step-by-step upload process."""
-    # This is a more reliable check for a CallbackQuery
     if hasattr(msg_or_query, 'message') and msg_or_query.message:
         user_id = msg_or_query.from_user.id
         status_msg = msg_or_query.message
-        original_msg = msg_or_query.message
-    else:  # It's a Message object
+    else:
         user_id = msg_or_query.from_user.id
         state = user_states.get(user_id, {})
         status_msg = state.get('status_msg', msg_or_query)
-        original_msg = msg_or_query
 
     state_data = user_states[user_id]
     file_info = state_data["file_info"]
     platform = state_data["platform"]
     upload_type = state_data["upload_type"]
     user_settings = await get_user_settings(user_id)
-
-    # Check for short video eligibility
-    short_info = ""
-    if platform == 'youtube' and 'title' not in file_info:
-        metadata = get_video_metadata(file_info['downloaded_path'])
-        duration = float(metadata.get('format', {}).get('duration', '61'))
-        if duration < 60:
-            short_info = "\n\nℹ️ This video is under 60 seconds and may be published as a YouTube Short if it has a vertical aspect ratio."
 
     # BUG FIX: Simplified Reels Flow (Corrected Logic)
     if upload_type == "reel":
@@ -2416,31 +2408,30 @@ async def process_upload_step(msg_or_query):
             if default_caption:
                 prompt += f"\n\nOr use /skip to use your default: `{default_caption[:50]}`"
             await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
-            return # ടൈറ്റിൽ ചോദിച്ച ശേഷം ഇവിടെ നിർത്തണം
-
+            return
         elif "schedule_time" not in file_info:
-            # ടൈറ്റിൽ കിട്ടിക്കഴിഞ്ഞാൽ പബ്ലിഷ് ഓപ്ഷൻ കാണിക്കുക
-            file_info['description'] = ""
-            file_info['tags'] = ""
-            file_info['thumbnail_path'] = None
-            file_info['visibility'] = 'public'
+            file_info.update({'description': "", 'tags': "", 'thumbnail_path': None, 'visibility': 'public'})
             state_data["action"] = "waiting_for_publish_choice"
             await safe_edit_message(status_msg, to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
-            return # ഓപ്ഷൻ കാണിച്ച ശേഷം ഇവിടെയും നിർത്തണം
-
-
-    # Determine the current step based on what's missing in file_info
+            return
+    
     if "title" not in file_info:
         state_data["action"] = "waiting_for_title"
         default_title = user_settings.get(f'title_{platform}') or user_settings.get(f'caption_{platform}')
         prompt = to_bold_sans("Media Received. First, Send Your Title.") + "\n\n"
-        prompt += "• " + "Send Text Now" + "\n" # Normal text
+        prompt += "• " + "Send Text Now"
         if default_title:
-            prompt += f"• Or use /skip to use your default: `{default_title[:50]}`"
+            prompt += f"\n• Or use /skip to use your default: `{default_title[:50]}`"
         else:
-            prompt += "• Or use /skip for no title."
-        prompt += short_info
+            prompt += "\n• Or use /skip for no title."
+        
+        if platform == 'youtube':
+            metadata = get_video_metadata(file_info['downloaded_path'])
+            duration = float(metadata.get('format', {}).get('duration', '61'))
+            if duration < 60:
+                prompt += "\n\nℹ️ This video may be published as a YouTube Short."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+
     elif "description" not in file_info:
         state_data["action"] = "waiting_for_description"
         default_desc = user_settings.get(f'description_{platform}')
@@ -2450,6 +2441,7 @@ async def process_upload_step(msg_or_query):
         else:
             prompt += "• Or use /skip for no description."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+
     elif platform == 'youtube' and "tags" not in file_info:
         state_data["action"] = "waiting_for_tags"
         default_tags = user_settings.get(f'tags_{platform}')
@@ -2459,71 +2451,52 @@ async def process_upload_step(msg_or_query):
         else:
             prompt += "• Or use /skip for no tags."
         await safe_edit_message(status_msg, prompt, parse_mode=enums.ParseMode.MARKDOWN)
-    elif "thumbnail_path" not in file_info:
-        # This step is only for videos
+
+    elif platform == 'youtube' and "thumbnail_path" not in file_info:
         is_video = file_info['original_media_msg'].video or (file_info['original_media_msg'].document and 'video' in file_info['original_media_msg'].document.mime_type)
         if not is_video:
-            file_info['thumbnail_path'] = None # Skip for photos
-            await process_upload_step(msg_or_query)
-            return
+            file_info['thumbnail_path'] = None
+            return await process_upload_step(msg_or_query)
         state_data["action"] = "waiting_for_thumbnail_choice"
         await safe_edit_message(status_msg, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
-    elif "visibility" not in file_info:
-        # Facebook doesn't have a simple visibility toggle via API for pages, so we skip it.
-        if platform == 'facebook':
-            file_info['visibility'] = 'public' # Default
-            await process_upload_step(msg_or_query)
-            return
+
+    elif platform == 'youtube' and "visibility" not in file_info:
         state_data["action"] = "waiting_for_visibility_choice"
         await safe_edit_message(status_msg, to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
+
     elif "schedule_time" not in file_info:
+        # Default visibility for Facebook
+        if platform == 'facebook':
+            file_info['visibility'] = 'public'
         state_data["action"] = "waiting_for_publish_choice"
         await safe_edit_message(status_msg, to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+
     else:
-        # All info gathered, decide whether to upload now or schedule
         schedule_time = file_info.get("schedule_time")
         if schedule_time:
-            # This is a scheduled post
             await safe_edit_message(status_msg, "⏳ " + to_bold_sans("Scheduling your post..."))
-            
-            # Forward the media to storage channel to get a permanent file_id
             try:
                 stored_msg = await file_info['original_media_msg'].forward(STORAGE_CHANNEL)
-                
                 job_details = {
-                    "user_id": user_id,
-                    "platform": platform,
-                    "upload_type": upload_type,
-                    "storage_msg_id": stored_msg.id,
-                    "schedule_time": schedule_time,
-                    "status": "pending",
-                    "created_at": datetime.now(timezone.utc),
-                    "metadata": {
-                        "title": file_info.get("title"),
-                        "description": file_info.get("description"),
-                        "tags": file_info.get("tags"),
-                        "visibility": file_info.get("visibility")
-                    }
+                    "user_id": user_id, "platform": platform, "upload_type": upload_type,
+                    "storage_msg_id": stored_msg.id, "schedule_time": schedule_time,
+                    "status": "pending", "created_at": datetime.now(timezone.utc),
+                    "metadata": {k: file_info.get(k) for k in ["title", "description", "tags", "visibility"]}
                 }
-                
-                # BUG FIX: Changed `if db:` to `if db is not None:`
                 if db is not None:
-                    await asyncio.to_thread(db.scheduled_jobs.insert_one, job_details)
-                    await safe_edit_message(status_msg, f"✅ **Scheduled!**\n\nYour post will be uploaded on `{schedule_time.strftime('%Y-%m-%d %H:%M')} UTC`.")
+                    job_id = (await asyncio.to_thread(db.scheduled_jobs.insert_one, job_details)).inserted_id
+                    schedule_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🗓️ Manage Schedules", callback_data=f"manage_schedules_{platform}")]])
+                    await safe_edit_message(status_msg, f"✅ **Scheduled!**\n\nYour post will be uploaded on `{schedule_time.strftime('%Y-%m-%d %H:%M')} UTC`.", reply_markup=schedule_markup)
                 else:
                     await safe_edit_message(status_msg, "❌ **Scheduling Failed:** Database is offline.")
-                
             except Exception as e:
-                logger.error(f"Failed to forward media to storage channel: {e}")
+                logger.error(f"Failed to forward media to storage channel: {e}", exc_info=True)
                 await safe_edit_message(status_msg, f"❌ **Scheduling Failed:** Could not store the media file. Error: {e}")
             finally:
                 if user_id in user_states: del user_states[user_id]
-
         else:
-            # Upload now
             state_data["action"] = "finalizing"
             await start_upload_task(status_msg, file_info, user_id)
-
 
 
 @app.on_message(filters.media & filters.private)
@@ -2574,7 +2547,7 @@ async def handle_media_upload(_, msg):
         try:
             stored_msg = await msg.forward(STORAGE_CHANNEL)
             state_data["bulk_media"].append(stored_msg.id)
-            await msg.reply(f"✅ File {len(media_list)}/10 received. Send more files or type /finish.")
+            await msg.reply(f"✅ File {len(media_list)+1}/10 received. Send more files or type /finish.")
         except Exception as e:
             logger.error(f"Failed to forward bulk media to storage: {e}")
             await msg.reply(f"❌ Error storing file. Please check STORAGE_CHANNEL_ID. Error: {e}")
@@ -2633,15 +2606,17 @@ async def start_upload_task(msg, file_info, user_id):
     )
 
 async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_id=None):
+    platform, upload_type, processing_msg = None, None, None
     if not from_schedule:
-        platform = user_states[user_id]["platform"]
-        upload_type = user_states[user_id]["upload_type"]
-        processing_msg = user_states[user_id].get("status_msg") or msg
-    else: # Scheduled job
+        state_data = user_states[user_id]
+        platform = state_data["platform"]
+        upload_type = state_data["upload_type"]
+        processing_msg = state_data.get("status_msg") or msg
+    else:
         job = await asyncio.to_thread(db.scheduled_jobs.find_one, {"_id": ObjectId(job_id)})
         platform = job['platform']
-        upload_type = job.get('upload_type', 'video') # Default to video for older jobs
-        processing_msg = await app.send_message(user_id, "⏳ " + to_bold_sans("Starting your scheduled upload..."))
+        upload_type = job.get('upload_type', 'video')
+        processing_msg = await app.send_message(user_id, "⏳ " + to_bold_sans(f"Starting your scheduled {upload_type}..."))
 
 
     async with upload_semaphore:
@@ -2654,20 +2629,18 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             if not path or not os.path.exists(path):
                 raise FileNotFoundError("Downloaded file path is missing or invalid.")
             
-            # --- Video processing ---
-            is_video = 'video' in file_info['original_media_msg'].document.mime_type if file_info['original_media_msg'].document else file_info['original_media_msg'].video
+            is_video = 'video' in getattr(file_info.get('original_media_msg', {}), 'document', {}).get('mime_type', '') or getattr(file_info.get('original_media_msg', {}), 'video', None)
 
             upload_path = path
             if is_video:
                 await safe_edit_message(processing_msg, "⚙️ " + to_bold_sans("Processing Video... This May Take A Moment."))
                 processed_path = path.rsplit(".", 1)[0] + "_processed.mp4"
                 upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
-                file_info['processed_path'] = upload_path
+                files_to_clean.append(processed_path)
             
-            # --- Thumbnail generation ---
-            if file_info.get("thumbnail_path") == "auto":
+            if platform == 'youtube' and file_info.get("thumbnail_path") == "auto":
                 await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
-                thumb_output_path = upload_path + ".jpg" # CORRECTED LINE
+                thumb_output_path = upload_path + ".jpg"
                 generated_thumb = await asyncio.to_thread(generate_thumbnail, upload_path, thumb_output_path)
                 file_info["thumbnail_path"] = generated_thumb
                 files_to_clean.append(generated_thumb)
@@ -2675,7 +2648,6 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             _upload_progress['status'] = 'uploading'
             task_tracker.create_task(monitor_progress_task(user_id, processing_msg.id, processing_msg), user_id, "upload_monitor")
             
-            # --- Platform-specific upload logic ---
             url, media_id = "N/A", "N/A"
             final_title = file_info.get("title") or user_settings.get(f"title_{platform}") or user_settings.get(f"caption_{platform}") or "Untitled"
             
@@ -2686,7 +2658,6 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 page_id = session['id']
                 token = session['access_token']
                 final_description = (file_info.get("title") or "") + "\n\n" + (file_info.get("description", "") or "")
-
 
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
@@ -2700,112 +2671,66 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         media_id = post_id
                 
                 elif upload_type == 'video':
-                    # This new robust method is similar to Reels to prevent incomplete uploads
                     file_size = os.path.getsize(upload_path)
-                    
-                    # Step 1: Initialize the upload session
                     init_url = f"https://graph-video.facebook.com/v18.0/{page_id}/videos"
-                    init_params = {
-                        'access_token': token,
-                        'upload_phase': 'start',
-                        'file_size': file_size
-                    }
-                    init_response = requests.post(init_url, params=init_params)
+                    init_data = {'access_token': token, 'upload_phase': 'start', 'file_size': file_size}
+                    init_response = requests.post(init_url, data=init_data)
                     init_response.raise_for_status()
                     init_data = init_response.json()
-                    
                     video_id = init_data['video_id']
                     upload_session_url = init_data['upload_url']
 
-                    # Step 2: Upload the video file
                     upload_headers = {'Authorization': f'OAuth {token}'}
                     with open(upload_path, 'rb') as f:
                         upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
                         upload_response.raise_for_status()
                         
-                    # Step 3: Finish the upload by publishing the video
-                    finish_params = {
-                        'access_token': token,
-                        'upload_phase': 'finish',
-                        'description': final_description,
-                    }
+                    finish_data = {'access_token': token, 'upload_phase': 'finish', 'description': final_description}
                     
-                    # Wait a moment for processing before finishing
-                    await asyncio.sleep(15)
-                    
-                    publish_response = requests.post(f"https://graph-video.facebook.com/v18.0/{video_id}", params=finish_params)
-                    
-                    # Poll until the video is ready if the first attempt fails
-                    for _ in range(12): # Try for 2 minutes
-                        if publish_response.json().get('success'):
-                            break
+                    for _ in range(15): # Poll for up to 2.5 minutes
                         await asyncio.sleep(10)
-                        publish_response = requests.post(f"https://graph-video.facebook.com/v18.0/{video_id}", params=finish_params)
-                    
-                    publish_response.raise_for_status()
-
+                        publish_response = requests.post(init_url, data={'video_id': video_id, **finish_data})
+                        if publish_response.status_code == 200 and publish_response.json().get('success'):
+                            logger.info(f"Video {video_id} published successfully.")
+                            break
+                    else:
+                        raise Exception("Facebook video publishing timed out.")
+                        
                     media_id = video_id
                     url = f"https://facebook.com/{video_id}"
 
-                # BUG FIX: Corrected Reels API Flow (More Robust Version)
                 elif upload_type == 'reel':
-                    # Step 1: Initialize the upload session to get an upload URL
                     init_url = f"https://graph.facebook.com/v18.0/{page_id}/video_reels"
-                    init_params = {
-                        'upload_phase': 'start',
-                        'access_token': token
-                    }
-                    init_response = requests.post(init_url, params=init_params)
+                    init_data = {'upload_phase': 'start', 'access_token': token}
+                    init_response = requests.post(init_url, data=init_data)
                     init_response.raise_for_status()
                     upload_data = init_response.json()
-                    
                     video_id = upload_data['video_id']
                     upload_session_url = upload_data['upload_url']
 
-                    # Step 2: Upload the actual video file to the session URL received from Step 1
                     file_size = os.path.getsize(upload_path)
-                    upload_headers = {
-                        'Authorization': f'OAuth {token}',
-                        'offset': '0',
-                        'file_size': str(file_size)
-                    }
+                    upload_headers = {'Authorization': f'OAuth {token}', 'offset': '0', 'file_size': str(file_size)}
                     with open(upload_path, 'rb') as f:
                         upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
                         upload_response.raise_for_status()
 
-                    # Step 3: Wait for Facebook to process the video and then publish it.
-                    # This is the most critical step. We will poll the video status.
                     status_check_url = f"https://graph.facebook.com/v18.0/{video_id}"
-                    status_params = {
-                        'access_token': token,
-                        'fields': 'status'
-                    }
+                    status_params = {'access_token': token, 'fields': 'status'}
                     
-                    # Wait up to 2 minutes for Facebook to finish processing
-                    for _ in range(12): # Try 12 times with 10 seconds wait
+                    for _ in range(12):
                         await asyncio.sleep(10)
                         status_response = requests.get(status_check_url, params=status_params)
                         status_data = status_response.json()
                         video_status = status_data.get('status', {}).get('video_status')
-                        
                         if video_status == 'ready':
-                            logger.info(f"Video {video_id} is processed and ready to be published.")
+                            logger.info(f"Reel {video_id} is processed and ready.")
                             break
-                        else:
-                            logger.info(f"Waiting for video processing... current status: {video_status}")
                     else:
-                        raise Exception("Facebook video processing timed out after 2 minutes.")
+                        raise Exception("Facebook Reel processing timed out.")
 
-                    # Final Step: Publish the processed video
-                    publish_params = {
-                        'access_token': token,
-                        'video_id': video_id,
-                        'upload_phase': 'finish',
-                        'description': final_title,
-                    }
-                    publish_response = requests.post(init_url, params=publish_params)
+                    publish_data = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
+                    publish_response = requests.post(init_url, data=publish_data)
                     publish_response.raise_for_status()
-
                     media_id = video_id
                     url = f"https://www.facebook.com/reel/{video_id}"
             
@@ -2818,19 +2743,15 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     try:
                         creds.refresh(Request())
                         session['credentials_json'] = creds.to_json()
-                        # Re-save the refreshed credentials
-                        active_session = await get_active_session(user_id, 'youtube')
-                        active_session['credentials_json'] = creds.to_json()
-                        await save_platform_session(user_id, "youtube", active_session)
+                        await save_platform_session(user_id, "youtube", session)
                     except RefreshError as e:
                         raise ConnectionError(f"YouTube token expired and failed to refresh. Please /ytlogin again. Error: {e}")
 
                 youtube = build('youtube', 'v3', credentials=creds)
-                
                 tags = (file_info.get("tags") or user_settings.get("tags_youtube", "")).split(',')
                 visibility = file_info.get("visibility") or user_settings.get("visibility_youtube", "private")
                 thumbnail = file_info.get("thumbnail_path")
-                schedule_time = file_info.get("schedule_time") # This is for direct uploads, not the scheduler system
+                schedule_time = file_info.get("schedule_time")
 
                 body = {
                     "snippet": {
@@ -2865,7 +2786,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
 
             _upload_progress['status'] = 'complete'
             task_tracker.cancel_user_task(user_id, "upload_monitor")
-            # BUG FIX: Changed `if db:` to `if db is not None:`
+            
             if db is not None:
                 if not from_schedule:
                     await asyncio.to_thread(db.uploads.insert_one, {
@@ -2875,13 +2796,12 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     })
                 else:
                     await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "completed", "final_url": url}})
-
+                    await app.send_message(user_id, f"✅ **Scheduled Upload Complete!**\n\nYour {upload_type} '{final_title}' has been published:\n{url}")
 
             log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n" \
-                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n" \
+                      f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
             success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
-            if file_info.get('schedule_time') and not from_schedule:
-                success_msg += f"\n\n⏰ Scheduled for: `{file_info['schedule_time'].strftime('%Y-%m-%d %H:%M')}`"
             
             await safe_edit_message(processing_msg, success_msg, parse_mode=None)
             await send_log_to_channel(app, LOG_CHANNEL, log_msg)
@@ -2891,12 +2811,14 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             await safe_edit_message(processing_msg, error_msg)
             if from_schedule and db is not None:
                 await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
-            logger.error(f"Upload error for {user_id}: {e}")
+                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
+            logger.error(f"Upload error for {user_id}: {e}", exc_info=True)
         except Exception as e:
             error_msg = f"❌ " + to_bold_sans(f"An Unexpected Error Occurred: {str(e)}")
             await safe_edit_message(processing_msg, error_msg)
             if from_schedule and db is not None:
                 await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
+                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
 
             logger.error(f"General upload failed for {user_id} on {platform}: {e}", exc_info=True)
         finally:
@@ -2941,17 +2863,16 @@ def run_server():
 
 async def send_log_to_channel(client, channel_id, text):
     global valid_log_channel
-    if not valid_log_channel:
+    if not channel_id or not valid_log_channel:
         return
     try:
         await client.send_message(channel_id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
-    # BUG FIX: Improved error handling for PeerIdInvalid
     except PeerIdInvalid:
         logger.error(f"Failed to log to channel {channel_id}: The ID is invalid. Please ensure the bot is an admin in the correct channel and the ID is correct.")
         valid_log_channel = False
     except Exception as e:
         logger.error(f"Failed to log to channel {channel_id}: {e}")
-        valid_log_channel = False # Stop trying if it fails once
+        valid_log_channel = False
 
 # ===================================================================
 # ======================== BOT STARTUP ============================
@@ -2962,10 +2883,9 @@ async def start_bot():
     try:
         mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         mongo.admin.command('ping')
-        db = mongo.UploaderBotDB # Use a relevant DB name
+        db = mongo.UploaderBotDB
         logger.info("✅ Connected to MongoDB successfully.")
         
-        # Create indexes for faster queries
         await asyncio.to_thread(db.scheduled_jobs.create_index, [("schedule_time", 1), ("status", 1)])
         
         settings_from_db = await asyncio.to_thread(db.settings.find_one, {"_id": "global_settings"}) or {}
@@ -2980,7 +2900,6 @@ async def start_bot():
         global_settings = DEFAULT_GLOBAL_SETTINGS.copy()
         merge_dicts(global_settings, settings_from_db)
 
-        # Ensure the settings in DB are up-to-date with defaults
         await asyncio.to_thread(db.settings.update_one, {"_id": "global_settings"}, {"$set": global_settings}, upsert=True)
         logger.info("Global settings loaded and synchronized.")
     except Exception as e:
@@ -2992,7 +2911,6 @@ async def start_bot():
     upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
     MAX_FILE_SIZE_BYTES = global_settings.get("max_file_size_mb") * 1024 * 1024
 
-    # Run the HTTP server in a separate thread
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
     
@@ -3004,6 +2922,7 @@ async def start_bot():
 
     if LOG_CHANNEL:
         try:
+            await app.get_chat(LOG_CHANNEL)
             await app.send_message(LOG_CHANNEL, "✅ **" + to_bold_sans("Bot Is Now Online And Running!") + "**", parse_mode=enums.ParseMode.MARKDOWN)
             valid_log_channel = True
         except Exception as e:
@@ -3012,7 +2931,7 @@ async def start_bot():
 
     logger.info(f"Bot is now online! ID: {BOT_ID}. Waiting for tasks...")
     task_tracker.create_task(weekly_report_scheduler())
-    task_tracker.create_task(schedule_checker_task()) # NEW: Start the scheduler worker
+    task_tracker.create_task(schedule_checker_task())
     await idle()
 
     logger.info("Shutting down...")
@@ -3024,7 +2943,6 @@ async def start_bot():
     
 # NEW: Enhanced broadcast function
 async def broadcast_message(admin_msg, text=None, photo=None, video=None, reply_markup=None):
-    # BUG FIX: Changed `if not db:` to `if db is None:`
     if db is None:
         return await admin_msg.reply("DB connection failed, cannot get user list.")
 
@@ -3064,23 +2982,19 @@ async def broadcast_message(admin_msg, text=None, photo=None, video=None, reply_
 # NEW: Weekly analytics report scheduler
 async def weekly_report_scheduler():
     while not shutdown_event.is_set():
+        await asyncio.sleep(3600) # Check every hour
         now = datetime.now(timezone.utc)
         last_report_str = global_settings.get("last_weekly_report")
         
         if last_report_str:
             last_report_time = datetime.fromisoformat(last_report_str)
             if now - last_report_time < timedelta(days=7):
-                await asyncio.sleep(3600) # Check every hour
                 continue
 
         await send_weekly_report()
         await _update_global_setting("last_weekly_report", now.isoformat())
-        
-        # Sleep for a day after sending the report
-        await asyncio.sleep(86400)
 
 async def send_weekly_report():
-    # BUG FIX: Changed `if not db or not valid_log_channel:` to `if db is None or not valid_log_channel:`
     if db is None or not valid_log_channel:
         return
 
@@ -3089,19 +3003,8 @@ async def send_weekly_report():
     new_users = await asyncio.to_thread(db.users.count_documents, {"added_at": {"$gte": one_week_ago}})
     total_uploads_week = await asyncio.to_thread(db.uploads.count_documents, {"timestamp": {"$gte": one_week_ago}})
     
-    pipeline = [
-        {"$match": {"premium.facebook.added_at": {"$gte": one_week_ago}}},
-        {"$count": "new_premium_fb"}
-    ]
-    new_premium_fb = await asyncio.to_thread(list, db.users.aggregate(pipeline))
-    new_premium_fb_count = new_premium_fb[0]['new_premium_fb'] if new_premium_fb else 0
-    
-    pipeline = [
-        {"$match": {"premium.youtube.added_at": {"$gte": one_week_ago}}},
-        {"$count": "new_premium_yt"}
-    ]
-    new_premium_yt = await asyncio.to_thread(list, db.users.aggregate(pipeline))
-    new_premium_yt_count = new_premium_yt[0]['new_premium_yt'] if new_premium_yt else 0
+    new_premium_fb_count = await asyncio.to_thread(db.users.count_documents, {"premium.facebook.added_at": {"$gte": one_week_ago}})
+    new_premium_yt_count = await asyncio.to_thread(db.users.count_documents, {"premium.youtube.added_at": {"$gte": one_week_ago}})
 
     report_text = (
         "📊 **" + to_bold_sans("Weekly Analytics Report") + "** 📊\n\n"
@@ -3119,7 +3022,6 @@ async def send_weekly_report():
 async def schedule_checker_task():
     logger.info("Scheduler worker started.")
     while not shutdown_event.is_set():
-        # BUG FIX: Changed `if db:` to `if db is not None:`
         if db is not None:
             try:
                 now = datetime.now(timezone.utc)
@@ -3137,31 +3039,32 @@ async def schedule_checker_task():
                     await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": job['_id']}, {"$set": {"status": "processing"}})
                     
                     try:
-                        # Download the file from the storage channel
                         stored_msg = await app.get_messages(STORAGE_CHANNEL, job['storage_msg_id'])
                         if not stored_msg:
-                            raise FileNotFoundError("Message not found in storage channel.")
+                            raise FileNotFoundError(f"Message {job['storage_msg_id']} not found in storage channel.")
                         
                         downloaded_path = await app.download_media(stored_msg)
 
                         file_info = {
                             "original_media_msg": stored_msg,
                             "downloaded_path": downloaded_path,
-                            **job['metadata'] # Unpack title, desc, etc.
+                            **job['metadata']
                         }
                         
-                        # Use a dedicated task to avoid blocking the scheduler loop
                         task_tracker.create_task(
                             safe_task_wrapper(process_and_upload(None, file_info, job['user_id'], from_schedule=True, job_id=job_id_str))
                         )
 
                     except Exception as e:
-                        logger.error(f"Failed to process scheduled job {job_id_str}: {e}")
+                        logger.error(f"Failed to process scheduled job {job_id_str}: {e}", exc_info=True)
                         await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": job['_id']}, {"$set": {"status": "failed", "error_message": str(e)}})
-                        await app.send_message(job['user_id'], f"❌ Your scheduled upload for '{job['metadata']['title']}' failed. Error: {e}")
+                        try:
+                            await app.send_message(job['user_id'], f"❌ Your scheduled upload for '{job['metadata']['title']}' failed. Error: {e}")
+                        except Exception as notify_e:
+                            logger.error(f"Failed to notify user {job['user_id']} about failed schedule: {notify_e}")
 
             except Exception as e:
-                logger.error(f"Error in scheduler worker loop: {e}")
+                logger.error(f"Error in scheduler worker loop: {e}", exc_info=True)
 
         await asyncio.sleep(60) # Check every minute
     logger.info("Scheduler worker stopped.")
@@ -3173,7 +3076,6 @@ async def manage_schedules_cb(_, query):
     user_id = query.from_user.id
     platform = query.data.split("_")[-1]
     
-    # BUG FIX: Changed `if not db:` to `if db is None:`
     if db is None:
         return await query.answer("Database is offline.", show_alert=True)
         
@@ -3192,7 +3094,7 @@ async def manage_schedules_cb(_, query):
     text = f"🗓️ **Your Pending {platform.capitalize()} Schedules:**\n\n"
     buttons = []
     for job in jobs:
-        title = job['metadata']['title'][:30]
+        title = (job['metadata'].get('title') or "Untitled")[:30]
         time_str = job['schedule_time'].strftime('%Y-%m-%d %H:%M')
         job_id = str(job['_id'])
         
@@ -3211,23 +3113,20 @@ async def cancel_schedule_cb(_, query):
     user_id = query.from_user.id
     job_id = query.data.split("_")[-1]
 
-    # BUG FIX: Changed `if not db:` to `if db is None:`
     if db is None:
         return await query.answer("Database is offline.", show_alert=True)
     
-    result = await asyncio.to_thread(db.scheduled_jobs.delete_one, {"_id": ObjectId(job_id), "user_id": user_id})
+    job = await asyncio.to_thread(db.scheduled_jobs.find_one_and_delete, {"_id": ObjectId(job_id), "user_id": user_id})
     
-    if result.deleted_count > 0:
+    if job:
         await query.answer("Scheduled post cancelled successfully!", show_alert=True)
-        # Refresh the list
+        platform = job.get("platform", "facebook")
         class MockQuery:
             def __init__(self, user, message, data):
                 self.from_user = user
                 self.message = message
                 self.data = data
-        platform_query = await asyncio.to_thread(db.users.find_one, {"_id": user_id}) # A bit hacky to get platform, but works
-        # This part is a simplification. Assuming user is in a state where this can be inferred or defaulting.
-        await manage_schedules_cb(app, MockQuery(query.from_user, query.message, f'manage_schedules_facebook')) # Defaulting to FB, better logic needed for multi-platform
+        await manage_schedules_cb(app, MockQuery(query.from_user, query.message, f'manage_schedules_{platform}'))
     else:
         await query.answer("Could not find the scheduled post or you don't have permission.", show_alert=True)
 
