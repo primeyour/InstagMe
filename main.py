@@ -2611,6 +2611,8 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
         state_data = user_states.get(user_id)
         if not state_data:
             logger.error(f"State not found for user {user_id} during direct upload.")
+            if msg:
+                await safe_reply(msg, "❌ " + to_bold_sans("An error occurred. Please start the process again."))
             return
         platform = state_data["platform"]
         upload_type = state_data["upload_type"]
@@ -2636,8 +2638,10 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             path = file_info.get("downloaded_path")
             if not path or not os.path.exists(path):
                 raise FileNotFoundError("Downloaded file path is missing or invalid.")
-            
-            is_video = 'video' in getattr(file_info.get('original_media_msg', {}), 'document', {}).get('mime_type', '') or getattr(file_info.get('original_media_msg', {}), 'video', None)
+
+            # CORRECTED AND SIMPLIFIED is_video CHECK
+            msg_obj = file_info.get('original_media_msg')
+            is_video = msg_obj and (msg_obj.video or (msg_obj.document and 'video' in (msg_obj.document.mime_type or '')))
 
             upload_path = path
             if is_video:
@@ -2759,7 +2763,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     url = f"https://www.facebook.com/reel/{video_id}"
             
             elif platform == "youtube":
-                # YouTube logic remains the same as it was working correctly.
+                # YouTube logic remains the same
                 session = await get_active_session(user_id, 'youtube')
                 if not session: raise ConnectionError("YouTube session not found. Please /ytlogin.")
                 
