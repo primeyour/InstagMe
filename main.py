@@ -2639,6 +2639,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             if not path or not os.path.exists(path):
                 raise FileNotFoundError("Downloaded file path is missing or invalid.")
 
+            # CORRECTED AND SIMPLIFIED is_video CHECK
             msg_obj = file_info.get('original_media_msg')
             is_video = msg_obj and (msg_obj.video or (msg_obj.document and 'video' in (msg_obj.document.mime_type or '')))
 
@@ -2649,6 +2650,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
                 files_to_clean.append(processed_path)
             
+            # As requested, thumbnail generation is now ONLY for YouTube
             if platform == 'youtube' and file_info.get("thumbnail_path") == "auto":
                 await safe_edit_message(processing_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."))
                 thumb_output_path = upload_path + ".jpg"
@@ -2668,7 +2670,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 
                 page_id = session['id']
                 token = session['access_token']
-                final_description = (file_info.get("description", "") or final_title)
+                final_description = (file_info.get("description", "") or final_title) # Use title as desc if empty
 
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
@@ -2860,6 +2862,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 del user_states[user_id]
             _upload_progress.clear()
             logger.info(f"Semaphore released for user {user_id}.")
+
 
 # === HTTP Server for OAuth and Health Checks ===
 class OAuthHandler(BaseHTTPRequestHandler):
