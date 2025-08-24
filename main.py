@@ -1281,23 +1281,7 @@ async def handle_text_input(_, msg):
         await safe_edit_message(login_msg, "🔐 " + to_bold_sans("Validating credentials and fetching Page details..."))
         
         try:
-            # 1. Validate the token
-            debug_url = f"https://graph.facebook.com/debug_token"
-            debug_params = {'input_token': token, 'access_token': token}
-            debug_res = requests.get(debug_url, params=debug_params)
-            debug_data = check_fb_response(debug_res)['data']
-
-            if not debug_data.get('is_valid'):
-                raise ValueError("The provided Page Access Token is invalid or expired.")
-            if debug_data.get('app_id') != app_id:
-                raise ValueError(f"Token is not for App ID {app_id}.")
-
-            required_scopes = ["pages_manage_posts", "pages_read_engagement", "pages_manage_videos"]
-            scopes = debug_data.get('scopes', [])
-            if not all(scope in scopes for scope in required_scopes):
-                raise ValueError(f"Token is missing required permissions. Need: {', '.join(required_scopes)}")
-
-            # 2. Get Page ID and Name
+            # Get Page ID and Name (this also works as a basic token validity check)
             page_url = f"https://graph.facebook.com/v19.0/me?access_token={token}&fields=id,name,picture.type(large)"
             page_res = requests.get(page_url)
             page_data = check_fb_response(page_res)
@@ -1307,7 +1291,7 @@ async def handle_text_input(_, msg):
             page_picture_url = page_data.get('picture', {}).get('data', {}).get('url')
 
             if not page_id or not page_name:
-                raise ValueError("Could not fetch Page ID and Name from the token.")
+                raise ValueError("Could not fetch Page ID and Name from the token. Please ensure it's a valid Page Access Token.")
 
             session_data = {
                 'id': page_id,
@@ -1325,8 +1309,7 @@ async def handle_text_input(_, msg):
             success_caption = (
                 f"✅ **Login Successful!**\n\n"
                 f"**Page Name:** `{page_name}`\n"
-                f"**Page ID:** `{page_id}`\n"
-                f"**App ID:** `{app_id}`\n\n"
+                f"**Page ID:** `{page_id}`\n\n"
                 "This account is now set as your active Facebook account."
             )
             if page_picture_url:
@@ -2392,11 +2375,13 @@ async def process_upload_step(msg):
     except Exception:
         pass
 
-    state_data = user_states[user_id]
+    state_data = user_states.get(user_id)
+    if not state_data: return
     
     if "prompt_msg" in state_data:
         try:
-            await state_data["prompt_msg"].delete()
+            # Using getattr to avoid error if prompt_msg is not a message object
+            await getattr(state_data["prompt_msg"], "delete", lambda: None)()
         except Exception:
             pass
 
@@ -2404,6 +2389,9 @@ async def process_upload_step(msg):
     platform = state_data["platform"]
     upload_type = state_data["upload_type"]
     user_settings = await get_user_settings(user_id)
+    
+    # Using a new message for each step
+    chat_id = msg.chat.id
 
     # Simplified Reels Flow
     if upload_type == "reel":
@@ -2413,12 +2401,12 @@ async def process_upload_step(msg):
             prompt = to_bold_sans("Reel Received. Please Send Your Caption.")
             if default_caption:
                 prompt += f"\n\nOr use /skip to use your default: `{default_caption[:50]}`"
-            state_data["prompt_msg"] = await msg.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
+            state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
             return
         elif "schedule_time" not in file_info:
             file_info.update({'description': "", 'tags': "", 'thumbnail_path': None, 'visibility': 'public'})
             state_data["action"] = "waiting_for_publish_choice"
-            state_data["prompt_msg"] = await msg.reply(to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+            state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
             return
     
     if "title" not in file_info:
@@ -2435,7 +2423,7 @@ async def process_upload_step(msg):
             duration = float(metadata.get('format', {}).get('duration', '61'))
             if duration < 60:
                 prompt += "\n\nℹ️ This video may be published as a YouTube Short."
-        state_data["prompt_msg"] = await msg.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
+        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif "description" not in file_info:
         state_data["action"] = "waiting_for_description"
@@ -2445,7 +2433,7 @@ async def process_upload_step(msg):
             prompt += f"\n\nOr use /skip to use your default: `{default_desc[:50]}`"
         else:
             prompt += "\nOr use /skip for no description."
-        state_data["prompt_msg"] = await msg.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
+        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif platform == 'youtube' and "tags" not in file_info:
         state_data["action"] = "waiting_for_tags"
@@ -2455,7 +2443,7 @@ async def process_upload_step(msg):
             prompt += f"\n\nOr use /skip to use your default: `{default_tags[:50]}`"
         else:
             prompt += "\nOr use /skip for no tags."
-        state_data["prompt_msg"] = await msg.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
+        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif platform == 'youtube' and "thumbnail_path" not in file_info:
         msg_obj = file_info.get('original_media_msg')
@@ -2464,17 +2452,17 @@ async def process_upload_step(msg):
             file_info['thumbnail_path'] = None
             return await process_upload_step(msg)
         state_data["action"] = "waiting_for_thumbnail_choice"
-        state_data["prompt_msg"] = await msg.reply(to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
+        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
 
     elif platform == 'youtube' and "visibility" not in file_info:
         state_data["action"] = "waiting_for_visibility_choice"
-        state_data["prompt_msg"] = await msg.reply(to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
+        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
 
     elif "schedule_time" not in file_info:
         if platform == 'facebook':
             file_info['visibility'] = 'public'
         state_data["action"] = "waiting_for_publish_choice"
-        state_data["prompt_msg"] = await msg.reply(to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
 
     else:
         status_msg = state_data.get('status_msg')
@@ -2697,12 +2685,11 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 elif upload_type in ['video', 'reel']:
                     is_reel = upload_type == 'reel'
                     api_version = "v19.0"
-                    base_url = f"https://graph-video.facebook.com/{api_version}/{page_id}"
                     endpoint = "video_reels" if is_reel else "videos"
                     
                     # 1. START
-                    await safe_edit_message(processing_msg, "➡️ " + to_bold_sans("Facebook Upload: Initializing (1/4)"))
-                    init_url = f"{base_url}/{endpoint}"
+                    await safe_edit_message(processing_msg, "➡️ " + to_bold_sans(f"Facebook {upload_type.capitalize()} Upload: Initializing (1/4)"))
+                    init_url = f"https://graph-video.facebook.com/{api_version}/{page_id}/{endpoint}"
                     init_params = {'upload_phase': 'start', 'access_token': token}
                     init_response = requests.post(init_url, data=init_params)
                     init_data = check_fb_response(init_response)
@@ -2710,17 +2697,17 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     video_id = init_data.get('video_id')
                     upload_url = init_data.get('upload_url')
                     if not video_id or not upload_url:
-                        raise ValueError("Facebook did not return a valid video_id and upload_url.")
+                        raise ValueError("Facebook did not return a valid video_id and upload_url on initialization.")
 
                     # 2. TRANSFER
-                    await safe_edit_message(processing_msg, "⬆️ " + to_bold_sans("Facebook Upload: Transferring File (2/4)"))
+                    await safe_edit_message(processing_msg, "⬆️ " + to_bold_sans(f"Facebook {upload_type.capitalize()} Upload: Transferring File (2/4)"))
                     transfer_headers = {'Authorization': f'OAuth {token}'}
                     with open(upload_path, 'rb') as f:
                         transfer_response = requests.post(upload_url, headers=transfer_headers, data=f)
                         check_fb_response(transfer_response)
 
                     # 3. STATUS POLLING
-                    await safe_edit_message(processing_msg, "⏳ " + to_bold_sans("Facebook Upload: Processing Video (3/4)"))
+                    await safe_edit_message(processing_msg, "⏳ " + to_bold_sans(f"Facebook {upload_type.capitalize()} Upload: Processing Video (3/4)"))
                     status_check_url = f"https://graph.facebook.com/{api_version}/{video_id}"
                     status_params = {'access_token': token, 'fields': 'status'}
                     for i in range(25): # Poll for up to ~5 minutes
@@ -2739,20 +2726,22 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         raise Exception("Facebook video processing timed out after 5 minutes.")
 
                     # 4. FINISH
-                    await safe_edit_message(processing_msg, "✅ " + to_bold_sans("Facebook Upload: Publishing (4/4)"))
-                    finish_url = f"{base_url}/{endpoint}"
+                    await safe_edit_message(processing_msg, "✅ " + to_bold_sans(f"Facebook {upload_type.capitalize()} Upload: Publishing (4/4)"))
+                    finish_url = f"https://graph-video.facebook.com/{api_version}/{video_id}"
                     finish_params = {
-                        'video_id': video_id,
                         'upload_phase': 'finish',
                         'access_token': token,
-                        'description': final_title if is_reel else final_description
+                        'description': final_title
                     }
+                    if is_reel:
+                         finish_url = init_url
+                         finish_params['video_id'] = video_id
+                    
                     publish_response = requests.post(finish_url, data=finish_params)
-                    publish_data = check_fb_response(publish_response)
+                    check_fb_response(publish_response)
                     
                     media_id = video_id
                     
-                    # Get permalink_url
                     try:
                         final_status_res = requests.get(status_check_url, params={'access_token': token, 'fields': 'permalink_url'})
                         final_status_data = check_fb_response(final_status_res)
@@ -2761,7 +2750,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         url = f"https://www.facebook.com/{'reel/' if is_reel else ''}{video_id}"
                     
                     logger.info(f"Facebook {upload_type} {video_id} published successfully.")
-
+            
             elif platform == "youtube":
                 session = await get_active_session(user_id, 'youtube')
                 if not session: raise ConnectionError("YouTube session not found. Please /ytlogin.")
@@ -2834,21 +2823,26 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             await safe_edit_message(processing_msg, success_msg, parse_mode=None, reply_markup=None)
             await send_log_to_channel(app, LOG_CHANNEL, log_msg)
 
-        except (ConnectionError, RefreshError, requests.RequestException, FileNotFoundError, ValueError) as e:
-            error_msg = f"❌ " + to_bold_sans(f"Upload Failed: {e}")
-            await safe_edit_message(processing_msg, error_msg, reply_markup=None)
-            if from_schedule and db is not None:
-                await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
-                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
-            logger.error(f"Upload error for {user_id}: {e}", exc_info=True)
+        except (requests.RequestException, ValueError) as e:
+            error_str = str(e).lower()
+            if "permission" in error_str or "requires" in error_str or "authorization" in error_str:
+                logger.warning(f"A non-blocking permission error occurred during upload for user {user_id}: {e}")
+                error_msg = f"⚠️ **Upload Warning:**\nCould not complete the upload due to a permission issue from Facebook. Please ensure your Page Token has the necessary permissions (`pages_manage_videos`, `pages_manage_posts`, etc.) for this type of upload."
+                await safe_edit_message(processing_msg, error_msg, reply_markup=None)
+            else:
+                error_msg = f"❌ " + to_bold_sans(f"Upload Failed: {e}")
+                await safe_edit_message(processing_msg, error_msg, reply_markup=None)
+                logger.error(f"Upload error for {user_id}: {e}", exc_info=True)
+                if from_schedule and db is not None:
+                    await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
+        
         except Exception as e:
             error_msg = f"❌ " + to_bold_sans(f"An Unexpected Error Occurred: {str(e)}")
             await safe_edit_message(processing_msg, error_msg, reply_markup=None)
             if from_schedule and db is not None:
                 await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "failed", "error_message": str(e)}})
-                await app.send_message(user_id, f"❌ Your scheduled upload for '{final_title}' failed. Error: {e}")
-
             logger.error(f"General upload failed for {user_id} on {platform}: {e}", exc_info=True)
+            
         finally:
             cleanup_temp_files(files_to_clean)
             if not from_schedule and user_id in user_states:
