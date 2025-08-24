@@ -1714,6 +1714,9 @@ async def select_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
+        async def answer(self, *args, **kwargs):
+            # This is a mock method to prevent crashes.
+            pass
     await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^confirm_logout_"))
@@ -1749,6 +1752,9 @@ async def logout_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
+        async def answer(self, *args, **kwargs):
+            # This is a mock method to prevent crashes.
+            pass
     await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^add_account_"))
@@ -2492,7 +2498,7 @@ async def start_upload_task(msg, file_info, user_id):
     )
 
 async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_id=None):
-    platform, upload_type, processing_msg = None, None, None
+    platform, upload_type, processing_msg, final_title = None, None, None, "Untitled"
     if not from_schedule:
         state_data = user_states.get(user_id)
         if not state_data:
@@ -2513,6 +2519,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             return
         platform = job['platform']
         upload_type = job.get('upload_type', 'video')
+        final_title = job.get('metadata', {}).get('title', 'Scheduled Upload')
         processing_msg = await app.send_message(user_id, "⏳ " + to_bold_sans(f"Starting your scheduled {upload_type}..."))
 
     async with upload_semaphore:
@@ -2567,7 +2574,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         r.raise_for_status()
                         post_data = r.json()
                         if not isinstance(post_data, dict):
-                             raise ValueError(f"Facebook returned an invalid response for post: {r.text}")
+                                raise ValueError(f"Facebook returned an invalid response for post: {r.text}")
                         post_id = post_data.get('post_id', post_data.get('id', 'N/A'))
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
@@ -2576,8 +2583,9 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     file_size = os.path.getsize(upload_path)
                     init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
                     
-                    params = {'access_token': token, 'upload_phase': 'start', 'file_size': file_size}
-                    init_response = requests.post(init_url, params=params)
+                    params = {'access_token': token}
+                    data = {'upload_phase': 'start', 'file_size': file_size}
+                    init_response = requests.post(init_url, params=params, data=data)
                     init_response.raise_for_status()
                     init_data = init_response.json()
                     if not isinstance(init_data, dict):
@@ -2591,12 +2599,13 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
                         upload_response.raise_for_status()
                         
-                    finish_params = {'access_token': token, 'upload_phase': 'finish', 'description': final_description}
+                    finish_params = {'access_token': token}
+                    finish_data = {'upload_phase': 'finish', 'description': final_description}
                     
                     for i in range(15):
                         logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
                         await asyncio.sleep(10)
-                        publish_response = requests.post(init_url, params=finish_params)
+                        publish_response = requests.post(init_url, params=finish_params, data=finish_data)
                         if publish_response.status_code == 200:
                             p_json = publish_response.json()
                             if isinstance(p_json, dict) and p_json.get('success'):
@@ -2611,8 +2620,8 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 elif upload_type == 'reel':
                     init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
                     
-                    params = {'upload_phase': 'start', 'access_token': token}
-                    init_response = requests.post(init_url, params=params)
+                    init_data = {'upload_phase': 'start', 'access_token': token}
+                    init_response = requests.post(init_url, data=init_data)
                     init_response.raise_for_status()
                     upload_data = init_response.json()
                     if not isinstance(upload_data, dict):
@@ -2630,7 +2639,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     status_check_url = f"https://graph.facebook.com/v19.0/{video_id}"
                     status_params = {'access_token': token, 'fields': 'status'}
                     
-                    for _ in range(12):
+                    for _ in range(20): # Increased retries
                         await asyncio.sleep(10)
                         status_response = requests.get(status_check_url, params=status_params)
                         status_data = status_response.json()
@@ -2644,8 +2653,8 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                     else:
                         raise Exception("Facebook Reel processing timed out.")
 
-                    publish_params = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
-                    publish_response = requests.post(init_url, params=publish_params)
+                    publish_data = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
+                    publish_response = requests.post(init_url, data=publish_data)
                     publish_response.raise_for_status()
                     media_id = video_id
                     url = f"https://www.facebook.com/reel/{video_id}"
@@ -2782,13 +2791,20 @@ async def send_log_to_channel(client, channel_id, text):
     if not channel_id or not valid_log_channel:
         return
     try:
+        # Try sending with the integer ID first
         await client.send_message(channel_id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
-    except PeerIdInvalid:
-        logger.error(f"Failed to log to channel {channel_id}: The ID is invalid. Please ensure the bot is an admin in the correct channel and the ID is correct.")
-        valid_log_channel = False
+    except (PeerIdInvalid, ValueError):
+        # If it fails, try to get the chat to see if it's a public channel username
+        try:
+            chat = await client.get_chat(channel_id)
+            await client.send_message(chat.id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Failed to log to channel {channel_id} even after get_chat(): {e}")
+            valid_log_channel = False
     except Exception as e:
         logger.error(f"Failed to log to channel {channel_id}: {e}")
         valid_log_channel = False
+
 
 # ===================================================================
 # ======================== BOT STARTUP ============================
@@ -3042,6 +3058,8 @@ async def cancel_schedule_cb(_, query):
                 self.from_user = user
                 self.message = message
                 self.data = data
+            async def answer(self, *args, **kwargs):
+                pass
         await manage_schedules_cb(app, MockQuery(query.from_user, query.message, f'manage_schedules_{platform}'))
     else:
         await query.answer("Could not find the scheduled post or you don't have permission.", show_alert=True)
