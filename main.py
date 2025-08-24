@@ -29,7 +29,7 @@ from bson import ObjectId
 
 
 # Pyrogram (Telegram Bot)
-from pyrogram import Client, filters, enums, idle
+from pyrogram import Client, filters, enums, idle, types
 from pyrogram.errors import UserNotParticipant, FloodWait, UserIsBlocked, PeerIdInvalid
 from pyrogram.types import (
     ReplyKeyboardMarkup,
@@ -1269,7 +1269,7 @@ async def handle_text_input(_, msg):
         await safe_edit_message(prompt_msg,
             to_bold_sans("🔑 Please Enter Your Facebook Page API Token.") +
             "\n\nThis is a Page Access Token, not a User Token.\n"
-            "Required permissions: `pages_manage_posts`, `pages_read_engagement`, `pages_manage_videos`."
+            "You can get it from the Facebook Developer Dashboard."
         )
 
     elif action == "waiting_for_fb_page_token":
@@ -1891,6 +1891,10 @@ async def upload_flow_cb(_, query):
     if not state_data or "file_info" not in state_data:
         return await query.answer("❌ Error: State lost, please start over.", show_alert=True)
     
+    # Since this is a callback, the original message is query.message
+    # We pass the query object itself to process_upload_step to handle it correctly
+    state_data["prompt_msg"] = query.message
+
     parts = data.split("_")
     step = parts[0]
     choice = parts[1]
@@ -2366,22 +2370,30 @@ async def handle_yt_json(_, msg):
             if os.path.exists(json_path):
                 os.remove(json_path)
 
-async def process_upload_step(msg):
+async def process_upload_step(msg_or_query):
     """Central function to handle the step-by-step upload process."""
-    user_id = msg.from_user.id
-    
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-    state_data = user_states.get(user_id)
-    if not state_data: return
-    
-    if "prompt_msg" in state_data:
+    # FIX: Handle both Message and CallbackQuery objects
+    if isinstance(msg_or_query, types.CallbackQuery):
+        query = msg_or_query
+        message = query.message
+        user_id = query.from_user.id
+    else:
+        message = msg_or_query
+        user_id = message.from_user.id
         try:
-            # Using getattr to avoid error if prompt_msg is not a message object
-            await getattr(state_data["prompt_msg"], "delete", lambda: None)()
+            await message.delete()
+        except Exception:
+            pass
+    
+    chat_id = message.chat.id
+    state_data = user_states.get(user_id)
+    if not state_data:
+        return
+
+    # Delete the previous prompt message from the bot
+    if "prompt_msg" in state_data and hasattr(state_data["prompt_msg"], "delete"):
+        try:
+            await state_data["prompt_msg"].delete()
         except Exception:
             pass
 
@@ -2389,9 +2401,6 @@ async def process_upload_step(msg):
     platform = state_data["platform"]
     upload_type = state_data["upload_type"]
     user_settings = await get_user_settings(user_id)
-    
-    # Using a new message for each step
-    chat_id = msg.chat.id
 
     # Simplified Reels Flow
     if upload_type == "reel":
@@ -2450,7 +2459,7 @@ async def process_upload_step(msg):
         is_video = msg_obj and (msg_obj.video or (msg_obj.document and 'video' in (msg_obj.document.mime_type or '')))
         if not is_video:
             file_info['thumbnail_path'] = None
-            return await process_upload_step(msg)
+            return await process_upload_step(msg_or_query)
         state_data["action"] = "waiting_for_thumbnail_choice"
         state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
 
@@ -2727,16 +2736,13 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
 
                     # 4. FINISH
                     await safe_edit_message(processing_msg, "✅ " + to_bold_sans(f"Facebook {upload_type.capitalize()} Upload: Publishing (4/4)"))
-                    finish_url = f"https://graph-video.facebook.com/{api_version}/{video_id}"
+                    finish_url = init_url # For both video and reel, finish call goes to the main endpoint
                     finish_params = {
+                        'video_id': video_id,
                         'upload_phase': 'finish',
                         'access_token': token,
                         'description': final_title
                     }
-                    if is_reel:
-                         finish_url = init_url
-                         finish_params['video_id'] = video_id
-                    
                     publish_response = requests.post(finish_url, data=finish_params)
                     check_fb_response(publish_response)
                     
