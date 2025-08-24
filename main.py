@@ -2490,6 +2490,19 @@ async def handle_media_upload(_, msg):
 # ==================== UPLOAD PROCESSING ==========================
 # ===================================================================
 
+def check_fb_response(response):
+    """Checks for HTTP and Facebook API errors in a requests response."""
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Facebook returned an invalid, non-JSON response: {response.text}")
+    if 'error' in data:
+        error_details = data['error']
+        raise requests.RequestException(
+            f"Facebook API Error ({error_details.get('code', 'N/A')}): {error_details.get('message', 'Unknown error')}"
+        )
+    return data
+
 async def start_upload_task(msg, file_info, user_id):
     task_tracker.create_task(
         safe_task_wrapper(process_and_upload(msg, file_info, user_id)),
@@ -2567,97 +2580,85 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
 
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
-                        post_url = f"https://graph.facebook.com/{page_id}/photos"
+                        post_url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
                         payload = {'access_token': token, 'caption': final_description}
                         files = {'source': f}
-                        r = requests.post(post_url, data=payload, files=files, timeout=600)
-                        r.raise_for_status()
-                        post_data = r.json()
-                        if not isinstance(post_data, dict):
-                                raise ValueError(f"Facebook returned an invalid response for post: {r.text}")
+                        response = requests.post(post_url, data=payload, files=files, timeout=600)
+                        post_data = check_fb_response(response)
                         post_id = post_data.get('post_id', post_data.get('id', 'N/A'))
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
                 
-                elif upload_type == 'video':
-                    file_size = os.path.getsize(upload_path)
-                    init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
+                elif upload_type in ['video', 'reel']:
+                    is_reel = upload_type == 'reel'
+                    api_version = "v19.0"
+                    base_url = f"https://graph-video.facebook.com/{api_version}/{page_id}"
+                    endpoint = "video_reels" if is_reel else "videos"
                     
-                    params = {'access_token': token}
-                    data = {'upload_phase': 'start', 'file_size': file_size}
-                    init_response = requests.post(init_url, params=params, data=data)
-                    init_response.raise_for_status()
-                    init_data = init_response.json()
-                    if not isinstance(init_data, dict):
-                        raise ValueError(f"Facebook returned an invalid response for video init: {init_response.text}")
+                    # 1. START
+                    await safe_edit_message(processing_msg, " başlatılıyor..." + to_bold_sans("Facebook Upload Session (1/4)"))
+                    init_url = f"{base_url}/{endpoint}"
+                    init_params = {
+                        'upload_phase': 'start',
+                        'access_token': token
+                    }
+                    if not is_reel:
+                         init_params['file_size'] = os.path.getsize(upload_path)
+                    
+                    init_response = requests.post(init_url, data=init_params)
+                    init_data = check_fb_response(init_response)
 
                     video_id = init_data['video_id']
-                    upload_session_url = init_data['upload_url']
+                    upload_session_id = init_data.get('upload_session_id') # For videos
+                    upload_url = init_data['upload_url'] # For reels
 
-                    upload_headers = {'Authorization': f'OAuth {token}'}
+                    # 2. TRANSFER
+                    await safe_edit_message(processing_msg, "⬆️ " + to_bold_sans("Uploading File to Facebook (2/4)"))
+                    transfer_headers = {'Authorization': f'OAuth {token}'}
                     with open(upload_path, 'rb') as f:
-                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
-                        upload_response.raise_for_status()
-                        
-                    finish_params = {'access_token': token}
-                    finish_data = {'upload_phase': 'finish', 'description': final_description}
-                    
-                    for i in range(15):
-                        logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
-                        await asyncio.sleep(10)
-                        publish_response = requests.post(init_url, params=finish_params, data=finish_data)
-                        if publish_response.status_code == 200:
-                            p_json = publish_response.json()
-                            if isinstance(p_json, dict) and p_json.get('success'):
-                                logger.info(f"Video {video_id} published successfully.")
-                                break
-                    else:
-                        raise Exception("Facebook video publishing timed out or failed.")
-                        
-                    media_id = video_id
-                    url = f"https://facebook.com/{video_id}"
+                        transfer_response = requests.post(upload_url, headers=transfer_headers, data=f)
+                        check_fb_response(transfer_response)
 
-                elif upload_type == 'reel':
-                    init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-                    
-                    init_data = {'upload_phase': 'start', 'access_token': token}
-                    init_response = requests.post(init_url, data=init_data)
-                    init_response.raise_for_status()
-                    upload_data = init_response.json()
-                    if not isinstance(upload_data, dict):
-                        raise ValueError(f"Facebook returned an invalid response for reel init: {init_response.text}")
-                        
-                    video_id = upload_data['video_id']
-                    upload_session_url = upload_data['upload_url']
-
-                    file_size = os.path.getsize(upload_path)
-                    upload_headers = {'Authorization': f'OAuth {token}', 'offset': '0', 'file_size': str(file_size)}
-                    with open(upload_path, 'rb') as f:
-                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
-                        upload_response.raise_for_status()
-
-                    status_check_url = f"https://graph.facebook.com/v19.0/{video_id}"
+                    # 3. STATUS POLLING
+                    await safe_edit_message(processing_msg, "⏳ " + to_bold_sans("Waiting for Facebook to Process... (3/4)"))
+                    status_check_url = f"https://graph.facebook.com/{api_version}/{video_id}"
                     status_params = {'access_token': token, 'fields': 'status'}
-                    
-                    for _ in range(20): # Increased retries
-                        await asyncio.sleep(10)
+                    for i in range(25): # Poll for up to ~5 minutes
+                        await asyncio.sleep(12)
                         status_response = requests.get(status_check_url, params=status_params)
-                        status_data = status_response.json()
-                        if not isinstance(status_data, dict):
-                            logger.warning(f"Invalid status response from Facebook: {status_response.text}")
-                            continue
+                        status_data = check_fb_response(status_response)
                         video_status = status_data.get('status', {}).get('video_status')
+                        logger.info(f"Polling FB video {video_id}, status: {video_status} (Attempt {i+1}/25)")
                         if video_status == 'ready':
-                            logger.info(f"Reel {video_id} is processed and ready.")
+                            logger.info(f"Video {video_id} is processed and ready.")
                             break
+                        elif video_status == 'error':
+                             error_details = status_data.get('status', {}).get('processing_progress', {}).get('error', {})
+                             raise ValueError(f"Facebook processing failed: {error_details.get('message', 'Unknown processing error')}")
                     else:
-                        raise Exception("Facebook Reel processing timed out.")
+                        raise Exception("Facebook video processing timed out after 5 minutes.")
 
-                    publish_data = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
-                    publish_response = requests.post(init_url, data=publish_data)
-                    publish_response.raise_for_status()
-                    media_id = video_id
-                    url = f"https://www.facebook.com/reel/{video_id}"
+                    # 4. FINISH
+                    await safe_edit_message(processing_msg, "✅ " + to_bold_sans("Publishing on Facebook (4/4)"))
+                    finish_url = f"{base_url}/{endpoint}"
+                    finish_params = {
+                        'upload_phase': 'finish',
+                        'access_token': token,
+                        'description': final_title if is_reel else final_description
+                    }
+                    if is_reel:
+                        finish_params['video_id'] = video_id
+                    else: # For videos
+                        finish_params['upload_session_id'] = upload_session_id
+
+                    publish_response = requests.post(finish_url, data=finish_params)
+                    publish_data = check_fb_response(publish_response)
+                    if publish_data.get('success'):
+                        media_id = video_id
+                        url = f"https://www.facebook.com/{'reel/' if is_reel else ''}{video_id}"
+                        logger.info(f"Facebook {upload_type} {video_id} published successfully.")
+                    else:
+                        raise Exception("Facebook publish command did not return success.")
             
             elif platform == "youtube":
                 session = await get_active_session(user_id, 'youtube')
