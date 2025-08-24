@@ -2326,7 +2326,7 @@ async def process_upload_step(msg_or_query):
         else:
             prompt += "\n• Or use /skip for no title."
         
-        if platform == 'youtube':
+        if platform == 'youtube' and 'downloaded_path' in file_info:
             metadata = get_video_metadata(file_info['downloaded_path'])
             duration = float(metadata.get('format', {}).get('duration', '61'))
             if duration < 60:
@@ -2459,7 +2459,7 @@ async def handle_media_upload(_, msg):
         if user_id in user_states: del user_states[user_id]
         return await msg.reply(f"❌ " + to_bold_sans(f"File Size Exceeds The Limit Of `{MAX_FILE_SIZE_BYTES / (1024 * 1024):.0f}` Mb."))
 
-    status_msg = await msg.reply("⏳ " + to_bold_sans("Starting Download..."))
+    status_msg = await msg.reply("⏳ " + to_bold_sans("Processing your file... Please wait."))
     state_data['status_msg'] = status_msg
     try:
         start_time = time.time()
@@ -2579,86 +2579,61 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         url = f"https://facebook.com/{post_id}"
                         media_id = post_id
                 
-                elif upload_type == 'video':
-                    file_size = os.path.getsize(upload_path)
-                    init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
+                #
+                # ========== CORRECTED FACEBOOK VIDEO & REEL UPLOAD LOGIC ==========
+                #
+                elif upload_type in ['video', 'reel']:
+                    # Determine API endpoint
+                    endpoint = "videos" if upload_type == 'video' else "video_reels"
+                    base_url = f"https://graph-video.facebook.com/v19.0/{page_id}/{endpoint}"
                     
-                    params = {'access_token': token}
-                    data = {'upload_phase': 'start', 'file_size': file_size}
-                    init_response = requests.post(init_url, params=params, data=data)
-                    init_response.raise_for_status()
-                    init_data = init_response.json()
-                    if not isinstance(init_data, dict):
-                        raise ValueError(f"Facebook returned an invalid response for video init: {init_response.text}")
-
-                    video_id = init_data['video_id']
-                    upload_session_url = init_data['upload_url']
-
+                    # --- Step 1: Start the upload session ---
+                    file_size = os.path.getsize(upload_path)
+                    start_payload = {
+                        'upload_phase': 'start',
+                        'file_size': file_size,
+                        'access_token': token
+                    }
+                    start_response = requests.post(base_url, data=start_payload)
+                    start_response.raise_for_status()
+                    start_data = start_response.json()
+                    
+                    upload_url = start_data['upload_url']
+                    video_id = start_data['video_id'] # Use this as the media_id
+                    
+                    # --- Step 2: Transfer the file data ---
                     upload_headers = {'Authorization': f'OAuth {token}'}
                     with open(upload_path, 'rb') as f:
-                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
-                        upload_response.raise_for_status()
-                        
-                    finish_params = {'access_token': token}
-                    finish_data = {'upload_phase': 'finish', 'description': final_description}
-                    
-                    for i in range(15):
-                        logger.info(f"Attempting to publish video {video_id} (Attempt {i+1}/15)")
-                        await asyncio.sleep(10)
-                        publish_response = requests.post(init_url, params=finish_params, data=finish_data)
-                        if publish_response.status_code == 200:
-                            p_json = publish_response.json()
-                            if isinstance(p_json, dict) and p_json.get('success'):
-                                logger.info(f"Video {video_id} published successfully.")
-                                break
-                    else:
-                        raise Exception("Facebook video publishing timed out or failed.")
-                        
-                    media_id = video_id
-                    url = f"https://facebook.com/{video_id}"
+                        transfer_response = requests.post(upload_url, headers=upload_headers, data=f)
+                        transfer_response.raise_for_status()
 
-                elif upload_type == 'reel':
-                    init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-                    
-                    init_data = {'upload_phase': 'start', 'access_token': token}
-                    init_response = requests.post(init_url, data=init_data)
-                    init_response.raise_for_status()
-                    upload_data = init_response.json()
-                    if not isinstance(upload_data, dict):
-                        raise ValueError(f"Facebook returned an invalid response for reel init: {init_response.text}")
-                        
-                    video_id = upload_data['video_id']
-                    upload_session_url = upload_data['upload_url']
+                    # --- Step 3: Finish the upload ---
+                    finish_payload = {
+                        'upload_phase': 'finish',
+                        'access_token': token,
+                        'description': final_description
+                    }
 
-                    file_size = os.path.getsize(upload_path)
-                    upload_headers = {'Authorization': f'OAuth {token}', 'offset': '0', 'file_size': str(file_size)}
-                    with open(upload_path, 'rb') as f:
-                        upload_response = requests.post(upload_session_url, headers=upload_headers, data=f)
-                        upload_response.raise_for_status()
-
+                    # Wait for Facebook to process the video before finishing
                     status_check_url = f"https://graph.facebook.com/v19.0/{video_id}"
                     status_params = {'access_token': token, 'fields': 'status'}
-                    
-                    for _ in range(20): # Increased retries
+                    for i in range(20): # Wait up to 200 seconds
                         await asyncio.sleep(10)
                         status_response = requests.get(status_check_url, params=status_params)
-                        status_data = status_response.json()
-                        if not isinstance(status_data, dict):
-                            logger.warning(f"Invalid status response from Facebook: {status_response.text}")
-                            continue
-                        video_status = status_data.get('status', {}).get('video_status')
+                        status_data = status_response.json().get('status', {})
+                        video_status = status_data.get('video_status')
+                        logger.info(f"FB video processing check {i+1}/20: status is '{video_status}'")
                         if video_status == 'ready':
-                            logger.info(f"Reel {video_id} is processed and ready.")
                             break
                     else:
-                        raise Exception("Facebook Reel processing timed out.")
+                        raise Exception("Facebook video processing timed out.")
 
-                    publish_data = {'access_token': token, 'video_id': video_id, 'upload_phase': 'finish', 'description': final_title}
-                    publish_response = requests.post(init_url, data=publish_data)
-                    publish_response.raise_for_status()
+                    finish_response = requests.post(base_url, data=finish_payload)
+                    finish_response.raise_for_status()
+
                     media_id = video_id
-                    url = f"https://www.facebook.com/reel/{video_id}"
-            
+                    url = f"https://www.facebook.com/{video_id}"
+
             elif platform == "youtube":
                 session = await get_active_session(user_id, 'youtube')
                 if not session: raise ConnectionError("YouTube session not found. Please /ytlogin.")
@@ -2786,21 +2761,22 @@ def run_server():
     except Exception as e:
         logger.error(f"HTTP server failed: {e}")
 
+# ========== CORRECTED LOGGING FUNCTION ==========
 async def send_log_to_channel(client, channel_id, text):
     global valid_log_channel
     if not channel_id or not valid_log_channel:
         return
     try:
-        # Try sending with the integer ID first
         await client.send_message(channel_id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
-    except (PeerIdInvalid, ValueError):
-        # If it fails, try to get the chat to see if it's a public channel username
+    except (PeerIdInvalid, ValueError) as e:
+        logger.warning(f"Peer ID {channel_id} is invalid, attempting to resolve it. Error: {e}")
         try:
+            # If the initial ID fails, try to get the chat object, which works with @usernames
             chat = await client.get_chat(channel_id)
             await client.send_message(chat.id, text, disable_web_page_preview=True, parse_mode=enums.ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"Failed to log to channel {channel_id} even after get_chat(): {e}")
-            valid_log_channel = False
+        except Exception as e_inner:
+            logger.error(f"Failed to log to channel {channel_id} even after get_chat(): {e_inner}")
+            valid_log_channel = False # Stop trying if it fails repeatedly
     except Exception as e:
         logger.error(f"Failed to log to channel {channel_id}: {e}")
         valid_log_channel = False
@@ -2855,10 +2831,10 @@ async def start_bot():
     if LOG_CHANNEL:
         try:
             await app.get_chat(LOG_CHANNEL)
-            await app.send_message(LOG_CHANNEL, "✅ **" + to_bold_sans("Bot Is Now Online And Running!") + "**", parse_mode=enums.ParseMode.MARKDOWN)
             valid_log_channel = True
+            await send_log_to_channel(app, LOG_CHANNEL, "✅ **" + to_bold_sans("Bot Is Now Online And Running!") + "**")
         except Exception as e:
-            logger.error(f"Could not log to channel {LOG_CHANNEL}. Invalid ID or bot isn't an admin. Error: {e}")
+            logger.error(f"Could not access log channel {LOG_CHANNEL}. Invalid ID or bot isn't an admin. Error: {e}")
             valid_log_channel = False
 
     logger.info(f"Bot is now online! ID: {BOT_ID}. Waiting for tasks...")
