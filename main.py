@@ -75,7 +75,7 @@ LOG_CHANNEL_STR = os.getenv("LOG_CHANNEL_ID") # e.g., -1001234567890
 MONGO_URI = os.getenv("MONGO_DB")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 # NEW: Required for the secure YouTube OAuth flow
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/")
 PORT_STR = os.getenv("PORT", "8080") # Port for the local redirect server
 # NEW: Required for the scheduling system
 STORAGE_CHANNEL_STR = os.getenv("STORAGE_CHANNEL_ID")
