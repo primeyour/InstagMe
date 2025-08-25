@@ -316,7 +316,7 @@ PREMIUM_PLATFORMS = ["facebook", "youtube"]
 
 def get_main_keyboard(user_id, premium_platforms):
     buttons = [
-        [KeyboardButton("⚙️ ꜱᴇᴛᴛɪɴɢꜱ"), KeyboardButton("📊 ꜱᴛᴀᴛꜱ")]
+        [KeyboardButton("📊 Dashboard"), KeyboardButton("⚙️ ꜱᴇᴛᴛɪɴɢꜱ")]
     ]
     fb_buttons = []
     yt_buttons = []
@@ -369,6 +369,7 @@ async def get_main_settings_markup(user_id):
 def get_facebook_settings_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 ᴅᴇғᴀᴜʟᴛ ᴄᴀᴩᴛɪᴏɴ", callback_data="set_caption_facebook")],
+        [InlineKeyboardButton("📄 ᴅᴇғᴀᴜʟᴛ ᴅᴇꜱᴄʀɪᴩᴛɪᴏɴ", callback_data="set_description_facebook")],
         [InlineKeyboardButton("👤 ᴍᴀɴᴀɢᴇ ғʙ ᴀᴄᴄᴏᴜɴᴛꜱ", callback_data="manage_fb_accounts")],
         [InlineKeyboardButton("🗓️ My FB Schedules", callback_data="manage_schedules_facebook")],
         [InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ꜱᴇᴛᴛɪɴɢꜱ", callback_data="back_to_settings")]
@@ -658,6 +659,7 @@ async def get_user_settings(user_id):
         settings = await asyncio.to_thread(db.settings.find_one, {"_id": user_id}) or {}
     
     settings.setdefault("caption_facebook", "")
+    settings.setdefault("description_facebook", "") # New setting
     settings.setdefault("active_facebook_id", None)
     settings.setdefault("title_youtube", "")
     settings.setdefault("description_youtube", "")
@@ -738,10 +740,10 @@ async def monitor_progress_task(chat_id, msg_id, progress_msg, action_text="Down
         # Simulate upload progress
         if action_text == "Uploading":
             for i in range(1, 100):
-                await asyncio.sleep(random.uniform(0.1, 0.5)) # Simulate network latency
+                if i > 5: await asyncio.sleep(random.uniform(0.1, 0.5))
                 progress_bar = f"[{'█' * int(i / 5)}{' ' * (20 - int(i / 5))}]"
                 progress_text = (
-                    f"⬆️ {to_bold_sans(f'Uploading to API')}: `{progress_bar}`\n"
+                    f"⬆️ {to_bold_sans('Uploading to API')}: `{progress_bar}`\n"
                     f"📊 **Percentage**: `{i:.2f}%`\n"
                 )
                 await safe_edit_message(progress_msg, progress_text, parse_mode=None)
@@ -1112,17 +1114,18 @@ async def admin_panel_button_handler(_, msg):
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-@app.on_message(filters.regex("📊 ꜱᴛᴀᴛꜱ"))
+@app.on_message(filters.regex("📊 Dashboard") | filters.command("stats"))
 @with_user_lock
 async def show_stats(_, msg):
     user_id = msg.from_user.id
     await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
     if db is None: return await msg.reply("⚠️ " + to_bold_sans("Database Is Currently Unavailable."))
     
+    # Show personal stats for regular users
     if not is_admin(user_id):
         user_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': user_id})
         stats_text = (
-            f"📊 **{to_bold_sans('Your Statistics:')}**\n\n"
+            f"📊 **{to_bold_sans('Your Dashboard:')}**\n\n"
             f"📈 **Total Uploads:** `{user_uploads}`\n"
         )
         for p in PREMIUM_PLATFORMS:
@@ -1170,7 +1173,7 @@ async def show_stats(_, msg):
     total_uploads = await asyncio.to_thread(db.uploads.count_documents, {})
     
     stats_text = (
-        f"📊 **{to_bold_sans('Bot Statistics:')}**\n\n"
+        f"📊 **{to_bold_sans('Bot Dashboard:')}**\n\n"
         f"**Users**\n"
         f"👥 Total Users: `{total_users}`\n"
         f"⭐ Premium Users: `{total_premium_users}`\n"
@@ -1397,20 +1400,20 @@ async def handle_text_input(_, msg):
         await msg.reply("✅ " + to_bold_sans(f"Default Caption For {platform.capitalize()} Has Been Set."))
         if user_id in user_states: del user_states[user_id]
 
-    elif action.startswith("waiting_for_title_"):
-        platform = action.split("_")[-1]
-        settings = await get_user_settings(user_id)
-        settings[f"title_{platform}"] = msg.text
-        await save_user_settings(user_id, settings)
-        await msg.reply("✅ " + to_bold_sans(f"Default Title For {platform.capitalize()} Has Been Set."))
-        if user_id in user_states: del user_states[user_id]
-
     elif action.startswith("waiting_for_description_"):
         platform = action.split("_")[-1]
         settings = await get_user_settings(user_id)
         settings[f"description_{platform}"] = msg.text
         await save_user_settings(user_id, settings)
         await msg.reply("✅ " + to_bold_sans(f"Default Description For {platform.capitalize()} Has Been Set."))
+        if user_id in user_states: del user_states[user_id]
+
+    elif action.startswith("waiting_for_title_"):
+        platform = action.split("_")[-1]
+        settings = await get_user_settings(user_id)
+        settings[f"title_{platform}"] = msg.text
+        await save_user_settings(user_id, settings)
+        await msg.reply("✅ " + to_bold_sans(f"Default Title For {platform.capitalize()} Has Been Set."))
         if user_id in user_states: del user_states[user_id]
 
     elif action == "waiting_for_tags_youtube":
@@ -1597,7 +1600,6 @@ async def handle_text_input(_, msg):
 # =================== CALLBACK QUERY HANDLERS =======================
 # ===================================================================
 
-# NEW CALLBACK HANDLER FOR PLATFORM SELECTION
 @app.on_callback_query(filters.regex("^select_platform_"))
 @rate_limit_callbacks
 async def select_platform_for_premium_cb(_, query):
@@ -1765,6 +1767,8 @@ async def select_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
+        async def answer(self, *args, **kwargs):
+            pass
     await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^manage_logout_"))
@@ -1843,6 +1847,8 @@ async def logout_account_cb(_, query):
             self.from_user = user
             self.message = message
             self.data = data
+        async def answer(self, *args, **kwargs):
+            pass
     await manage_accounts_cb(app, MockQuery(query.from_user, query.message, f'manage_{"fb" if platform == "facebook" else "yt"}_accounts'))
 
 @app.on_callback_query(filters.regex("^add_account_"))
@@ -1888,7 +1894,6 @@ async def cancel_upload_cb(_, query):
     await task_tracker.cancel_all_user_tasks(user_id)
     logger.info(f"User {user_id} cancelled their upload.")
 
-# --- NEW: Upload Flow Callbacks ---
 @app.on_callback_query(filters.regex("^upload_flow_"))
 @rate_limit_callbacks
 async def upload_flow_cb(_, query):
@@ -2406,38 +2411,41 @@ async def process_upload_step(msg_or_query):
     upload_type = state_data["upload_type"]
     user_settings = await get_user_settings(user_id)
     
+    # Use the original media message as the base for replies
+    reply_to_message = file_info.get("original_media_msg")
+
     if upload_type == "reel":
         if "title" not in file_info:
             state_data["action"] = "waiting_for_title"
             prompt = to_bold_sans("Reel Received. Please Send Your Caption.")
-            state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+            state_data["prompt_msg"] = await reply_to_message.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
             return
         elif "schedule_time" not in file_info:
             file_info.update({'description': "", 'tags': "", 'thumbnail_path': None, 'visibility': 'public'})
             state_data["action"] = "waiting_for_publish_choice"
-            state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+            state_data["prompt_msg"] = await reply_to_message.reply(to_bold_sans("When To Publish Reel?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
             return
     
     if "title" not in file_info:
         state_data["action"] = "waiting_for_title"
-        prompt = to_bold_sans("Media Received. First, Send Your Title.")
-        if user_settings.get(f'title_{platform}') or user_settings.get(f'caption_{platform}'):
-            prompt += f"\n\nOr use /skip to use your default."
-        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+        prompt = to_bold_sans("Please send a Title for your post.")
+        if user_settings.get(f'caption_{platform}') or user_settings.get(f'title_{platform}'):
+            prompt += "\n\nOr use /skip to use your default title."
+        state_data["prompt_msg"] = await reply_to_message.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif "description" not in file_info:
         state_data["action"] = "waiting_for_description"
-        prompt = to_bold_sans("Next, Send Your Description.")
+        prompt = to_bold_sans("Next, send a Description.")
         if user_settings.get(f'description_{platform}'):
-            prompt += f"\n\nOr use /skip to use your default."
-        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+            prompt += "\n\nOr use /skip to use your default description."
+        state_data["prompt_msg"] = await reply_to_message.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif platform == 'youtube' and "tags" not in file_info:
         state_data["action"] = "waiting_for_tags"
-        prompt = to_bold_sans("Now, Send Comma-separated Tags.")
+        prompt = to_bold_sans("Now, send comma-separated Tags.")
         if user_settings.get(f'tags_{platform}'):
-            prompt += f"\n\nOr use /skip to use your default."
-        state_data["prompt_msg"] = await app.send_message(chat_id, prompt, parse_mode=enums.ParseMode.MARKDOWN)
+            prompt += "\n\nOr use /skip to use your default tags."
+        state_data["prompt_msg"] = await reply_to_message.reply(prompt, parse_mode=enums.ParseMode.MARKDOWN)
 
     elif platform == 'youtube' and "thumbnail_path" not in file_info:
         msg_obj = file_info.get('original_media_msg')
@@ -2446,22 +2454,22 @@ async def process_upload_step(msg_or_query):
             file_info['thumbnail_path'] = None
             return await process_upload_step(msg_or_query)
         state_data["action"] = "waiting_for_thumbnail_choice"
-        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
+        state_data["prompt_msg"] = await reply_to_message.reply(to_bold_sans("Choose Thumbnail Option:"), reply_markup=get_upload_flow_markup(platform, 'thumbnail'))
     
-    elif platform == 'youtube' and file_info.get("thumbnail_path") == "auto":
-        file_info['visibility'] = user_settings.get("visibility_youtube", "private")
+    elif platform == 'youtube' and file_info.get("thumbnail_path") == "auto": # User skipped thumbnail
+        file_info['visibility'] = user_settings.get("visibility_youtube", "private") # Set default and skip asking
         state_data["action"] = "waiting_for_publish_choice"
-        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+        state_data["prompt_msg"] = await reply_to_message.reply(to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
     
     elif platform == 'youtube' and "visibility" not in file_info:
         state_data["action"] = "waiting_for_visibility_choice"
-        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
+        state_data["prompt_msg"] = await reply_to_message.reply(to_bold_sans("Set Video Visibility:"), reply_markup=get_upload_flow_markup(platform, 'visibility'))
 
     elif "schedule_time" not in file_info:
         if platform == 'facebook':
-            file_info['visibility'] = 'public'
+            file_info['visibility'] = 'public' # FB doesn't need this step
         state_data["action"] = "waiting_for_publish_choice"
-        state_data["prompt_msg"] = await app.send_message(chat_id, to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
+        state_data["prompt_msg"] = await reply_to_message.reply(to_bold_sans("When To Publish?"), reply_markup=get_upload_flow_markup(platform, 'publish'))
 
     else:
         status_msg = state_data.get('status_msg')
@@ -2551,7 +2559,7 @@ async def handle_media_upload(_, msg):
         if user_id in user_states: del user_states[user_id]
         return await msg.reply(f"❌ " + to_bold_sans(f"File Size Exceeds The Limit Of `{MAX_FILE_SIZE_BYTES / (1024 * 1024):.0f}` Mb."))
 
-    status_msg = await msg.reply("⏳ " + to_bold_sans("Starting Download..."))
+    status_msg = await msg.reply_text("⏳ " + to_bold_sans("Starting Download..."))
     state_data['status_msg'] = status_msg
     try:
         start_time = time.time()
@@ -2660,7 +2668,8 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             task_tracker.create_task(monitor_progress_task(user_id, processing_msg.id, processing_msg, action_text="Uploading"), user_id, "upload_monitor")
             
             url, media_id = "N/A", "N/A"
-            final_title = file_info.get("title") or user_settings.get(f"title_{platform}") or user_settings.get(f"caption_{platform}") or "Untitled"
+            final_title = file_info.get("title") or user_settings.get(f"caption_{platform}") or user_settings.get(f"title_{platform}") or "Untitled"
+            final_description = file_info.get("description") or user_settings.get(f"description_{platform}") or final_title
             
             if platform == "facebook":
                 session = await get_active_session(user_id, 'facebook')
@@ -2668,8 +2677,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 
                 page_id = session['id']
                 token = session['access_token']
-                final_description = (file_info.get("description", "") or final_title)
-
+                
                 if upload_type == 'post':
                     with open(upload_path, 'rb') as f:
                         post_url = f"https://graph.facebook.com/v19.0/{page_id}/photos"
@@ -2678,68 +2686,57 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                         response = requests.post(post_url, data=payload, files=files, timeout=600)
                         post_data = check_fb_response(response)
                         post_id = post_data.get('post_id', post_data.get('id', 'N/A'))
-                        url = f"https://facebook.com/{post_id}"
-                        media_id = post_id
-                
-                elif upload_type == 'video': # Simple, direct upload for videos
+                        media_id = post_id.split('_')[1] if '_' in post_id else post_id
+                        url = f"https://facebook.com/video.php?v={media_id}"
+
+                elif upload_type == 'video':
                     upload_url = f"https://graph-video.facebook.com/{page_id}/videos"
                     with open(upload_path, 'rb') as f:
                         params = {'access_token': token, 'description': final_description}
                         files = {'source': f}
-                        r = requests.post(upload_url, data=params, files=files, timeout=1800)
+                        r = requests.post(upload_url, data=params, files=files, timeout=3600) # Increased timeout
                         video_data = check_fb_response(r)
-                        video_id = video_data['id']
-                        url = f"https://facebook.com/{video_id}"
-                        media_id = video_id
-                        logger.info(f"Facebook video {video_id} published successfully using simple method.")
+                        media_id = video_data['id']
+                        url = f"https://facebook.com/video.php?v={media_id}"
+                        logger.info(f"Facebook video {media_id} published successfully.")
 
-                elif upload_type == 'reel': # Multi-step resumable for reels
-                    api_version = "v19.0"
-                    init_url = f"https://graph-video.facebook.com/{api_version}/{page_id}/video_reels"
-                    
+                elif upload_type == 'reel':
+                    # Step 1: Initialize
+                    init_url = f"https://graph-video.facebook.com/v19.0/{page_id}/video_reels"
                     init_params = {'upload_phase': 'start', 'access_token': token}
-                    init_response = requests.post(init_url, data=init_params)
-                    init_data = check_fb_response(init_response)
-                    
-                    video_id = init_data.get('video_id')
-                    upload_url = init_data.get('upload_url')
-                    if not video_id or not upload_url:
-                        raise ValueError("Facebook did not return a valid video_id and upload_url for reel.")
+                    init_r = requests.post(init_url, data=init_params)
+                    upload_data = check_fb_response(init_r)
+                    video_id = upload_data['video_id']
+                    upload_session_url = upload_data['upload_url']
 
-                    transfer_headers = {'Authorization': f'OAuth {token}'}
+                    # Step 2: Upload
+                    upload_headers = {'Authorization': f'OAuth {token}'}
                     with open(upload_path, 'rb') as f:
-                        transfer_response = requests.post(upload_url, headers=transfer_headers, data=f)
-                        check_fb_response(transfer_response)
-
-                    status_check_url = f"https://graph.facebook.com/{api_version}/{video_id}"
-                    status_params = {'access_token': token, 'fields': 'status'}
-                    for i in range(25):
-                        await asyncio.sleep(12)
-                        status_response = requests.get(status_check_url, params=status_params)
-                        status_data = check_fb_response(status_response)
-                        video_status = status_data.get('status', {}).get('video_status')
-                        logger.info(f"Polling FB reel {video_id}, status: {video_status} (Attempt {i+1}/25)")
-                        if video_status == 'ready':
-                            logger.info(f"Reel {video_id} is processed and ready.")
-                            break
-                        elif video_status == 'error':
-                             error_details = status_data.get('status', {}).get('processing_progress', {}).get('error', {})
-                             raise ValueError(f"Facebook processing failed: {error_details.get('message', 'Unknown error')}")
-                    else:
-                        raise Exception("Facebook reel processing timed out.")
-
-                    finish_params = {
+                        upload_r = requests.post(upload_session_url, headers=upload_headers, data=f)
+                        check_fb_response(upload_r)
+                    
+                    # Step 3: Publish (with polling)
+                    publish_params = {
+                        'access_token': token,
                         'video_id': video_id,
                         'upload_phase': 'finish',
-                        'access_token': token,
-                        'description': final_title
+                        'video_state': 'PUBLISHED',
+                        'description': final_title,
                     }
-                    publish_response = requests.post(init_url, data=finish_params)
-                    check_fb_response(publish_response)
-                    
-                    media_id = video_id
-                    url = f"https://www.facebook.com/reel/{video_id}"
-                    logger.info(f"Facebook reel {video_id} published successfully.")
+                    for _ in range(20): # Poll for up to ~4 minutes
+                        await asyncio.sleep(12)
+                        publish_r = requests.post(init_url, data=publish_params)
+                        if publish_r.status_code == 200:
+                            publish_data = check_fb_response(publish_r)
+                            if publish_data.get('success'):
+                                media_id = video_id
+                                url = f"https://facebook.com/video.php?v={media_id}"
+                                logger.info(f"Facebook reel {media_id} published successfully.")
+                                break
+                        else:
+                            logger.warning(f"Reel publish attempt failed with status {publish_r.status_code}. Retrying...")
+                    else:
+                        raise Exception("Reel publishing timed out or failed consistently.")
             
             elif platform == "youtube":
                 session = await get_active_session(user_id, 'youtube')
@@ -2761,15 +2758,8 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 schedule_time = file_info.get("schedule_time")
 
                 body = {
-                    "snippet": {
-                        "title": final_title,
-                        "description": file_info.get("description") or user_settings.get("description_youtube", ""),
-                        "tags": [tag.strip() for tag in tags if tag.strip()]
-                    },
-                    "status": {
-                        "privacyStatus": "private" if schedule_time else visibility,
-                        "selfDeclaredMadeForKids": False
-                    }
+                    "snippet": { "title": final_title, "description": final_description, "tags": [tag.strip() for tag in tags if tag.strip()]},
+                    "status": {"privacyStatus": "private" if schedule_time else visibility, "selfDeclaredMadeForKids": False }
                 }
                 if schedule_time and isinstance(schedule_time, datetime):
                     body["status"]["publishAt"] = schedule_time.isoformat().replace("+00:00", "Z")
@@ -2780,8 +2770,7 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
                 response = None
                 while response is None:
                     status, response = await asyncio.to_thread(request.next_chunk)
-                    if status:
-                        logger.info(f"Uploaded {int(status.progress() * 100)}%")
+                    if status: logger.info(f"Uploaded {int(status.progress() * 100)}%")
                 
                 media_id = response['id']
                 url = f"https://youtu.be/{media_id}"
@@ -2797,17 +2786,15 @@ async def process_and_upload(msg, file_info, user_id, from_schedule=False, job_i
             if db is not None:
                 if not from_schedule:
                     await asyncio.to_thread(db.uploads.insert_one, {
-                        "user_id": user_id, "media_id": str(media_id),
-                        "platform": platform, "upload_type": upload_type, "timestamp": datetime.now(timezone.utc),
+                        "user_id": user_id, "media_id": str(media_id), "platform": platform, 
+                        "upload_type": upload_type, "timestamp": datetime.now(timezone.utc),
                         "url": url, "title": final_title
                     })
                 else:
                     await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": ObjectId(job_id)}, {"$set": {"status": "completed", "final_url": url}})
                     await app.send_message(user_id, f"✅ **Scheduled Upload Complete!**\n\nYour {upload_type} '{final_title}' has been published:\n{url}")
 
-            log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n" \
-                      f"👤 User: `{user_id}`\n🔗 URL: {url}\n" \
-                      f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+            log_msg = f"📤 New {platform.capitalize()} {upload_type.capitalize()} Upload\n👤 User: `{user_id}`\n🔗 URL: {url}\n📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
             success_msg = f"✅ " + to_bold_sans("Uploaded Successfully!") + f"\n\n{url}"
             
             await safe_edit_message(processing_msg, success_msg, parse_mode=None, reply_markup=None)
