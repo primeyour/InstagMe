@@ -153,23 +153,52 @@ def needs_conversion(input_file: str) -> bool:
     return True
 
 def process_video_for_upload(input_file: str, output_file: str) -> str:
-    """Converts a video to a web-compatible format (H.264/AAC) using ultrafast preset."""
+    """
+    Intelligently converts a video file. It stream-copies compatible tracks 
+    and only re-encodes what is necessary.
+    """
+    metadata = get_video_metadata(input_file)
+    if not metadata:
+        raise ValueError("Could not get video metadata to perform conversion.")
+
+    v_codec = None
+    a_codec = None
+    for stream in metadata.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            v_codec = stream.get('codec_name')
+        elif stream.get('codec_type') == 'audio':
+            a_codec = stream.get('codec_name')
+
+    # Build the FFmpeg command dynamically
+    command = ['ffmpeg', '-y', '-i', input_file]
+
+    # Video stream handling
+    if v_codec == 'h264':
+        logger.info("Video stream is compatible (h264). Copying without re-encoding.")
+        command.extend(['-c:v', 'copy'])
+    else:
+        logger.warning(f"Video stream '{v_codec}' is not h264. Re-encoding.")
+        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
+
+    # Audio stream handling
+    if a_codec == 'aac':
+        logger.info("Audio stream is compatible (aac). Copying without re-encoding.")
+        command.extend(['-c:a', 'copy'])
+    else:
+        logger.warning(f"Audio stream '{a_codec}' is not aac. Re-encoding.")
+        command.extend(['-c:a', 'aac', '-b:a', '128k'])
+
+    command.extend(['-movflags', '+faststart', output_file])
+
     try:
-        command = [
-            'ffmpeg', '-y', '-i', input_file,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-movflags', '+faststart',
-            output_file
-        ]
         subprocess.run(command, check=True, capture_output=True, text=True)
-        logger.info(f"Successfully converted video to '{output_file}'.")
+        logger.info(f"Successfully processed video to '{output_file}'.")
         return output_file
     except FileNotFoundError:
         raise FileNotFoundError("ffmpeg is not installed. Video processing is not possible.")
     except subprocess.CalledProcessError as e:
         logger.error(f"ffmpeg conversion failed for {input_file}. Error: {e.stderr}")
-        raise ValueError(f"Video conversion failed.")
+        raise ValueError("Video conversion failed.")
 
 
 # === Global Bot Settings ===
