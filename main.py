@@ -72,13 +72,12 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOG_CHANNEL_STR = os.getenv("LOG_CHANNEL_ID")
 MONGO_URI = os.getenv("MONGO_DB")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/")
 PORT_STR = os.getenv("PORT", "8080")
-STORAGE_CHANNEL_STR = os.getenv("STORAGE_CHANNEL_ID")
 
 
 # Validate required environment variables
-if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI, STORAGE_CHANNEL_STR]):
+if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI]):
     logger.critical("FATAL ERROR: One or more required environment variables are missing.")
     sys.exit(1)
 
@@ -86,7 +85,6 @@ if not all([API_ID_STR, API_HASH, BOT_TOKEN, ADMIN_ID_STR, MONGO_URI, STORAGE_CH
 API_ID = int(API_ID_STR)
 ADMIN_ID = int(ADMIN_ID_STR)
 LOG_CHANNEL = int(LOG_CHANNEL_STR) if LOG_CHANNEL_STR else None
-STORAGE_CHANNEL = int(STORAGE_CHANNEL_STR)
 PORT = int(PORT_STR)
 
 # === Advanced Video Processing Helpers ===
@@ -155,11 +153,11 @@ def needs_conversion(input_file: str) -> bool:
     return True
 
 def process_video_for_upload(input_file: str, output_file: str) -> str:
-    """Converts a video to a web-compatible format (H.264/AAC)."""
+    """Converts a video to a web-compatible format (H.264/AAC) using ultrafast preset."""
     try:
         command = [
             'ffmpeg', '-y', '-i', input_file,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac', '-b:a', '128k',
             '-movflags', '+faststart',
             output_file
@@ -200,7 +198,6 @@ MAX_FILE_SIZE_BYTES = 0
 MAX_CONCURRENT_UPLOADS = 0
 shutdown_event = asyncio.Event()
 valid_log_channel = False
-valid_storage_channel = False
 
 # Pyrogram Client
 app = Client("upload_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -526,6 +523,19 @@ def get_upload_flow_markup(platform, step):
 # ====================== HELPER FUNCTIONS ===========================
 # ===================================================================
 
+def check_fb_response(response):
+    """Checks for HTTP and Facebook API errors in a requests response."""
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Facebook returned an invalid, non-JSON response: {response.text}")
+    if 'error' in data:
+        error_details = data['error']
+        raise requests.RequestException(
+            f"Facebook API Error ({error_details.get('code', 'N/A')}): {error_details.get('message', 'Unknown error')}"
+        )
+    return data
+
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
@@ -661,13 +671,13 @@ async def get_user_settings(user_id):
     
     return settings
 
-async def safe_edit_message(message, text, reply_markup=None, parse_mode=enums.ParseMode.MARKDOWN):
+async def safe_edit_message(message, text, reply_markup=None):
     """Safely edits a message, ignoring 'message not modified' errors."""
     try:
         if not message:
             logger.warning("safe_edit_message called with a None message object.")
             return
-        await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
         if "MESSAGE_NOT_MODIFIED" not in str(e):
             logger.warning(f"Couldn't edit message: {e}")
@@ -681,7 +691,7 @@ async def safe_threaded_reply(original_media_message, new_text=None, new_markup=
     try:
         parse_mode = enums.ParseMode.MARKDOWN
         if status_message:
-            await safe_edit_message(status_message, new_text, new_markup, parse_mode)
+            await safe_edit_message(status_message, new_text, new_markup)
             return status_message
         else:
             return await original_media_message.reply(text=new_text, reply_markup=new_markup, parse_mode=parse_mode, quote=True)
@@ -913,7 +923,7 @@ async def facebook_login_cmd_new(_, msg):
     if not await is_premium_for_platform(user_id, "facebook"):
         return await msg.reply("❌ " + to_bold_sans("Facebook Premium Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
-    prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your Facebook App ID."))
+    prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your Facebook App ID."), quote=True)
     user_states[user_id] = {
         "action": "waiting_for_fb_app_id",
         "platform": "facebook",
@@ -929,7 +939,7 @@ async def youtube_login_cmd_new(_, msg):
     if not await is_premium_for_platform(user_id, "youtube"):
         return await msg.reply("❌ " + to_bold_sans("YouTube Premium Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
-    prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your YouTube OAuth Client ID."))
+    prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your YouTube OAuth Client ID."), quote=True)
     user_states[user_id] = {
         "action": "waiting_for_yt_client_id",
         "platform": "youtube",
@@ -1065,11 +1075,24 @@ async def admin_panel_button_handler(_, msg):
 
 @app.on_message(filters.regex("📊 Dashboard") | filters.command("stats"))
 @with_user_lock
-async def show_stats(_, msg):
-    user_id = msg.from_user.id
+async def show_stats(_, msg_or_query):
+    if hasattr(msg_or_query, 'message'): # It's a callback query
+        user_id = msg_or_query.from_user.id
+        message = msg_or_query.message
+        is_callback = True
+    else: # It's a regular message
+        user_id = msg_or_query.from_user.id
+        message = msg_or_query
+        is_callback = False
+
     await _save_user_data(user_id, {"last_active": datetime.now(timezone.utc)})
-    if db is None: return await msg.reply("⚠️ " + to_bold_sans("Database Is Currently Unavailable."))
-    
+    if db is None: 
+        text = "⚠️ " + to_bold_sans("Database Is Currently Unavailable.")
+        if is_callback:
+            return await msg_or_query.answer(text, show_alert=True)
+        else:
+            return await message.reply(text)
+
     if not is_admin(user_id):
         user_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': user_id})
         stats_text = (
@@ -1079,11 +1102,13 @@ async def show_stats(_, msg):
         for p in PREMIUM_PLATFORMS:
             platform_uploads = await asyncio.to_thread(db.uploads.count_documents, {'user_id': user_id, 'platform': p})
             stats_text += f"    - {p.capitalize()}: `{platform_uploads}`\n"
-        await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply(stats_text)
         return
 
+    # Admin Stats
     total_users = await asyncio.to_thread(db.users.count_documents, {})
     
+    # ... [rest of the stats logic remains the same]
     pipeline = [
         {"$project": {
             "is_premium": {"$or": [
@@ -1103,20 +1128,14 @@ async def show_stats(_, msg):
             **{f"{p}_premium": {"$sum": {"$cond": [f"$platforms.{p}", 1, 0]}} for p in PREMIUM_PLATFORMS}
         }}
     ]
-    
     try:
         result = await asyncio.to_thread(list, db.users.aggregate(pipeline))
     except OperationFailure as e:
         logger.error(f"Stats aggregation failed: {e}")
-        return await msg.reply("⚠️ " + to_bold_sans("Could Not Fetch Bot Statistics."))
+        return await message.reply("⚠️ " + to_bold_sans("Could Not Fetch Bot Statistics."))
 
-    total_premium_users = 0
-    premium_counts = {p: 0 for p in PREMIUM_PLATFORMS}
-    if result:
-        total_premium_users = result[0].get('total_premium', 0)
-        for p in PREMIUM_PLATFORMS:
-            premium_counts[p] = result[0].get(f'{p}_premium', 0)
-            
+    total_premium_users = result[0].get('total_premium', 0) if result else 0
+    premium_counts = {p: result[0].get(f'{p}_premium', 0) if result else 0 for p in PREMIUM_PLATFORMS}
     total_uploads = await asyncio.to_thread(db.uploads.count_documents, {})
     
     stats_text = (
@@ -1137,17 +1156,16 @@ async def show_stats(_, msg):
 
     stats_text += f"\n**Events**\n📢 Special Event Status: `{'ON' if global_settings.get('special_event_toggle') else 'OFF'}`"
     
-    if hasattr(msg, 'reply_markup') and msg.reply_markup:
-        await safe_edit_message(msg, stats_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
+    if is_callback:
+        await safe_edit_message(message, stats_text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="admin_panel")]]))
     else:
-        await msg.reply(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
+        await message.reply(stats_text)
 
 @app.on_message(filters.regex("👤 Account Info"))
 async def account_info_handler(_, msg):
     user_id = msg.from_user.id
     if is_admin(user_id):
-        # For admin, this button can show their own info. Checking others is in admin panel.
-        pass
+        pass # Admin can check other users via admin panel
 
     info_text = f"👤 **{to_bold_sans('Account Information')}**\n\n"
     has_any_session = False
@@ -1158,9 +1176,19 @@ async def account_info_handler(_, msg):
         has_any_session = True
         info_text += "**Facebook Accounts:**\n"
         for session in fb_sessions:
-            page_name = session.get('session_data', {}).get('name', 'N/A')
-            page_id = session.get('session_data', {}).get('id', 'N/A')
-            info_text += f"  - **Page:** {page_name} (`{page_id}`)\n"
+            s_data = session.get('session_data', {})
+            page_name = s_data.get('name', 'N/A')
+            expiry = s_data.get('expires_at')
+            info_text += f"  - **Page:** {page_name}\n"
+            if expiry:
+                expiry_dt = datetime.fromtimestamp(expiry, tz=timezone.utc)
+                remaining = expiry_dt - datetime.now(timezone.utc)
+                if remaining.total_seconds() > 0:
+                    info_text += f"    - **Token Expires in:** `{remaining.days}d, {remaining.seconds // 3600}h`\n"
+                else:
+                    info_text += f"    - **Token:** `Expired`\n"
+            else:
+                info_text += f"    - **Token:** `Long-Lived (No Expiry Date Stored)`\n"
 
     # Check YouTube Sessions
     yt_sessions = await load_platform_sessions(user_id, 'youtube')
@@ -1168,16 +1196,20 @@ async def account_info_handler(_, msg):
         has_any_session = True
         info_text += "\n**YouTube Accounts:**\n"
         for session in yt_sessions:
-            channel_name = session.get('session_data', {}).get('name', 'N/A')
-            channel_id = session.get('session_data', {}).get('id', 'N/A')
+            s_data = session.get('session_data', {})
+            channel_name = s_data.get('name', 'N/A')
+            info_text += f"  - **Channel:** {channel_name}\n"
             try:
-                creds = Credentials.from_authorized_user_info(json.loads(session['session_data']['credentials_json']))
-                expiry = creds.expiry.strftime('%Y-%m-%d %H:%M UTC')
-                info_text += f"  - **Channel:** {channel_name}\n"
-                info_text += f"    - **Token Expires:** `{expiry}`\n"
+                creds = Credentials.from_authorized_user_info(json.loads(s_data['credentials_json']))
+                expiry = creds.expiry
+                remaining = expiry - datetime.now(timezone.utc)
+                if remaining.total_seconds() > 0:
+                    info_text += f"    - **Token Expires in:** `{remaining.days}d, {remaining.seconds // 3600}h`\n"
+                else:
+                    info_text += f"    - **Token:** `Expired` (Will attempt to refresh on next use)\n"
             except Exception as e:
                 logger.error(f"Could not parse YouTube credentials for user {user_id}: {e}")
-                info_text += f"  - **Channel:** {channel_name} (Token info unavailable)\n"
+                info_text += f"    - **Token:** `Info Unavailable`\n"
 
 
     if not has_any_session:
@@ -1255,13 +1287,26 @@ async def handle_text_input(_, msg):
 
     elif action == "waiting_for_fb_page_token":
         token = msg.text.strip()
-        state_data["login_data"]["access_token"] = token
         app_id = state_data["login_data"]["app_id"]
+        app_secret = state_data["login_data"]["app_secret"]
         
-        await prompt_msg.edit("🔐 " + to_bold_sans("Validating credentials..."))
+        await prompt_msg.edit("🔐 " + to_bold_sans("Validating and extending token..."))
         
         try:
-            page_url = f"https://graph.facebook.com/v19.0/me?access_token={token}&fields=id,name,picture.type(large)"
+            # Exchange for a long-lived token
+            exchange_url = (f"https://graph.facebook.com/v19.0/oauth/access_token?"
+                            f"grant_type=fb_exchange_token&"
+                            f"client_id={app_id}&"
+                            f"client_secret={app_secret}&"
+                            f"fb_exchange_token={token}")
+            exchange_res = requests.get(exchange_url)
+            token_data = check_fb_response(exchange_res)
+            long_lived_token = token_data['access_token']
+            expires_in = token_data.get('expires_in', 5184000) # Default to 60 days
+            expires_at = int(time.time()) + expires_in
+
+            # Get Page ID and Name
+            page_url = f"https://graph.facebook.com/v19.0/me?access_token={long_lived_token}&fields=id,name,picture.type(large)"
             page_res = requests.get(page_url)
             page_data = check_fb_response(page_res)
             
@@ -1274,8 +1319,8 @@ async def handle_text_input(_, msg):
 
             session_data = {
                 'id': page_id, 'name': page_name, 'picture_url': page_picture_url,
-                'app_id': app_id, 'app_secret': state_data["login_data"]["app_secret"],
-                'access_token': token
+                'app_id': app_id, 'app_secret': app_secret,
+                'access_token': long_lived_token, 'expires_at': expires_at
             }
             await save_platform_session(user_id, "facebook", session_data)
             
@@ -2068,13 +2113,7 @@ async def admin_panel_actions_cb(_, query):
         await safe_edit_message(query.message, "📢 " + to_bold_sans("Please send the message to broadcast."))
     
     elif action == "admin_stats_panel":
-        class MockMsg:
-            def __init__(self, q):
-                self.from_user = q.from_user; self.chat = q.message.chat; self.id = q.message.id; self.reply_markup = q.message.reply_markup 
-            async def reply(self, text, **kwargs):
-                await safe_edit_message(query.message, text, **kwargs)
-        
-        await show_stats(app, MockMsg(query))
+        await show_stats(app, query)
 
 async def show_user_details(message, target_user_id):
     """Helper to fetch and display user details for the admin."""
@@ -2338,9 +2377,9 @@ async def process_upload_step(msg_or_query):
         next_prompt_text = to_bold_sans("Now, send comma-separated Tags.")
         next_markup = get_upload_flow_markup(platform, 'input')
 
-    elif platform == 'youtube' and upload_type in ['video', 'short'] and "thumbnail_path" not in file_info:
+    elif platform == 'youtube' and upload_type == 'video' and "thumbnail_path" not in file_info:
         state_data["action"] = "waiting_for_thumbnail_choice"
-        next_prompt_text = to_bold_sans("A thumbnail is required for YouTube. Please upload one or let the bot generate one.")
+        next_prompt_text = to_bold_sans("A thumbnail is required for YouTube Videos. Please upload one or let the bot generate one.")
         next_markup = get_upload_flow_markup(platform, 'thumbnail')
     
     elif platform == 'youtube' and "visibility" not in file_info:
@@ -2350,7 +2389,7 @@ async def process_upload_step(msg_or_query):
 
     elif "schedule_time" not in file_info:
         if platform == 'facebook':
-            file_info['visibility'] = 'public' # FB doesn't need this step
+            file_info['visibility'] = 'public'
         state_data["action"] = "waiting_for_publish_choice"
         next_prompt_text = to_bold_sans("When To Publish?")
         next_markup = get_upload_flow_markup(platform, 'publish')
@@ -2362,13 +2401,11 @@ async def process_upload_step(msg_or_query):
             new_status_msg = await safe_threaded_reply(original_media_msg, "⏳ " + to_bold_sans("Scheduling your post..."), status_message=status_msg)
             state_data['status_msg'] = new_status_msg
             try:
-                if not valid_storage_channel:
-                    raise ConnectionError("Storage channel is invalid/inaccessible.")
-                
-                stored_msg = await file_info['original_media_msg'].forward(STORAGE_CHANNEL)
                 job_details = {
                     "user_id": user_id, "platform": platform, "upload_type": upload_type,
-                    "storage_msg_id": stored_msg.id, "schedule_time": schedule_time,
+                    "original_chat_id": original_media_msg.chat.id,
+                    "original_message_id": original_media_msg.id,
+                    "schedule_time": schedule_time,
                     "status": "pending", "created_at": datetime.now(timezone.utc),
                     "metadata": {k: file_info.get(k) for k in ["title", "description", "tags", "visibility", "thumbnail_path"]}
                 }
@@ -2379,8 +2416,8 @@ async def process_upload_step(msg_or_query):
                 else:
                     await safe_threaded_reply(original_media_msg, "❌ **Scheduling Failed:** Database is offline.", status_message=new_status_msg)
             except Exception as e:
-                logger.error(f"Failed to forward media to storage channel: {e}", exc_info=True)
-                await safe_threaded_reply(original_media_msg, f"❌ **Scheduling Failed:** Could not store media file. Error: {e}", status_message=new_status_msg)
+                logger.error(f"Failed to schedule job: {e}", exc_info=True)
+                await safe_threaded_reply(original_media_msg, f"❌ **Scheduling Failed:** Could not save the job. Error: {e}", status_message=new_status_msg)
             finally:
                 if user_id in user_states: del user_states[user_id]
         else:
@@ -2533,7 +2570,7 @@ async def process_and_upload(status_msg, file_info, user_id, from_schedule=False
                 else:
                     await safe_threaded_reply(original_media_msg, "✅ No conversion needed.")
 
-            if platform == 'youtube' and upload_type in ['video', 'short'] and file_info.get("thumbnail_path") == "auto":
+            if platform == 'youtube' and upload_type == 'video' and file_info.get("thumbnail_path") == "auto":
                 status_msg = await safe_threaded_reply(original_media_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."), status_message=status_msg)
                 thumb_output_path = upload_path + ".jpg"
                 generated_thumb = await asyncio.to_thread(generate_thumbnail, upload_path, thumb_output_path)
@@ -2702,7 +2739,7 @@ async def send_log_to_channel(client, channel_id, text):
 # ======================== BOT STARTUP ============================
 # ===================================================================
 async def start_bot():
-    global mongo, db, global_settings, upload_semaphore, MAX_CONCURRENT_UPLOADS, MAX_FILE_SIZE_BYTES, task_tracker, valid_log_channel, valid_storage_channel, BOT_ID
+    global mongo, db, global_settings, upload_semaphore, MAX_CONCURRENT_UPLOADS, MAX_FILE_SIZE_BYTES, task_tracker, valid_log_channel, BOT_ID
 
     try:
         mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -2761,22 +2798,6 @@ async def start_bot():
             admin_dm_text += f"**LOGGING ERROR**: {error}\n\n"
             valid_log_channel = False
     
-    if STORAGE_CHANNEL:
-        try:
-            chat = await app.get_chat(STORAGE_CHANNEL)
-            if hasattr(chat, 'is_public') and chat.is_public:
-                 raise ValueError("STORAGE_CHANNEL must be a private channel.")
-            member = await app.get_chat_member(STORAGE_CHANNEL, BOT_ID)
-            if member.status not in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
-                raise PermissionError("Bot is not an admin in STORAGE_CHANNEL.")
-            valid_storage_channel = True
-            logger.info(f"Successfully accessed STORAGE_CHANNEL ({STORAGE_CHANNEL}).")
-        except Exception as e:
-            error = f"Could not access STORAGE_CHANNEL ({STORAGE_CHANNEL}). Scheduling disabled. Error: {e}"
-            logger.error(error)
-            admin_dm_text += f"**SCHEDULING ERROR**: {error}\n\n"
-            valid_storage_channel = False
-
     if admin_dm_text:
         try:
             await app.send_message(ADMIN_ID, "⚠️ **Configuration Issues Detected**\n\n" + admin_dm_text + "Please fix and restart.")
@@ -2874,7 +2895,7 @@ async def send_weekly_report():
 async def schedule_checker_task():
     logger.info("Scheduler worker started.")
     while not shutdown_event.is_set():
-        if db is not None and valid_storage_channel:
+        if db is not None:
             try:
                 now = datetime.now(timezone.utc)
                 due_jobs_cursor = db.scheduled_jobs.find({
@@ -2891,9 +2912,9 @@ async def schedule_checker_task():
                     await asyncio.to_thread(db.scheduled_jobs.update_one, {"_id": job['_id']}, {"$set": {"status": "processing"}})
                     
                     try:
-                        stored_msg = await app.get_messages(STORAGE_CHANNEL, job['storage_msg_id'])
+                        stored_msg = await app.get_messages(job['original_chat_id'], job['original_message_id'])
                         if not stored_msg:
-                            raise FileNotFoundError(f"Message {job['storage_msg_id']} not found in storage channel.")
+                            raise FileNotFoundError(f"Message {job['original_message_id']} not found in chat {job['original_chat_id']}.")
                         
                         downloaded_path = await app.download_media(stored_msg)
 
