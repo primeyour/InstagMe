@@ -523,6 +523,22 @@ def get_upload_flow_markup(platform, step):
 # ====================== HELPER FUNCTIONS ===========================
 # ===================================================================
 
+async def safe_edit_message(message, text, reply_markup=None):
+    """Safely edits a message, ignoring 'message not modified' errors."""
+    try:
+        if not message:
+            logger.warning("safe_edit_message called with a None message object.")
+            return
+        await message.edit_text(
+            text=text, 
+            reply_markup=reply_markup, 
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e):
+            logger.warning(f"Couldn't edit message: {e}")
+
+
 def check_fb_response(response):
     """Checks for HTTP and Facebook API errors in a requests response."""
     response.raise_for_status()
