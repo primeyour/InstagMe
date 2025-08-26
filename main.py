@@ -72,7 +72,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOG_CHANNEL_STR = os.getenv("LOG_CHANNEL_ID")
 MONGO_URI = os.getenv("MONGO_DB")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/")
 PORT_STR = os.getenv("PORT", "8080")
 
 
@@ -523,6 +523,19 @@ def get_upload_flow_markup(platform, step):
 # ====================== HELPER FUNCTIONS ===========================
 # ===================================================================
 
+def check_fb_response(response):
+    """Checks for HTTP and Facebook API errors in a requests response."""
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Facebook returned an invalid, non-JSON response: {response.text}")
+    if 'error' in data:
+        error_details = data['error']
+        raise requests.RequestException(
+            f"Facebook API Error ({error_details.get('code', 'N/A')}): {error_details.get('message', 'Unknown error')}"
+        )
+    return data
+
 async def safe_edit_message(message, text, reply_markup=None):
     """Safely edits a message, ignoring 'message not modified' errors."""
     try:
@@ -537,20 +550,6 @@ async def safe_edit_message(message, text, reply_markup=None):
     except Exception as e:
         if "MESSAGE_NOT_MODIFIED" not in str(e):
             logger.warning(f"Couldn't edit message: {e}")
-
-
-def check_fb_response(response):
-    """Checks for HTTP and Facebook API errors in a requests response."""
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise ValueError(f"Facebook returned an invalid, non-JSON response: {response.text}")
-    if 'error' in data:
-        error_details = data['error']
-        raise requests.RequestException(
-            f"Facebook API Error ({error_details.get('code', 'N/A')}): {error_details.get('message', 'Unknown error')}"
-        )
-    return data
 
 def is_admin(user_id):
     return user_id == ADMIN_ID
@@ -686,17 +685,6 @@ async def get_user_settings(user_id):
     settings.setdefault("active_youtube_id", None)
     
     return settings
-
-async def safe_edit_message(message, text, reply_markup=None):
-    """Safely edits a message, ignoring 'message not modified' errors."""
-    try:
-        if not message:
-            logger.warning("safe_edit_message called with a None message object.")
-            return
-        await message.edit_text(text=text, reply_markup=reply_markup, parse_mode=enums.ParseMode.MARKDOWN)
-    except Exception as e:
-        if "MESSAGE_NOT_MODIFIED" not in str(e):
-            logger.warning(f"Couldn't edit message: {e}")
 
 async def safe_threaded_reply(original_media_message, new_text=None, new_markup=None, status_message=None):
     """Handles all replies and edits within the media's thread."""
@@ -1124,7 +1112,6 @@ async def show_stats(_, msg_or_query):
     # Admin Stats
     total_users = await asyncio.to_thread(db.users.count_documents, {})
     
-    # ... [rest of the stats logic remains the same]
     pipeline = [
         {"$project": {
             "is_premium": {"$or": [
@@ -1181,7 +1168,8 @@ async def show_stats(_, msg_or_query):
 async def account_info_handler(_, msg):
     user_id = msg.from_user.id
     if is_admin(user_id):
-        pass # Admin can check other users via admin panel
+        # For admin, this button can show their own info. Checking others is in admin panel.
+        pass
 
     info_text = f"👤 **{to_bold_sans('Account Information')}**\n\n"
     has_any_session = False
@@ -1528,6 +1516,15 @@ async def handle_text_input(_, msg):
                 "❌ " + to_bold_sans("Invalid format. Please use `YYYY-MM-DD HH:MM` in UTC."),
                 status_message=state_data.get("status_msg")
             )
+
+    elif action in ["waiting_for_thumbnail_choice", "waiting_for_thumbnail"]:
+        original_media_msg = state_data.get("file_info", {}).get("original_media_msg")
+        correction_text = "❌ " + to_bold_sans("Invalid input. Please either click a button below or send a PHOTO for the thumbnail.")
+        if original_media_msg:
+            await original_media_msg.reply(correction_text)
+        else:
+            await msg.reply(correction_text)
+        return
             
     elif action == "waiting_for_broadcast_message":
         if not is_admin(user_id): return
@@ -1969,9 +1966,10 @@ async def upload_flow_cb(_, query):
     if step == "thumbnail":
         if choice == "custom":
             state_data['action'] = 'waiting_for_thumbnail'
+            await safe_edit_message(query.message, "🖼️ " + to_bold_sans("Please send the thumbnail image now."))
         elif choice == "auto":
             state_data['file_info']['thumbnail_path'] = "auto"
-        await process_upload_step(query)
+            await process_upload_step(query)
     elif step == "visibility":
         state_data['file_info']['visibility'] = choice
         await process_upload_step(query)
