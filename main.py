@@ -152,11 +152,11 @@ def needs_conversion(input_file: str) -> bool:
     logger.warning(f"'{input_file}' needs conversion (Video: {v_codec}, Audio: {a_codec}, Container: {container}).")
     return True
 
-# ഈ ഫംഗ്ഷൻ നിങ്ങളുടെ കോഡിൽ റീപ്ലേസ് ചെയ്യുക
+# ഈ ഫംഗ്ഷൻ നിങ്ങളുടെ കോഡിൽ പൂർണ്ണമായി റീപ്ലേസ് ചെയ്യുക
 
 async def process_video_for_upload(app, status_msg, original_media_msg, input_file: str, output_file: str) -> str:
     """
-    Converts a video to a web-compatible format and shows progress.
+    Converts a video to a web-compatible format, shows progress, and includes a timeout.
     """
     metadata = get_video_metadata(input_file)
     total_duration_str = metadata.get("format", {}).get("duration", "0")
@@ -197,40 +197,48 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
 
     last_update_time = 0
     
-    while process.returncode is None:
-        line_bytes = await process.stdout.readline()
-        if not line_bytes:
-            break
-        
-        line = line_bytes.decode('utf-8', errors='ignore').strip()
-        
-        if 'out_time_ms' in line:
-            try:
-                # --- ഇതാണ് പ്രധാന മാറ്റം ---
-                # 'N/A' പോലുള്ള വിലകൾ വന്നാൽ എറർ ഒഴിവാക്കാൻ try-except ചേർത്തു
-                current_micros = int(line.split('=')[1])
-                # -------------------------
-            except ValueError:
-                # അസാധുവായ വിലയാണെങ്കിൽ, ഈ ലൈൻ ഒഴിവാക്കി അടുത്തതിലേക്ക് പോകുന്നു
-                continue
-
-            current_secs = current_micros / 1_000_000
-            
-            if total_duration_secs > 0:
-                percentage = min((current_secs / total_duration_secs) * 100, 100)
+    try:
+        # --- ഇതാണ് പ്രധാന മാറ്റം: 30 മിനിറ്റ് ടൈംഔട്ട് ചേർത്തു ---
+        async def read_progress():
+            while process.returncode is None:
+                line_bytes = await process.stdout.readline()
+                if not line_bytes:
+                    break
                 
-                if time.time() - last_update_time > 5 or percentage > 99:
-                    last_update_time = time.time()
-                    progress_bar = f"[{'█' * int(percentage / 5)}{' ' * (20 - int(percentage / 5))}]"
-                    progress_text = (
-                        f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
-                        f"`{progress_bar}`\n\n"
-                        f"📊 **Progress**: `{percentage:.2f}%`"
-                    )
-                    status_msg = await safe_threaded_reply(original_media_msg, progress_text, status_message=status_msg)
+                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                
+                if 'out_time_ms' in line:
+                    try:
+                        current_micros = int(line.split('=')[1])
+                    except ValueError:
+                        continue
 
-    await process.wait()
-    
+                    current_secs = current_micros / 1_000_000
+                    
+                    if total_duration_secs > 0:
+                        percentage = min((current_secs / total_duration_secs) * 100, 100)
+                        
+                        nonlocal last_update_time, status_msg
+                        if time.time() - last_update_time > 5 or percentage > 99:
+                            last_update_time = time.time()
+                            progress_bar = f"[{'█' * int(percentage / 5)}{' ' * (20 - int(percentage / 5))}]"
+                            progress_text = (
+                                f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
+                                f"`{progress_bar}`\n\n"
+                                f"📊 **Progress**: `{percentage:.2f}%`"
+                            )
+                            status_msg = await safe_threaded_reply(original_media_msg, progress_text, status_message=status_msg)
+        
+        # 30 മിനിറ്റ് (1800 സെക്കൻഡ്) കഴിഞ്ഞാൽ പ്രവർത്തനം നിർത്തും
+        await asyncio.wait_for(read_progress(), timeout=1800)
+        await process.wait()
+
+    except asyncio.TimeoutError:
+        logger.error(f"ffmpeg process timed out for file {input_file}.")
+        process.kill()
+        await process.wait()
+        raise ValueError("Video conversion took too long (over 30 minutes) and was cancelled.")
+        
     if process.returncode != 0:
         stderr_output = (await process.stderr.read()).decode('utf-8', errors='ignore')
         logger.error(f"ffmpeg conversion failed. Error: {stderr_output}")
