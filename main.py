@@ -152,53 +152,89 @@ def needs_conversion(input_file: str) -> bool:
     logger.warning(f"'{input_file}' needs conversion (Video: {v_codec}, Audio: {a_codec}, Container: {container}).")
     return True
 
-def process_video_for_upload(input_file: str, output_file: str) -> str:
+async def process_video_for_upload(app, status_msg, original_media_msg, input_file: str, output_file: str) -> str:
     """
-    Intelligently converts a video file. It stream-copies compatible tracks 
-    and only re-encodes what is necessary.
+    Converts a video to a web-compatible format and shows progress.
     """
     metadata = get_video_metadata(input_file)
-    if not metadata:
-        raise ValueError("Could not get video metadata to perform conversion.")
+    total_duration_str = metadata.get("format", {}).get("duration", "0")
+    total_duration_secs = float(total_duration_str)
+    
+    v_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'video'), 'N/A')
+    a_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'audio'), 'N/A')
+    container = metadata.get('format', {}).get('format_name', 'N/A')
 
-    v_codec = None
-    a_codec = None
-    for stream in metadata.get('streams', []):
-        if stream.get('codec_type') == 'video':
-            v_codec = stream.get('codec_name')
-        elif stream.get('codec_type') == 'audio':
-            a_codec = stream.get('codec_name')
+    reason_parts = []
+    if v_codec != 'h264': reason_parts.append(f"Video format is `{v_codec}` not `h264`")
+    if a_codec != 'aac': reason_parts.append(f"Audio format is `{a_codec}` not `aac`")
+    if 'mp4' not in container and 'mov' not in container: reason_parts.append(f"Container is `{container}` not `mp4`")
+    
+    reason_text = " and ".join(reason_parts)
+    
+    initial_text = (
+        f"⚙️ {to_bold_sans('Preparing Video...')}\n\n"
+        f"**Reason for Conversion**: {reason_text}.\n"
+        f"**Original Size**: `{os.path.getsize(input_file) / (1024*1024):.2f} MB`"
+    )
+    status_msg = await safe_threaded_reply(original_media_msg, initial_text, status_message=status_msg)
 
-    # Build the FFmpeg command dynamically
-    command = ['ffmpeg', '-y', '-i', input_file]
+    command = [
+        'ffmpeg', '-y', '-i', input_file,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-movflags', '+faststart',
+        '-progress', 'pipe:1', # Output progress to stdout
+        output_file
+    ]
+    
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-    # Video stream handling
-    if v_codec == 'h264':
-        logger.info("Video stream is compatible (h264). Copying without re-encoding.")
-        command.extend(['-c:v', 'copy'])
-    else:
-        logger.warning(f"Video stream '{v_codec}' is not h264. Re-encoding.")
-        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
+    last_update_time = 0
+    
+    while process.returncode is None:
+        line_bytes = await process.stdout.readline()
+        if not line_bytes:
+            break
+        
+        line = line_bytes.decode('utf-8', errors='ignore').strip()
+        
+        if 'out_time_ms' in line:
+            current_micros = int(line.split('=')[1])
+            current_secs = current_micros / 1_000_000
+            
+            if total_duration_secs > 0:
+                percentage = min((current_secs / total_duration_secs) * 100, 100)
+                
+                if time.time() - last_update_time > 5 or percentage > 99:
+                    last_update_time = time.time()
+                    progress_bar = f"[{'█' * int(percentage / 5)}{' ' * (20 - int(percentage / 5))}]"
+                    progress_text = (
+                        f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
+                        f"`{progress_bar}`\n\n"
+                        f"📊 **Progress**: `{percentage:.2f}%`"
+                    )
+                    status_msg = await safe_threaded_reply(original_media_msg, progress_text, status_message=status_msg)
 
-    # Audio stream handling
-    if a_codec == 'aac':
-        logger.info("Audio stream is compatible (aac). Copying without re-encoding.")
-        command.extend(['-c:a', 'copy'])
-    else:
-        logger.warning(f"Audio stream '{a_codec}' is not aac. Re-encoding.")
-        command.extend(['-c:a', 'aac', '-b:a', '128k'])
-
-    command.extend(['-movflags', '+faststart', output_file])
-
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-        logger.info(f"Successfully processed video to '{output_file}'.")
-        return output_file
-    except FileNotFoundError:
-        raise FileNotFoundError("ffmpeg is not installed. Video processing is not possible.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ffmpeg conversion failed for {input_file}. Error: {e.stderr}")
+    await process.wait()
+    
+    if process.returncode != 0:
+        stderr_output = (await process.stderr.read()).decode('utf-8', errors='ignore')
+        logger.error(f"ffmpeg conversion failed. Error: {stderr_output}")
         raise ValueError("Video conversion failed.")
+        
+    final_size_mb = os.path.getsize(output_file) / (1024*1024)
+    final_text = (
+        f"✅ {to_bold_sans('Conversion Complete!')}\n\n"
+        f"**Final Size**: `{final_size_mb:.2f} MB`"
+    )
+    await safe_threaded_reply(original_media_msg, final_text, status_message=status_msg)
+    
+    logger.info(f"Successfully converted video to '{output_file}'.")
+    return output_file
 
 
 # === Global Bot Settings ===
@@ -542,7 +578,7 @@ def get_upload_flow_markup(platform, step):
             [InlineKeyboardButton("⏰ ꜱᴄʜᴇᴅᴜʟᴇ ʟᴀᴛᴇʀ", callback_data="upload_flow_publish_schedule")]
         ])
     elif step == "input":
-         buttons.append([InlineKeyboardButton("➡️ Skip", callback_data=f"upload_flow_input_skip")])
+        buttons.append([InlineKeyboardButton("➡️ Skip", callback_data=f"upload_flow_input_skip")])
 
 
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")])
@@ -654,6 +690,7 @@ async def is_premium_for_platform(user_id, platform):
 async def save_platform_session(user_id, platform, session_data):
     if db is None: return
     
+    # This check correctly handles the multi-login limit for non-admin users.
     if not is_admin(user_id):
         existing_sessions_count = await asyncio.to_thread(db.sessions.count_documents, {"user_id": user_id, "platform": platform})
         if existing_sessions_count >= 2:
@@ -956,6 +993,12 @@ async def facebook_login_cmd_new(_, msg):
     if not await is_premium_for_platform(user_id, "facebook"):
         return await msg.reply("❌ " + to_bold_sans("Facebook Premium Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
+    # Check if user has reached the login limit
+    if not is_admin(user_id):
+        sessions = await load_platform_sessions(user_id, "facebook")
+        if len(sessions) >= 2:
+            return await msg.reply("⚠️ " + to_bold_sans("You have already logged in the maximum of 2 Facebook accounts."))
+
     prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your Facebook App ID."), quote=True)
     user_states[user_id] = {
         "action": "waiting_for_fb_app_id",
@@ -972,6 +1015,12 @@ async def youtube_login_cmd_new(_, msg):
     if not await is_premium_for_platform(user_id, "youtube"):
         return await msg.reply("❌ " + to_bold_sans("YouTube Premium Is Required. Use ") + "`/premiumplan`" + to_bold_sans(" To Upgrade."))
     
+    # Check if user has reached the login limit
+    if not is_admin(user_id):
+        sessions = await load_platform_sessions(user_id, "youtube")
+        if len(sessions) >= 2:
+            return await msg.reply("⚠️ " + to_bold_sans("You have already logged in the maximum of 2 YouTube accounts."))
+
     prompt_msg = await msg.reply(to_bold_sans("🔑 Please Enter Your YouTube OAuth Client ID."), quote=True)
     user_states[user_id] = {
         "action": "waiting_for_yt_client_id",
@@ -1554,7 +1603,7 @@ async def handle_text_input(_, msg):
         else:
             await msg.reply(correction_text)
         return
-            
+        
     elif action == "waiting_for_broadcast_message":
         if not is_admin(user_id): return
         
@@ -2094,7 +2143,7 @@ async def show_payment_qr_google_play_cb(_, query):
         return await query.answer("QR code is not set by the admin.", show_alert=True)
     
     caption_text = "**" + to_bold_sans("Scan & Pay") + "**\n\n" + \
-                    "Send a screenshot to the Admin for activation."
+                   "Send a screenshot to the Admin for activation."
     
     await query.message.reply_photo(photo=qr_file_id, caption=caption_text)
     await query.answer()
@@ -2467,7 +2516,7 @@ async def process_upload_step(msg_or_query):
                 if db is not None:
                     await asyncio.to_thread(db.scheduled_jobs.insert_one, job_details)
                     schedule_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🗓️ Manage Schedules", callback_data=f"manage_schedules_{platform}")]])
-                    await safe_threaded_reply(original_media_msg, f"✅ **Scheduled!**\n\nYour post will be uploaded on `{schedule_time.strftime('%Y-%m-%d %H:%M')} UTC`.", schedule_markup, new_status_msg)
+                    await safe_threaded_reply(original_media_msg, f"✅ **Scheduled!**\n\nYour post will be uploaded on `{schedule_time.strftime('%Y-%m-%d %H:%M')}` UTC.", schedule_markup, new_status_msg)
                 else:
                     await safe_threaded_reply(original_media_msg, "❌ **Scheduling Failed:** Database is offline.", status_message=new_status_msg)
             except Exception as e:
@@ -2615,15 +2664,12 @@ async def process_and_upload(status_msg, file_info, user_id, from_schedule=False
             upload_path = path
 
             if is_video:
-                status_msg = await safe_threaded_reply(original_media_msg, "⚙️ " + to_bold_sans("Checking video format..."), status_message=status_msg)
                 if await asyncio.to_thread(needs_conversion, path):
-                    status_msg = await safe_threaded_reply(original_media_msg, "⚙️ " + to_bold_sans("Converting video... (This may take a while)"), status_message=status_msg)
                     processed_path = path.rsplit(".", 1)[0] + "_processed.mp4"
-                    upload_path = await asyncio.to_thread(process_video_for_upload, path, processed_path)
+                    upload_path = await process_video_for_upload(app, status_msg, original_media_msg, path, processed_path)
                     files_to_clean.append(processed_path)
-                    await safe_threaded_reply(original_media_msg, "ℹ️ **Conversion Info**: Video was re-encoded for compatibility.")
                 else:
-                    await safe_threaded_reply(original_media_msg, "✅ No conversion needed.")
+                    status_msg = await safe_threaded_reply(original_media_msg, "✅ " + to_bold_sans("Video format is already compatible. No conversion needed."), status_message=status_msg)
 
             if platform == 'youtube' and upload_type == 'video' and file_info.get("thumbnail_path") == "auto":
                 status_msg = await safe_threaded_reply(original_media_msg, "🖼️ " + to_bold_sans("Generating Smart Thumbnail..."), status_message=status_msg)
