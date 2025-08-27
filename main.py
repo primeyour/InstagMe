@@ -72,7 +72,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 LOG_CHANNEL_STR = os.getenv("LOG_CHANNEL_ID")
 MONGO_URI = os.getenv("MONGO_DB")
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://absent-dulcea-primeyour-bcdf24ed.koyeb.app/")
 PORT_STR = os.getenv("PORT", "8080")
 
 
