@@ -158,6 +158,13 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
     """
     Converts a video to a web-compatible format, shows progress, and includes a timeout.
     """
+    # --- PROGRESS BAR STYLE ---
+    # പ്രോഗ്രസ് ബാറിന്റെ സ്റ്റൈൽ മാറ്റാൻ ഈ ചിഹ്നങ്ങൾ മാറ്റുക
+    filled_char = '●'
+    empty_char = '○'
+    # മറ്റ് ഓപ്ഷനുകൾ: filled_char='■', empty_char='□'  അല്ലെങ്കിൽ  filled_char='▓', empty_char='░'
+    # -------------------------
+
     metadata = get_video_metadata(input_file)
     total_duration_str = metadata.get("format", {}).get("duration", "0")
     total_duration_secs = float(total_duration_str)
@@ -195,11 +202,9 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
         stderr=asyncio.subprocess.PIPE
     )
 
-    last_update_time = 0
-    
     try:
-        # --- ഇതാണ് പ്രധാന മാറ്റം: 30 മിനിറ്റ് ടൈംഔട്ട് ചേർത്തു ---
         async def read_progress():
+            last_update_time = 0
             while process.returncode is None:
                 line_bytes = await process.stdout.readline()
                 if not line_bytes:
@@ -218,30 +223,29 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
                     if total_duration_secs > 0:
                         percentage = min((current_secs / total_duration_secs) * 100, 100)
                         
-                        nonlocal last_update_time, status_msg
-                        #...
-if time.time() - last_update_time > 5 or percentage > 99:
-    last_update_time = time.time()
+                        nonlocal status_msg
+                        if time.time() - last_update_time > 5 or percentage >= 99:
+                            last_update_time = time.time()
+                            filled_len = int(percentage / 5)
+                            empty_len = 20 - filled_len
+                            progress_bar = f"[{filled_char * filled_len}{empty_char * empty_len}]"
 
-    filled_len = int(percentage / 5)
-    empty_len = 20 - filled_len
-    progress_bar = f"[{'●' * filled_len}{'○' * empty_len}]" # <-- ഇവിടെയാണ് മാറ്റം വരുത്തിയത്
-
-    progress_text = (
-        f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
-        f"`{progress_bar}`\n\n"
-        f"📊 **Progress**: `{percentage:.2f}%`"
-    )
-#...
+                            progress_text = (
+                                f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
+                                f"`{progress_bar}`\n\n"
+                                f"📊 **Progress**: `{percentage:.2f}%`"
+                            )
                             status_msg = await safe_threaded_reply(original_media_msg, progress_text, status_message=status_msg)
         
-        # 30 മിനിറ്റ് (1800 സെക്കൻഡ്) കഴിഞ്ഞാൽ പ്രവർത്തനം നിർത്തും
-        await asyncio.wait_for(read_progress(), timeout=1800)
+        await asyncio.wait_for(read_progress(), timeout=1800) # 30 minute timeout
         await process.wait()
 
     except asyncio.TimeoutError:
         logger.error(f"ffmpeg process timed out for file {input_file}.")
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass # Process already finished
         await process.wait()
         raise ValueError("Video conversion took too long (over 30 minutes) and was cancelled.")
         
@@ -259,7 +263,6 @@ if time.time() - last_update_time > 5 or percentage > 99:
     
     logger.info(f"Successfully converted video to '{output_file}'.")
     return output_file
-
 
 # === Global Bot Settings ===
 DEFAULT_GLOBAL_SETTINGS = {
