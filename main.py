@@ -182,7 +182,7 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
 
     command = [
         'ffmpeg', '-y', '-i', input_file,
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         '-movflags', '+faststart',
         '-progress', 'pipe:1',
@@ -219,14 +219,20 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
                         percentage = min((current_secs / total_duration_secs) * 100, 100)
                         
                         nonlocal last_update_time, status_msg
-                        if time.time() - last_update_time > 5 or percentage > 99:
-                            last_update_time = time.time()
-                            progress_bar = f"[{'█' * int(percentage / 5)}{' ' * (20 - int(percentage / 5))}]"
-                            progress_text = (
-                                f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
-                                f"`{progress_bar}`\n\n"
-                                f"📊 **Progress**: `{percentage:.2f}%`"
-                            )
+                        #...
+if time.time() - last_update_time > 5 or percentage > 99:
+    last_update_time = time.time()
+
+    filled_len = int(percentage / 5)
+    empty_len = 20 - filled_len
+    progress_bar = f"[{'●' * filled_len}{'○' * empty_len}]" # <-- ഇവിടെയാണ് മാറ്റം വരുത്തിയത്
+
+    progress_text = (
+        f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
+        f"`{progress_bar}`\n\n"
+        f"📊 **Progress**: `{percentage:.2f}%`"
+    )
+#...
                             status_msg = await safe_threaded_reply(original_media_msg, progress_text, status_message=status_msg)
         
         # 30 മിനിറ്റ് (1800 സെക്കൻഡ്) കഴിഞ്ഞാൽ പ്രവർത്തനം നിർത്തും
