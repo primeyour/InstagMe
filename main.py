@@ -152,6 +152,8 @@ def needs_conversion(input_file: str) -> bool:
     logger.warning(f"'{input_file}' needs conversion (Video: {v_codec}, Audio: {a_codec}, Container: {container}).")
     return True
 
+# ഈ ഫംഗ്ഷൻ നിങ്ങളുടെ കോഡിൽ റീപ്ലേസ് ചെയ്യുക
+
 async def process_video_for_upload(app, status_msg, original_media_msg, input_file: str, output_file: str) -> str:
     """
     Converts a video to a web-compatible format and shows progress.
@@ -169,11 +171,11 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
     if a_codec != 'aac': reason_parts.append(f"Audio format is `{a_codec}` not `aac`")
     if 'mp4' not in container and 'mov' not in container: reason_parts.append(f"Container is `{container}` not `mp4`")
     
-    reason_text = " and ".join(reason_parts)
+    reason_text = " and ".join(reason_parts) if reason_parts else "No specific reason (ensuring compatibility)."
     
     initial_text = (
         f"⚙️ {to_bold_sans('Preparing Video...')}\n\n"
-        f"**Reason for Conversion**: {reason_text}.\n"
+        f"**Reason for Conversion**: {reason_text}\n"
         f"**Original Size**: `{os.path.getsize(input_file) / (1024*1024):.2f} MB`"
     )
     status_msg = await safe_threaded_reply(original_media_msg, initial_text, status_message=status_msg)
@@ -183,7 +185,7 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         '-movflags', '+faststart',
-        '-progress', 'pipe:1', # Output progress to stdout
+        '-progress', 'pipe:1',
         output_file
     ]
     
@@ -203,7 +205,15 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         
         if 'out_time_ms' in line:
-            current_micros = int(line.split('=')[1])
+            try:
+                # --- ഇതാണ് പ്രധാന മാറ്റം ---
+                # 'N/A' പോലുള്ള വിലകൾ വന്നാൽ എറർ ഒഴിവാക്കാൻ try-except ചേർത്തു
+                current_micros = int(line.split('=')[1])
+                # -------------------------
+            except ValueError:
+                # അസാധുവായ വിലയാണെങ്കിൽ, ഈ ലൈൻ ഒഴിവാക്കി അടുത്തതിലേക്ക് പോകുന്നു
+                continue
+
             current_secs = current_micros / 1_000_000
             
             if total_duration_secs > 0:
