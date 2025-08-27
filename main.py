@@ -1999,15 +1999,27 @@ async def upload_flow_cb(_, query):
         elif choice == "auto":
             state_data['file_info']['thumbnail_path'] = "auto"
             await process_upload_step(query)
+            
     elif step == "visibility":
         state_data['file_info']['visibility'] = choice
         await process_upload_step(query)
+        
     elif step == "publish":
         if choice == "now":
+            # If "Publish Now" is clicked, set time to None and proceed
             state_data['file_info']['schedule_time'] = None
+            await process_upload_step(query)
         elif choice == "schedule":
+            # If "Schedule Later" is clicked, set the action...
             state_data['action'] = 'waiting_for_schedule_time'
-        await process_upload_step(query)
+            # ...and then ASK the user for the time directly.
+            schedule_prompt = (
+                "⏰ " + to_bold_sans("Please send the schedule time.") + "\n\n"
+                "Use the format: `YYYY-MM-DD HH:MM`\n"
+                "*(Time should be in UTC)*"
+            )
+            await safe_edit_message(query.message, schedule_prompt, reply_markup=get_progress_markup())
+            
     elif step == "input" and choice == "skip":
         action = state_data.get('action')
         if action == "waiting_for_title":
