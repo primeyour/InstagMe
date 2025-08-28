@@ -156,82 +156,91 @@ def needs_conversion(input_file: str) -> bool:
 
 async def process_video_for_upload(app, status_msg, original_media_msg, input_file: str, output_file: str) -> str:
     """
-    Converts a video to a web-compatible format, shows progress, and includes a timeout.
+    Intelligently converts a video. It stream-copies compatible tracks 
+    and only re-encodes what is necessary, while showing progress and including a timeout.
     """
     # --- PROGRESS BAR STYLE ---
-    # പ്രോഗ്രസ് ബാറിന്റെ സ്റ്റൈൽ മാറ്റാൻ ഈ ചിഹ്നങ്ങൾ മാറ്റുക
+    # You can change these characters to customize the progress bar
     filled_char = '●'
     empty_char = '○'
-    # മറ്റ് ഓപ്ഷനുകൾ: filled_char='■', empty_char='□'  അല്ലെങ്കിൽ  filled_char='▓', empty_char='░'
+    # Other options: filled_char='■', empty_char='□'  or  filled_char='▓', empty_char='░'
     # -------------------------
 
     metadata = get_video_metadata(input_file)
     total_duration_str = metadata.get("format", {}).get("duration", "0")
     total_duration_secs = float(total_duration_str)
     
-    v_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'video'), 'N/A')
-    a_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'audio'), 'N/A')
-    container = metadata.get('format', {}).get('format_name', 'N/A')
+    v_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'video'), None)
+    a_codec = next((s.get('codec_name') for s in metadata.get('streams', []) if s.get('codec_type') == 'audio'), None)
 
-    reason_parts = []
-    if v_codec != 'h264': reason_parts.append(f"Video format is `{v_codec}` not `h264`")
-    if a_codec != 'aac': reason_parts.append(f"Audio format is `{a_codec}` not `aac`")
-    if 'mp4' not in container and 'mov' not in container: reason_parts.append(f"Container is `{container}` not `mp4`")
+    # --- Smart Command Building ---
+    command = ['ffmpeg', '-y', '-i', input_file]
     
-    reason_text = " and ".join(reason_parts) if reason_parts else "No specific reason (ensuring compatibility)."
+    processing_actions = []
+
+    # Video stream handling
+    if v_codec == 'h264':
+        logger.info("Video stream is compatible (h264). Copying without re-encoding.")
+        command.extend(['-c:v', 'copy'])
+    else:
+        logger.warning(f"Video stream '{v_codec}' is not h264. Re-encoding.")
+        command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23'])
+        processing_actions.append(f"Converting Video (`{v_codec}` to `h264`)")
+
+    # Audio stream handling
+    if a_codec == 'aac':
+        logger.info("Audio stream is compatible (aac). Copying without re-encoding.")
+        command.extend(['-c:a', 'copy'])
+    else:
+        logger.warning(f"Audio stream '{a_codec}' is not aac. Re-encoding.")
+        # Improved audio quality by increasing bitrate to 192k
+        command.extend(['-c:a', 'aac', '-b:a', '192k'])
+        processing_actions.append(f"Converting Audio (`{a_codec}` to `aac`)")
+
+    # The container always needs to be changed to mp4
+    if not processing_actions:
+        processing_actions.append("Changing Container (e.g., .mkv to .mp4)")
+        
+    command.extend(['-movflags', '+faststart', '-progress', 'pipe:1', output_file])
     
+    action_text = " & ".join(processing_actions)
+        
     initial_text = (
         f"⚙️ {to_bold_sans('Preparing Video...')}\n\n"
-        f"**Reason for Conversion**: {reason_text}\n"
+        f"**Action**: {action_text}.\n"
         f"**Original Size**: `{os.path.getsize(input_file) / (1024*1024):.2f} MB`"
     )
     status_msg = await safe_threaded_reply(original_media_msg, initial_text, status_message=status_msg)
-
-    command = [
-        'ffmpeg', '-y', '-i', input_file,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-movflags', '+faststart',
-        '-progress', 'pipe:1',
-        output_file
-    ]
     
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
-
+    
     try:
         async def read_progress():
             last_update_time = 0
             while process.returncode is None:
                 line_bytes = await process.stdout.readline()
-                if not line_bytes:
-                    break
-                
+                if not line_bytes: break
                 line = line_bytes.decode('utf-8', errors='ignore').strip()
-                
                 if 'out_time_ms' in line:
                     try:
                         current_micros = int(line.split('=')[1])
                     except ValueError:
                         continue
-
                     current_secs = current_micros / 1_000_000
-                    
                     if total_duration_secs > 0:
                         percentage = min((current_secs / total_duration_secs) * 100, 100)
-                        
                         nonlocal status_msg
                         if time.time() - last_update_time > 5 or percentage >= 99:
                             last_update_time = time.time()
                             filled_len = int(percentage / 5)
                             empty_len = 20 - filled_len
                             progress_bar = f"[{filled_char * filled_len}{empty_char * empty_len}]"
-
                             progress_text = (
-                                f"⚙️ {to_bold_sans('Converting Video...')}\n\n"
+                                f"⚙️ {to_bold_sans('Processing Video...')}\n\n"
                                 f"`{progress_bar}`\n\n"
                                 f"📊 **Progress**: `{percentage:.2f}%`"
                             )
@@ -242,26 +251,24 @@ async def process_video_for_upload(app, status_msg, original_media_msg, input_fi
 
     except asyncio.TimeoutError:
         logger.error(f"ffmpeg process timed out for file {input_file}.")
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass # Process already finished
+        try: process.kill()
+        except ProcessLookupError: pass
         await process.wait()
-        raise ValueError("Video conversion took too long (over 30 minutes) and was cancelled.")
+        raise ValueError("Video processing took too long (over 30 minutes) and was cancelled.")
         
     if process.returncode != 0:
         stderr_output = (await process.stderr.read()).decode('utf-8', errors='ignore')
-        logger.error(f"ffmpeg conversion failed. Error: {stderr_output}")
-        raise ValueError("Video conversion failed.")
+        logger.error(f"ffmpeg processing failed. Error: {stderr_output}")
+        raise ValueError("Video processing failed.")
         
     final_size_mb = os.path.getsize(output_file) / (1024*1024)
     final_text = (
-        f"✅ {to_bold_sans('Conversion Complete!')}\n\n"
+        f"✅ {to_bold_sans('Processing Complete!')}\n\n"
         f"**Final Size**: `{final_size_mb:.2f} MB`"
     )
     await safe_threaded_reply(original_media_msg, final_text, status_message=status_msg)
     
-    logger.info(f"Successfully converted video to '{output_file}'.")
+    logger.info(f"Successfully processed video to '{output_file}'.")
     return output_file
 
 # === Global Bot Settings ===
